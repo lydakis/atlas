@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+nix_image="nixos/nix@sha256:7a007c766426c1877758ddc5cb87a965ac131fc78c582ce0083d922d51ae945c"
+
+exec docker run --rm \
+  --volume atlas-nix-store:/nix \
+  --volume "${workspace_root}:/workspace" \
+  --workdir /workspace \
+  "${nix_image}" \
+  nix --extra-experimental-features "nix-command flakes" "$@"
