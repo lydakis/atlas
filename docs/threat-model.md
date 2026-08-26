@@ -71,19 +71,24 @@ flowchart TD
     H -->|Create, constrain, inspect, stop| EA
     H -->|Create, constrain, inspect, stop| EB
     H --> G[Grant broker]
-    H --> S[Surface broker]
+    H --> S[Surface reference monitor]
     H --> R[Private route broker]
     G -->|Scoped authority| EA
-    S -->|Browser or desktop control| EA
+    EA -->|Authenticated bounded actions| S
+    O -->|Paired observation, takeover, and input| S
+    S -->|Validated commands| WA[Browser worker A]
+    S -->|Validated commands| WB[Browser worker B]
     R -->|Authenticated private endpoint| O
     EA --> I[Internet and hostile content]
     EB --> I
+    WA --> I
+    WB --> I
     U[Signed update supply chain] --> H
     P[Physical storage] --- H
 ```
 
-The grant, surface, and route brokers are intended components, not current
-implementation claims.
+The grant broker, surface reference monitor, per-identity browser workers, and
+route broker are intended components, not current implementation claims.
 
 ## Threat Model, Trust Boundaries, and Assumptions
 
@@ -99,6 +104,12 @@ implementation claims.
   binaries, tests, and package lifecycle operations inside an environment.
 - **Remote content attacker:** controls a website, prompt injection, tool
   response, issue, document, or route request seen by an agent.
+- **Compromised browser worker:** begins with the website account and data
+  available to one browser identity but not another identity, environment,
+  private-network service, or the Atlas control plane.
+- **Compromised or lost operator device:** may hold a paired-device identity,
+  observe surfaces, approve takeover, inject operator input, or attempt to block
+  legitimate recovery until the host revokes it.
 - **Tailnet peer attacker:** has network membership but not necessarily Atlas
   operator or environment authority.
 - **Public-network attacker:** can scan public or LAN interfaces and influence
@@ -123,17 +134,23 @@ implementation claims.
 5. **Environment to environment:** files, processes, profiles, grants, surfaces,
    routes, resources, and activity attribution remain separate.
 6. **Environment to grant broker:** an environment obtains only approved
-   derivative authority and never the operator's source credential.
+   authority. A materialized source credential is an explicit degraded grant,
+   not the default or an implicit consequence of entering the environment.
 7. **Environment to surface:** profiles, automation endpoints, displays,
    clipboard, downloads, screenshots, recordings, and takeover carry sensitive
    authority and data.
-8. **Route to private network:** a loopback service becomes reachable across a
-   new authentication and routing boundary only after explicit publication.
-9. **Environment to internet:** an internet-enabled process can transmit any
-   data or bearer capability it can read.
-10. **Installed host to update supply chain:** a privileged update can replace
+8. **Surface reference monitor to browser worker:** web content and the worker
+   are hostile; each worker receives only validated commands and one profile.
+9. **Browser worker to host and network:** public-web reachability does not grant
+   access to host control sockets, other workers, host loopback, private LAN or
+   tailnet resources, or cloud metadata.
+10. **Route to private network:** a loopback service becomes reachable across a
+    new authentication and routing boundary only after explicit publication.
+11. **Environment or browser worker to internet:** an internet-enabled process
+    can transmit any data or bearer capability it can read.
+12. **Installed host to update supply chain:** a privileged update can replace
     every local control.
-11. **Persistent storage to physical access:** an unattended box may contain
+13. **Persistent storage to physical access:** an unattended box may contain
     code, profiles, tokens, logs, and pairing state.
 
 ### Security invariants
@@ -147,26 +164,41 @@ implementation claims.
    default.
 4. Ordinary environments cannot modify the Atlas control plane, audit sink,
    update policy, recovery material, or host credential store.
-5. Source credentials never enter the Nix store, process arguments, logs, or an
-   environment's ordinary filesystem.
+5. Source credentials never enter the Nix store, process arguments, Atlas audit
+   events, agent or model context, or persistent capture. They enter an
+   environment filesystem or process environment only through an explicitly
+   approved materialized-source grant reported as degraded. Remote takeover
+   separately enumerates and minimizes the operator-input components that
+   necessarily handle plaintext.
 6. Materialized bearer secrets are reported as a degraded grant mode. Brokered
    operations and derivative credentials are preferred where supported.
-7. A grant is bound to an environment, audience, operations, and expiry and can
-   be revoked without granting the environment access to its source secret.
+7. A grant is bound to an environment, audience, operations, and expiry.
+   Revocation does not require exposing the source secret and does not falsely
+   claim to recover a materialized copy already delivered to an environment.
 8. A browser profile and its derived session credentials are bound to one
-   environment and protected by the surface broker. Atlas accurately reports
-   when an automation protocol can export cookies or equivalent authority.
-9. Surface observation and control are explicit. At most one party holds
-   interactive control, and recording state is visible.
-10. Routes are unpublished by default, target only the owning environment, and
+   environment and one per-identity worker, protected by the surface reference
+   monitor. Atlas accurately reports when an automation protocol can export
+   cookies or equivalent authority.
+9. Every surface operation reauthenticates the observed caller, environment
+   membership, effective grant, and controller epoch. A copied identifier,
+   handle, path, port, or file descriptor does not establish authority.
+10. A compromised browser worker cannot reach another profile or worker, Atlas
+    control sockets, host loopback, private-network services, or cloud metadata
+    without an explicit grant.
+11. Surface observation and control are explicit. At most one party holds
+    interactive control, and takeover begins only after Atlas-controlled input,
+    every observer, observation, clipboard, download, and recording pipeline
+    fences the prior controller epoch. Context changes continuously fence
+    operator input during authentication.
+12. Routes are unpublished by default, target only the owning environment, and
     require private authentication unless an explicit public grant exists.
-11. Tailnet membership is network reachability, not ambient host, environment,
+13. Tailnet membership is network reachability, not ambient host, environment,
     grant, surface, or route authorization.
-12. Security events are written outside environment control and distinguish
+14. Security events are written outside environment control and distinguish
     proven host identity from unverified client annotations.
-13. Resource exhaustion in one environment cannot prevent the operator from
+15. Resource exhaustion in one environment cannot prevent the operator from
     inspecting, stopping, or recovering the host.
-14. Authenticated updates preserve declared guarantees or fail visibly with a
+16. Authenticated updates preserve declared guarantees or fail visibly with a
     tested recovery path.
 
 ### Assumptions and explicit non-guarantees
@@ -179,6 +211,17 @@ implementation claims.
   not provide data-loss prevention for data that environment may read.
 - Browser control is account authority. Atlas cannot prevent an authorized
   environment from misusing the website actions it has been granted.
+- Remote password entry necessarily exposes plaintext to a bounded operator
+  input path, browser renderer, and downstream website. Atlas can exclude agent,
+  capture, audit, and persistent-storage paths only after enumerating and testing
+  the operator stream and any relay.
+- A compromised browser worker can falsify worker-reported destination facts and
+  capture a reusable password entered into its renderer. V0 limits password
+  proof to a disposable or low-risk account, labels fact provenance, and does
+  not claim phishing resistance against a compromised worker.
+- Authenticated Surface v0 grants browser authority to an environment. It does
+  not claim process-scoped isolation until process identity, delegation,
+  inheritance, restart, and per-operation revalidation are defined and tested.
 - Tailscale policy is externally administered. Atlas cannot prove a tailnet rule
   is safe merely because the node is enrolled.
 - Client-owned terminals and arbitrary processes are not reconstructed after a
@@ -198,6 +241,13 @@ implementation claims.
 | High hypothesis | An environment escapes through mounts, devices, capabilities, ptrace, namespaces, or a privileged socket | hostile process inside environment | host root or another environment's data and authority | demonstration services use dynamic users, private network, dropped capabilities, and read-only host protections | choose and test an interactive environment backend; deny control sockets; isolate writable state, devices, IPC, and caches | Demonstration only: `nixos/configurations/spike-host.nix` |
 | High hypothesis | A second environment reads another environment's browser profile, grant, recording, or code | two persistent environments and an incomplete filesystem boundary | cross-environment identity and data theft | top-level sensitive state roots have restrictive ownership where implemented | per-environment ownership or isolated mount trees; cross-environment regression tests; immutable shared caches | Top-level modes implemented by `nixos/modules/atlas-host.nix`; per-environment backend absent |
 | High hypothesis | A raw browser-debug endpoint lets an authorized environment export cookies or reusable session credentials | persistent authenticated profile plus broad automation protocol | durable account takeover outside Atlas | none implemented | capability-specific browser adapters, authenticated local endpoints, protected profile filesystem, narrower action-only mode for high-trust identities, fast browser patching | Design requirement only |
+| High hypothesis | Agent-controlled content, a malicious focused frame, or a compromised worker deceives the operator into entering a source credential into the wrong context | future paired-device console and authenticated browser surface | low-risk account takeover in v0; potentially consequential source-credential theft later | none implemented; v0 limits proof to a low-risk disposable account | broker-owned chrome labels fact provenance; independently enforced destination policy is distinguished from worker reports; context change fences input; reusable-password entry does not claim protection from a compromised worker | Proposed contract: `docs/authenticated-surface-v0.md`, sections "Internal trust partition," "Controller state machine," and "Authentication handoff"; re-evaluate as Critical before consequential credentials |
+| High hypothesis | A stolen, replayed, or cross-surface takeover request obtains operator control of a browser identity | future paired-device console, reachable control channel, and missing request binding | unauthorized account actions or observation of the authentication ceremony | none implemented | paired-device authentication, short-lived single-use request, full context binding, controller epoch, fail-locked expiry and restart | Proposed contract: `docs/authenticated-surface-v0.md`, sections "Paired operator minimum contract" and "Authentication handoff" |
+| High hypothesis | Operator input, live-stream relay, screenshot, recording, accessibility, clipboard, crash, or queued automation path captures authentication data | future operator stream and browser observation pipeline | low-risk password, one-time-code, or account disclosure in v0; potentially consequential credential theft later | none implemented; v0 limits proof to a low-risk disposable account | enumerate plaintext recipients, end-to-end-protected operator transport, quiescence barrier, exclusive controller state, capture and clipboard fencing, retention policy, and secret-free audit and crash policy | Proposed contract: `docs/authenticated-surface-v0.md`, sections "Controller state machine" and "Password path and capture boundary"; re-evaluate as Critical before consequential credentials |
+| High hypothesis | An input, download, navigation, observation, or recording operation accepted under the old controller epoch races takeover, lock, or revocation | future concurrent surface pipelines | unintended account action, disclosure, or corrupted evidence during a supposedly exclusive transition | none implemented | per-pipeline epoch acknowledgement, cancel or complete accepted work, reject queued work, fail locked on incomplete quiescence | Proposed contract: `docs/authenticated-surface-v0.md`, sections "Revoke authority" and "Controller state machine" |
+| Critical hypothesis | Compromised web content escapes a shared browser service and reaches another profile, worker, or the surface reference monitor | future authenticated browser worker with weak internal isolation | multiple account takeover or Atlas host-control compromise | none implemented | small non-rendering reference monitor; separate identity, mounts, runtime, cgroup, IPC, profile key, and network context per browser identity | Proposed contract: `docs/authenticated-surface-v0.md`, sections "Internal trust partition" and "Isolation and extraction resistance" |
+| High hypothesis | A browser worker reaches Atlas control sockets, host loopback, private LAN or tailnet services, cloud metadata, or its own unbrokered automation endpoint | future internet-enabled browser worker without a protected network context | host pivot, private-service access, metadata credential theft, or full profile export | none implemented | deny private destinations outside the worker for every request and DNS result; use a renderer-inaccessible automation channel; require an explicit environment-bound grant for private services | Proposed contract: `docs/authenticated-surface-v0.md`, sections "Origin and action policy" and "Isolation and extraction resistance" |
+| High hypothesis | A compromised or lost paired operator device observes or controls authenticated surfaces after the operator revokes it | future paired-device console and incomplete device lifecycle | unauthorized takeover, password observation, identity destruction, or blocked recovery | none implemented | distinct per-device identity, fresh operator verification, active-session termination on revocation, replacement and last-device recovery ceremony | Proposed contract: `docs/authenticated-surface-v0.md`, section "Paired operator minimum contract" |
 | High hypothesis | Prompt injection obtains a broad or long-lived token and exfiltrates it | credential broker or materialized secret plus internet egress | downstream account or repository compromise | runtime secret root reserved; canonical external-path and resolved-target constraints for enrollment key | narrow derivative grants, out-of-band approval, audience binding, revocation, no secret logging, degraded-mode reporting | General broker absent; enrollment-key path tests at `nixos/tests/module-evaluation.nix` |
 | High hypothesis | A route publishes an administrative or unintended port, pivots to host metadata, or targets another environment | future route broker with attacker-controlled target | private data exposure, SSRF, or cross-environment access | no route is currently implemented or exposed | explicit publication, environment-bound upstream validation, private authentication, expiry, rate limits, and public sharing as separate grant | Design requirement only |
 | High hypothesis | Physical theft exposes source, browser sessions, grants, tailnet state, or recovery material | persistent unencrypted installation | offline credential and data theft | current live ISO is ephemeral | full-disk encryption, hardware-backed sealing where supportable, separate sensitive stores, encrypted backups, remote revocation, secure reset | Persistent installer and encryption absent |

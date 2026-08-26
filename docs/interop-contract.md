@@ -30,7 +30,7 @@ directly as the host administrator is outside that guarantee.
 | projects, repositories, branches, worktrees, diffs | agent client, Git, or operator |
 | terminals, panes, client reconnection, presentation | agent client or harness |
 | host installation, health, update, rollback, recovery | Atlas |
-| environment identity, isolation, durable home, resource budget | Atlas |
+| environment definition, identity, isolation, durable home, resource budget | Atlas |
 | browser profiles, displays, observation, recording, takeover | Atlas |
 | local credential grants and use attribution where observable | Atlas |
 | private routes from paired devices to environment services | Atlas |
@@ -74,21 +74,39 @@ A `host` is a paired Atlas machine. Its observable contract includes:
 
 ### Environment
 
-An `environment` is a persistent Linux compartment for one trust context. It
-owns:
+An `environment` is a named, reusable trust context realized as a persistent
+Linux compartment. An existing agent client selects or enters it before work
+begins. It owns:
 
 - an enforceable OS principal and process boundary
 - a private writable home and runtime state
 - a resource budget and accounting scope
 - a network context and outbound policy
+- non-secret configuration
 - references to its grants, surfaces, routes, and activity
 
 An environment is not a repository, branch, task, terminal, or agent. Those
 objects may exist inside it and remain owned by the selected client.
 
+Secret values are not environment configuration. Source credentials remain in
+an operator-owned or Atlas control-plane store by default. An explicit
+materialized-secret grant is the degraded exception that copies a credential
+into an environment. The environment references grants that define which
+authority it may use and how that authority is delivered.
+
 Environment labels are not security identities. The host derives authority
 from the authenticated entry path, OS principal, cgroup or scope membership,
 namespace membership, and any stronger selected isolation backend.
+
+Each environment also has an opaque, non-reusable Atlas identity. Deleting an
+environment requires an explicit lifecycle action for its bound profiles,
+grants, surfaces, and routes. Recreating the same human-readable name inherits
+nothing.
+
+Some agent products also use `environment` for a saved launch configuration or
+runner destination. A client environment may select an Atlas environment, but
+the two identifiers are not interchangeable and neither a matching name nor a
+client-supplied identifier establishes host authority.
 
 ### Grant
 
@@ -98,8 +116,8 @@ It includes:
 - requesting environment and, where provable, requesting process
 - downstream audience and allowed operations
 - issue, expiry, renewal, denial, and revocation state
-- delivery mode: materialized secret, derived credential, brokered operation,
-  or browser-identity authorization
+- delivery mode: materialized runtime secret, derived or brokered authority, or
+  browser-identity authorization
 - evidence of use where the protocol makes that observable
 
 A process can request authority but cannot approve its own request. A grant
@@ -111,7 +129,7 @@ A `surface` is a browser or graphical desktop that can have an agent controller,
 operator observers, and at most one interactive controller at a time. Its
 contract includes:
 
-- owning environment and trust level
+- bound environment and trust level
 - ephemeral or persistent profile policy
 - automation interface and its authority
 - current controller, observers, and takeover state
@@ -146,7 +164,8 @@ remote target and receives:
 - a normal shell, filesystem, home directory, and loopback network
 - the toolchain installed for that environment
 - isolation from the host control plane and other environments
-- conventional credential-helper and browser-control endpoints where granted
+- conventional credential helpers and a bounded surface-action endpoint where
+  granted; raw browser debugging is not a Level 0 guarantee
 - private service routing without opening public ports
 
 The client continues to own process and PTY lifetime unless it explicitly asks
@@ -177,8 +196,9 @@ Atlas should prefer interfaces existing tools already understand:
 - Unix sockets and peer credentials
 - standard credential helpers and SSH agents
 - loopback ports and HTTP proxies
-- browser computer-use, WebDriver, or debugging protocols with explicit
-  capability differences
+- bounded browser computer-use adapters
+- WebDriver or debugging protocols only as separately granted, explicitly
+  degraded capabilities equivalent to reusable browser authority
 
 ### Administrative CLI
 
@@ -242,11 +262,18 @@ reachability alone does not confer operator authority.
    environment cannot poison another.
 7. The isolation backend and its known gaps are discoverable through
    conformance rather than inferred from a marketing label.
-8. An environment may contain multiple repositories, worktrees, agent
+8. Unless Atlas can prove a narrower process identity and confinement boundary,
+   authority delivered to an environment is treated as usable by every process
+   inside it.
+9. An environment may contain multiple repositories, worktrees, agent
    processes, and client sessions because Atlas does not own those concepts.
 
 An implementation may use Linux users, systemd scopes, namespaces, containers,
 microVMs, or VMs. The contract is the observable boundary, not the backend.
+
+An operator uses separate environments when agent instances require different
+authority sets. This is guidance about selecting trust boundaries, not a claim
+that Atlas can identify a client's logical agent instances.
 
 ## Grants and browser identities
 
@@ -254,9 +281,25 @@ An approval request includes the requesting environment, requested capability,
 target service or identity, operations, duration, reason, and consequences.
 Approval happens outside agent-controlled content.
 
-Source credentials stay in a control-plane or operator-owned store. Where a
-downstream system supports it, Atlas prefers narrow derivative credentials or
+The source credential is the reusable secret from which downstream authority is
+obtained. It stays in a control-plane or operator-owned store by default. Where
+a downstream system supports it, Atlas prefers narrow derivative credentials or
 brokered operations over copyable bearer secrets.
+
+Credential delivery has three explicit modes:
+
+1. **Materialized runtime secret:** a source or derivative token, password,
+   file, or environment variable is copied into the environment. Any process
+   inside the environment may read and exfiltrate it. Capability discovery
+   reports whether the materialized value is a source credential or a scoped
+   derivative, and always reports this mode as degraded.
+2. **Derived or brokered authority:** the source credential remains outside the
+   environment while a helper performs narrow operations or issues a scoped,
+   short-lived derivative credential. This is preferred when the downstream
+   protocol supports it.
+3. **Browser identity:** authentication state remains in a protected browser
+   profile while the environment receives an explicit capability to operate
+   its surface.
 
 A browser profile is a credential container. Atlas binds it to one environment
 and trust level, protects its files from environment processes unless the
@@ -267,6 +310,10 @@ An environment authorized to operate a browser can act with the website
 authority represented by that profile. Isolation prevents other environments
 from acquiring that authority; it does not prevent the authorized environment
 from misusing it.
+
+The detailed authentication handoff, controller state, persistence policy, and
+acceptance proof are defined by
+[Authenticated Surface v0](authenticated-surface-v0.md).
 
 ## Connectivity and SSH
 
@@ -316,10 +363,10 @@ process immortality.
 
 | Event | Guaranteed durable state | Not guaranteed |
 | --- | --- | --- |
-| client disconnect | environment files, declared services, persistent profiles, grants, routes, events | arbitrary client-owned PTY or connection-local streams |
+| client disconnect | environment files, declared services, persistent profile data, grant and route records according to policy, events | arbitrary client-owned PTY or connection-local streams; continued authority after expiry or revocation |
 | environment process crash | files, declarations, persistent profile data, events | process memory; restart without declared policy |
 | Atlas control restart | on-disk resources and already supervised declared services | uninterrupted operator attachment transport |
-| host reboot | environment files, declared services and routes, persistent profiles, grants according to policy | process memory, PTY contents, ephemeral profiles |
+| host reboot | environment files, declared services, route and grant records with effective policy state, encrypted persistent profile data | process memory, PTY contents, ephemeral profiles; profile availability before its declared unlock condition is satisfied |
 | OS update | state promised across reboot, subject to reported conformance | arbitrary unmanaged host changes |
 | disk failure or machine loss | only configured and verified backups or replicas | unreplicated local state |
 
@@ -334,6 +381,8 @@ resource model with different guarantees. `atlas doctor --json` reports:
 - environment identity and isolation backend
 - browser automation, observation, recording, and takeover capabilities
 - whether raw browser credentials can be exported through the selected protocol
+- destination-fact provenance, password-retention policy, and paired-device
+  revocation and recovery capabilities
 - credential delivery and brokering modes
 - private connectivity and recovery paths
 - route authentication and exposure modes
@@ -362,7 +411,7 @@ This contract does not define:
 The contract does not yet choose:
 
 - final base Linux distribution or image-construction system
-- persistent disk layout and unattended-unlock policy
+- persistent disk layout and supported unlock mechanisms
 - environment isolation backend
 - control-plane implementation language
 - browser automation and streaming technology

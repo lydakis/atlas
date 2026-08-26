@@ -110,14 +110,17 @@ Replace `aarch64-linux` with `x86_64-linux` for an x86 output.
 ## Architecture decision still open
 
 NixOS is the current prototype vehicle, not a commitment. The next product
-proof runs on physical hardware and exercises one environment, one isolated
-browser identity, one private route, and a second environment that cannot cross
-those boundaries. A bootc/OCI comparison follows once that behavior is concrete
-enough to port and compare honestly.
+proof follows the product-thesis checklist on physical hardware. Authenticated
+Surface v0 supplies its browser and takeover security boundary; the same proof
+also exercises environment entry, capability reporting, one private route,
+reboot, update, and a second environment that cannot cross those boundaries. A
+bootc/OCI comparison follows once that behavior is concrete enough to port and
+compare honestly.
 
 ## Documentation
 
 - [Product thesis](docs/product-thesis.md)
+- [Authenticated Surface v0](docs/authenticated-surface-v0.md)
 - [Interop contract](docs/interop-contract.md)
 - [Threat model](docs/threat-model.md)
 - [Physical host v0](docs/physical-host-v0.md)

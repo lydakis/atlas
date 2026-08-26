@@ -76,9 +76,10 @@ Atlas makes three commitments:
 1. **Existing tools work normally.** An agent client can treat an Atlas
    environment as an ordinary remote Linux target and retain its own project,
    worktree, terminal, and conversation model.
-2. **Authority is compartmentalized.** Files, processes, browser identities,
-   credentials, routes, and resource budgets belong to an enforceable
-   environment rather than becoming ambient host state.
+2. **Authority is compartmentalized.** Files and processes live inside an
+   enforceable environment, while Atlas-managed browser identities, grants,
+   routes, and resource budgets are bound to that environment rather than
+   becoming ambient host state.
 3. **A human can see and intervene.** Sensitive grants, browser control,
    recordings, private routes, health, updates, and recovery remain visible and
    controllable from a paired operator device.
@@ -99,15 +100,24 @@ path.
 
 ### Environment
 
-A persistent Linux compartment into which an existing agent tool connects. An
+A named, reusable trust context realized as a persistent Linux compartment. It
+is the target an existing agent tool selects or enters before work begins. An
 environment owns an enforceable OS principal, files, process and resource
-boundaries, network context, browser identities, grants, surfaces, routes, and
-activity.
+boundaries, and network context. Atlas binds browser identities, grants,
+surfaces, routes, and activity to the environment's opaque, non-reusable
+identity.
+
+An environment may define non-secret configuration. Secret values are not part
+of that configuration. Source credentials remain in an operator-owned or Atlas
+control-plane store by default; an explicitly approved materialized-secret grant
+is the degraded exception. Grants bind specific authority to the environment
+through an explicit delivery mode.
 
 An environment is not a repository or task. Codex, Herdr, T3 Code, Git, or the
 operator may clone repositories, create worktrees, run terminals, and manage
-projects inside it. Atlas should only add repository primitives later if a
-specific host-level guarantee cannot be supplied by those tools.
+projects and sessions inside it. Atlas should only add repository or session
+primitives later if a specific host-level guarantee cannot be supplied by those
+tools.
 
 ### Grant
 
@@ -120,7 +130,8 @@ a copy of the operator's password vault.
 
 A browser or graphical desktop that an agent can operate and an operator can
 observe, record, or take over. Browser profiles, cookies, screenshots,
-recordings, clipboard state, and downloads are sensitive environment state.
+recordings, clipboard state, and downloads are sensitive Atlas-managed state
+bound to an environment, not files owned by that environment.
 
 ### Route
 
@@ -176,16 +187,25 @@ before being trusted with consequential authority.
 
 ## Credential model
 
-Atlas distinguishes three forms of access.
+Atlas distinguishes three delivery modes.
 
-1. **Materialized secret:** a token or password is delivered to a process. The
-   process can read and exfiltrate it, so this is a documented degraded mode.
-2. **Brokered operation:** Atlas or a local helper performs a narrow operation
-   or produces a short-lived derivative credential without exposing the source
-   secret. Git credential helpers, SSH agents, cloud session credentials, and
-   request-signing proxies can fit this model.
+1. **Materialized runtime secret:** a source or derivative token, password,
+   file, or environment variable is copied into the environment. Its processes
+   can read and exfiltrate it, so Atlas always reports this as degraded and says
+   whether the value is a source credential or scoped derivative.
+2. **Derived or brokered authority:** Atlas or a local helper performs a narrow
+   operation or produces a short-lived derivative credential without exposing
+   the source secret. Git credential helpers, SSH agents, cloud session
+   credentials, and request-signing proxies can fit this model.
 3. **Browser identity:** session credentials remain in a protected browser
-   profile while an agent receives permission to operate a browser surface.
+   profile while the environment receives permission to operate a browser
+   surface.
+
+An environment is the default authority boundary. Unless Atlas can prove a
+narrower process identity and confinement boundary, every process inside one
+environment must be treated as capable of using its runtime authority. Agent
+instances that require different authority sets belong in separate
+environments.
 
 Browser control is authority, even when the agent never receives the original
 password. An agent controlling a logged-in browser can act as that user. Raw
@@ -260,7 +280,7 @@ product behavior rather than choose a base from image mechanics alone.
 ## Delivery sequence
 
 1. **Physical host:** persistent installation, private enrollment, SSH,
-   encrypted state design, update, and recovery.
+   encrypted state with a declared unlock mode, update, and recovery.
 2. **Environment:** one enforceable Linux compartment that an existing agent
    client can use as a normal remote target.
 3. **Surface:** one isolated browser profile with observation, recording, and
@@ -271,6 +291,11 @@ product behavior rather than choose a base from image mechanics alone.
 6. **Isolation proof:** demonstrate that a second environment cannot cross any
    file, process, profile, grant, surface, route, or resource boundary.
 7. **Reconstruction:** reboot and update without losing state declared durable.
+
+The [Authenticated Surface v0](authenticated-surface-v0.md) contract supplies
+the security boundary for the environment, surface, and browser-grant steps
+inside this end-to-end proof. It stores an isolated authenticated browser
+session rather than importing the operator's password vault.
 
 ## First proof
 
@@ -287,7 +312,8 @@ Atlas v0 succeeds when:
    one holding its grant.
 6. An agent uses the browser while the operator can observe, take over, record,
    and revoke access.
-7. Raw source credentials are never placed in the environment or Nix store.
+7. The operator source password used for the browser proof is never placed in
+   the environment, browser password storage, or Nix store.
 8. One service becomes reachable through an explicit private route without a
    public listener or manual port forwarding.
 9. Reboot and update preserve or deliberately reconstruct documented durable

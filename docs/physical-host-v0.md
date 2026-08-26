@@ -109,3 +109,6 @@ The next artifact must install to an explicitly selected disk and define:
 - a factory-reset operation that is explicit and recoverable where possible
 
 Disk installation is intentionally not automated until those choices are made.
+An installed, encrypted state boundary with one declared and tested unlock and
+recovery mode is a prerequisite for the
+[Authenticated Surface v0](authenticated-surface-v0.md) milestone.

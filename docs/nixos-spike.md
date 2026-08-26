@@ -185,12 +185,13 @@ next gates are:
 
 1. Boot the live image on one representative x86 computer and validate
    interactive Tailscale SSH without a public listener.
-2. Choose a persistent disk and recovery design, including encrypted state and
-   the unattended-unlock tradeoff.
+2. Implement and test a persistent disk and recovery design, including encrypted
+   state and one declared automatic or operator-assisted unlock mode.
 3. Build one environment that an existing agent client can enter as a normal
    remote Linux target.
-4. Add one isolated browser identity, observable surface, and tailnet-private
-   route, then prove a second environment cannot cross those boundaries.
+4. Implement the [Authenticated Surface v0](authenticated-surface-v0.md)
+   contract, add one tailnet-private route, and prove a second environment
+   cannot cross those boundaries.
 5. Port that concrete behavior to a bootc/OCI spike and compare host definition,
    installation, updates, rollback, recovery, toolchain delivery, and operator
    complexity.
