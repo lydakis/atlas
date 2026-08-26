@@ -1,346 +1,258 @@
 # Atlas threat model
 
-Status: initial design threat model, August 2026
+Status: initial physical-host threat model, revised August 2026
 
 ## Overview
 
-Atlas turns a physical or virtual Linux machine into a remotely operated host for autonomous or semi-autonomous agent workloads. The host supervises durable workspaces and processes, exposes private previews and visual surfaces, brokers delegated credentials, and lets an operator inspect or take control.
+Atlas turns a dedicated physical Linux computer into a remotely operated host
+for existing agent clients. The intended host provides isolated environments,
+delegated grants, observable browser or desktop surfaces, private routes, and
+managed recovery without becoming an agent conversation or coding product.
 
-This repository contains product and interface design documents plus a bounded NixOS host architecture spike. The spike demonstrates a few host-policy controls, but it is not an Atlas implementation. The intended product boundary is defined in `docs/product-thesis.md`, and the caller, resource, and lifecycle contract is defined in `docs/interop-contract.md`. Except where `docs/nixos-spike.md` records runtime evidence, every mitigation below remains a security requirement or candidate control, not a claim about a complete product.
+This repository does not yet implement that product. It contains design
+contracts and a bounded NixOS spike. The spike defines Atlas state roots,
+control and environment resource slices, root-only Nix authority, interactive
+or runtime-secret Tailscale enrollment, a live physical ISO, and two hardened
+demonstration processes. It does not contain an environment manager, browser,
+credential broker, route proxy, audit service, persistent installer, or update
+controller.
+
+Threats below are requirements and hypotheses unless the evidence column says a
+control is implemented and tested. They are not confirmed vulnerabilities.
+
+### Components and source evidence
+
+| Component | Current role | Evidence |
+| --- | --- | --- |
+| Atlas host module | Declares state roots, host contract, Tailscale adapter, root-only Nix authority, control/environment slices, and accounts | `nixos/modules/atlas-host.nix` |
+| Spike configuration | Enables Tailscale and runs two hardened demonstration environment processes | `nixos/configurations/spike-host.nix` |
+| Host-contract tests | Check contract intent versus implementation, static configuration, absence of OpenSSH, generated state modes and ownership, environment namespaces, root-only Nix, safe option evaluation, and state survival | `nixos/tests/host-contract.nix`, `nixos/tests/module-evaluation.nix` |
+| Flake outputs | Build VM test artifacts and a non-persistent live ISO with local-console enrollment instructions | `flake.nix` |
+
+### Effective resources
+
+| Deployment or workflow | Resource or capability | Configuration and precedence | Safe effective value or location | Readers, writers, or recipients | Enforcing control | Evidence or unknowns |
+| --- | --- | --- | --- | --- | --- | --- |
+| All spike hosts | Mutable Atlas state | fixed v0 `atlas.host.dataRoot` | `/var/lib/atlas` with named subdirectories; separate storage must be mounted at that path | root and `atlas-control`; dynamic demonstration identities; future environment-specific owners | exact external-path option constraint and metadata-derived systemd-tmpfiles rules | Implemented and evaluation-tested; not an encrypted partition: `nixos/modules/atlas-host.nix`, `nixos/tests/module-evaluation.nix` |
+| Interactive enrollment | Tailnet and Tailscale SSH authority | `sudo atlas-enroll` invokes `tailscale up --qr --ssh` | Tailscale-managed state; no auth key embedded in the image | root, `tailscaled`, Tailscale control plane | local root plus tailnet policy | Implemented helper; live enrollment not yet integration-tested: `nixos/modules/atlas-host.nix` |
+| Automated enrollment | Tailscale auth key | operator-selected `atlas.host.tailscale.authKeyFile` | canonical external runtime path resolving outside `/nix/store` | root and NixOS Tailscale autoconnect service | external-path option type, dot-segment and store rejection, runtime resolution check, and file permissions supplied by deployer | Path representation is evaluation-tested; secret lifecycle untested: `nixos/modules/atlas-host.nix`, `nixos/tests/module-evaluation.nix` |
+| Host administration | `atlas-operator` authority | password-disabled local account in wheel; passwordless sudo | local OS account, reached only after selected remote enrollment or console access | tailnet identities allowed to log in as `atlas-operator`; anyone with the live ISO console | tailnet policy and physical possession of the live image | High-impact boundary; no Atlas policy layer yet: `nixos/modules/atlas-host.nix`, `flake.nix` |
+| Environment demonstrations | Process and loopback namespace | dynamic users, private network, hardened systemd services | separate service identities and network namespaces | each demonstration process only | systemd service sandboxing | Implemented and tested; not an interactive environment backend: `nixos/configurations/spike-host.nix`, `nixos/tests/host-contract.nix` |
+| Live physical image | First-boot console | ISO-only console autologin as password-disabled `atlas-operator` with passwordless sudo | ephemeral live system with host-root console authority | person with physical console access | physical possession and ISO-only configuration | Deliberately weak dogfood bootstrap; no persistent-image claim: `flake.nix` |
 
 ### Security objective
 
-Assume that agent workloads, generated code, repositories, dependencies, browser content, tool output, and remote websites can all be malicious. Atlas should contain their authority to an explicit workspace and workload, prevent silent access to host or operator secrets, keep exposed surfaces private unless deliberately shared, and preserve evidence sufficient for investigation and revocation.
+Assume that agent clients, environment processes, generated code, repositories,
+dependencies, browser content, tool output, and remote websites can be
+malicious. Atlas should contain their authority to an explicit environment,
+prevent silent access to host or operator secrets, keep routes private unless
+deliberately shared, preserve evidence for investigation and revocation, and
+retain a recovery path when the private network or control plane fails.
 
 ### Highest-value assets
 
-- operator identity, pairing keys, device keys, and recovery authority
-- source credentials from which delegated access is derived
-- short-lived tokens, SSH material, browser cookies, and authenticated profiles
-- source code, uncommitted work, artifacts, and workspace history
-- Atlas control-plane privileges and host root authority
-- signing keys, build provenance, update metadata, and recovery images
-- host identity, network membership, DNS names, and preview routes
-- audit records and evidence of sensitive actions
-- host compute, storage, network, and service availability
+- host root authority, update trust roots, and recovery mechanisms
+- operator identity, tailnet policy, paired devices, and enrollment authority
+- source credentials and derivative grants
+- browser cookies, authenticated profiles, recordings, clipboard, and downloads
+- source code, uncommitted work, artifacts, and environment state
+- route names, targets, authorization, and access history
+- audit records and attribution evidence
+- disk-encryption and backup keys
 - downstream product identities, including Blue and Fabric principals
 
-### Scope
+### Trust zones
 
-The initial scope includes the Atlas host, its managed or integrated Linux installation, local APIs and CLI, workspace branches and writer leases, workload and session boundaries, preview routing, browser and display services, credential brokering, inbound and outbound networking, pairing, remote operator access, updates, recovery, and optional Atlas-compatible remote services.
+```mermaid
+flowchart TD
+    O[Operator device] -->|Tailnet reachability and operator authentication| H[Atlas host control plane]
+    C[Existing agent client] -->|SSH or remote environment entry| EA[Environment A]
+    C -->|SSH or remote environment entry| EB[Environment B]
+    H -->|Create, constrain, inspect, stop| EA
+    H -->|Create, constrain, inspect, stop| EB
+    H --> G[Grant broker]
+    H --> S[Surface broker]
+    H --> R[Private route broker]
+    G -->|Scoped authority| EA
+    S -->|Browser or desktop control| EA
+    R -->|Authenticated private endpoint| O
+    EA --> I[Internet and hostile content]
+    EB --> I
+    U[Signed update supply chain] --> H
+    P[Physical storage] --- H
+```
 
-The operator device, third-party agent clients, downstream services, private-network provider, and distribution supply chain are external systems whose trust relationships must be explicit.
+The grant, surface, and route brokers are intended components, not current
+implementation claims.
 
 ## Threat Model, Trust Boundaries, and Assumptions
 
 ### Actors and attacker capabilities
 
-- **Legitimate operator:** pairs devices, creates workspaces, grants access, approves sensitive actions, and performs recovery. The operator can still make dangerous mistakes.
-- **Agent workload:** runs attacker-influenced code and commands. It may attempt privilege escalation, secret extraction, persistence, evasion, or interference with other workloads.
-- **Agent client or harness:** launches and observes work but may be buggy, compromised, or dishonest about logical agent identity.
-- **Malicious repository or dependency:** supplies build scripts, hooks, binaries, tests, or package lifecycle actions that execute within a workload.
-- **Remote content attacker:** controls a website, prompt injection, tool response, API result, issue, document, or preview request seen by an agent.
-- **Network attacker:** can scan or intercept reachable services and may control a local or public network, but does not initially possess trusted device keys.
-- **Compromised workspace peer:** already controls one workspace and tries to cross into another workspace or the host.
-- **Physical attacker:** steals or accesses a powered-off or unattended Atlas machine.
-- **Supply-chain attacker:** compromises an Atlas dependency, build system, update channel, mirror, package repository, or optional remote service.
-- **Resource-exhaustion attacker:** consumes CPU, memory, disk, file descriptors, ports, browser processes, or network capacity to deny service or evade logging.
+- **Legitimate operator:** owns the machine and tailnet, approves authority, and
+  performs recovery. The operator can still make dangerous policy mistakes.
+- **Environment process:** runs attacker-influenced code and may attempt host
+  escape, persistence, exfiltration, or interference with another environment.
+- **Agent client or harness:** connects through a normal remote interface but
+  may be buggy, compromised, or dishonest about its logical agent identity.
+- **Malicious repository or dependency:** controls build scripts, hooks,
+  binaries, tests, and package lifecycle operations inside an environment.
+- **Remote content attacker:** controls a website, prompt injection, tool
+  response, issue, document, or route request seen by an agent.
+- **Tailnet peer attacker:** has network membership but not necessarily Atlas
+  operator or environment authority.
+- **Public-network attacker:** can scan public or LAN interfaces and influence
+  untrusted networks but does not initially hold tailnet or device keys.
+- **Physical attacker:** steals or accesses an unattended machine or its disk.
+- **Supply-chain attacker:** compromises a dependency, build system, update
+  channel, package repository, or optional remote service.
+- **Resource-exhaustion attacker:** consumes CPU, memory, disk, file descriptors,
+  browser processes, recordings, routes, or network capacity.
 
-### Trust boundaries
+### Important trust boundaries
 
-```text
-Operator device
-      │ pairing, approvals, attach, recovery
-      ▼
-Remote access boundary ───── optional rendezvous or relay
-      │
-      ▼
-Atlas host control plane ─── update and supply-chain boundary
-      │         │
-      │         └──────── credential broker ─── downstream services
-      │
-      ├──────── workspace A / workload identity ─── internet and web content
-      │                  │
-      │                  ├── preview and browser/display surfaces
-      │                  └── durable workspace storage
-      │
-      └──────── workspace B / workload identity
-```
-
-The important boundaries are:
-
-1. **Operator device to host:** remote reachability must not equal operator authority.
-2. **Agent client to host:** client-supplied labels are input, not authentication.
-3. **Host control plane to workload:** workloads are expected to be hostile and must not write control-plane binaries, policy, sockets, logs, or update state.
-4. **Workspace to workspace:** each workspace has separate identity, resources, files, profiles, grants, and event attribution.
-5. **Workload to credential broker:** a workload receives only an approved derivative capability, never the operator's source credential.
-6. **Workload to visual surface:** browser profiles, automation endpoints, displays, clipboard state, recordings, and takeover channels carry sensitive data.
-7. **Workload to internet:** an internet-enabled workload can transmit any data and bearer capability it is allowed to read.
-8. **Preview to network:** local services become reachable across a new routing and authentication boundary.
-9. **Host to optional remote service:** rendezvous, relay, sharing, and audit services must have narrowly defined access and failure behavior.
-10. **Installed system to update supply chain:** privileged updates can replace every local control.
-11. **Persistent storage to physical access:** an unattended machine may contain source, tokens, browser state, logs, and pairing material.
-
-### Assumptions
-
-- The v0 operator is a single administrative trust domain. Safe multi-tenant hosting is not assumed.
-- An operator device is trusted after cryptographic pairing until explicitly revoked.
-- Kernel, firmware, hypervisor where present, and hardware root-of-trust mechanisms are outside Atlas's ability to make trustworthy after compromise.
-- Agent workloads do not require unrestricted host root. Work that genuinely requires elevated authority crosses an explicit approval boundary.
-- External services enforce the scopes and expiry of credentials they issue.
-- Network privacy tools reduce exposure but do not replace application authentication and authorization.
-- Recovery SSH is a privileged break-glass path and must be secured, observable, and revocable.
-- Atlas may broker a downstream identity but is not automatically that downstream principal.
-- The default v0 developer profile permits internet egress. Network isolation is not assumed to provide data-loss prevention.
+1. **Operator device to host:** private reachability does not itself prove Atlas
+   operator authority.
+2. **Tailnet to local OS account:** permission to log in as `atlas-operator`
+   currently yields passwordless sudo and must be treated as host-root access.
+3. **Agent client to environment:** client-supplied labels are input, not
+   authentication; environment entry must map to an observed kernel identity.
+4. **Host control plane to environment:** environments are hostile and cannot
+   write policy, host binaries, sockets, audit state, enrollment state, or
+   update trust roots.
+5. **Environment to environment:** files, processes, profiles, grants, surfaces,
+   routes, resources, and activity attribution remain separate.
+6. **Environment to grant broker:** an environment obtains only approved
+   derivative authority and never the operator's source credential.
+7. **Environment to surface:** profiles, automation endpoints, displays,
+   clipboard, downloads, screenshots, recordings, and takeover carry sensitive
+   authority and data.
+8. **Route to private network:** a loopback service becomes reachable across a
+   new authentication and routing boundary only after explicit publication.
+9. **Environment to internet:** an internet-enabled process can transmit any
+   data or bearer capability it can read.
+10. **Installed host to update supply chain:** a privileged update can replace
+    every local control.
+11. **Persistent storage to physical access:** an unattended box may contain
+    code, profiles, tokens, logs, and pairing state.
 
 ### Security invariants
 
-1. A process cannot gain authority by self-asserting a workspace, client, agent, or model identifier.
-2. A process receives Atlas workspace capabilities only after crossing an authenticated launch boundary.
-3. One workspace cannot read, signal, trace, attach to, route through, or consume grants belonging to another workspace unless policy explicitly allows it.
-4. A writable workspace branch has one active writer lease. Independent concurrent writers use separate branches.
-5. Agent workloads cannot modify the Atlas control plane, security policy, audit sink, update trust roots, or host credential store.
-6. Source credentials are not present in workload environment variables, home directories, command lines, logs, or browser profiles.
-7. A delegated grant is scoped to a principal, audience, operation set, and expiry, and can be revoked. It is workload-bound by default.
-8. Browser profiles, cookies, debugging endpoints, recordings, clipboards, and downloads follow the same workspace boundary as the workload.
-9. Preview routes are private and authenticated by default. Discovery alone does not publish a route. Public sharing is separate, explicit, narrow, expiring, and visible.
-10. Pairing proves possession of operator and host key material, resists replay, and produces a revocable device relationship.
-11. Security-relevant activity is recorded outside workload control and can be exported off-host or made tamper-evident.
-12. Updates are authenticated, rollback-aware, and unable to silently reduce declared security guarantees.
-13. Resource exhaustion in one workload does not prevent the operator from inspecting, stopping, or recovering the host.
-14. Losing an optional hosted service does not remove local recovery or strand declared durable state.
+1. A process cannot gain authority by self-asserting an environment, client,
+   agent, task, workspace, or model identifier.
+2. A process receives environment capabilities only through an authenticated
+   entry that the host binds to a kernel-enforced principal.
+3. One environment cannot read, signal, trace, attach to, route through, or use
+   another environment's files, profiles, grants, surfaces, or routes by
+   default.
+4. Ordinary environments cannot modify the Atlas control plane, audit sink,
+   update policy, recovery material, or host credential store.
+5. Source credentials never enter the Nix store, process arguments, logs, or an
+   environment's ordinary filesystem.
+6. Materialized bearer secrets are reported as a degraded grant mode. Brokered
+   operations and derivative credentials are preferred where supported.
+7. A grant is bound to an environment, audience, operations, and expiry and can
+   be revoked without granting the environment access to its source secret.
+8. A browser profile and its derived session credentials are bound to one
+   environment and protected by the surface broker. Atlas accurately reports
+   when an automation protocol can export cookies or equivalent authority.
+9. Surface observation and control are explicit. At most one party holds
+   interactive control, and recording state is visible.
+10. Routes are unpublished by default, target only the owning environment, and
+    require private authentication unless an explicit public grant exists.
+11. Tailnet membership is network reachability, not ambient host, environment,
+    grant, surface, or route authorization.
+12. Security events are written outside environment control and distinguish
+    proven host identity from unverified client annotations.
+13. Resource exhaustion in one environment cannot prevent the operator from
+    inspecting, stopping, or recovering the host.
+14. Authenticated updates preserve declared guarantees or fail visibly with a
+    tested recovery path.
 
-### Explicit non-guarantees in the first design
+### Assumptions and explicit non-guarantees
 
-- Atlas does not make arbitrary downloaded code safe.
-- Atlas does not solve malicious or exploitable host kernels, firmware, or hypervisors.
-- Atlas cannot prove prompt-level or logical subagent attribution without trustworthy client provenance.
-- Atlas does not promise hostile public multi-tenancy in v0.
-- Atlas does not prevent an explicitly authorized agent from misusing authority within the granted scope.
-- Atlas v0 does not prevent an internet-enabled workload from transmitting source, artifacts, tokens, or other data it is legitimately allowed to read.
-- Atlas does not make public previews safe merely by placing authentication in front of an exploitable application.
-- Atlas does not guarantee confidentiality after an operator grants live browser or display takeover to a compromised device.
+- The first operator is one administrative trust domain. Hostile public
+  multi-tenancy is not assumed.
+- Kernel, firmware, selected isolation backend, private-network provider, and
+  hardware roots of trust remain trusted dependencies.
+- The default developer environment may use the public internet. Atlas v0 does
+  not provide data-loss prevention for data that environment may read.
+- Browser control is account authority. Atlas cannot prevent an authorized
+  environment from misusing the website actions it has been granted.
+- Tailscale policy is externally administered. Atlas cannot prove a tailnet rule
+  is safe merely because the node is enrolled.
+- Client-owned terminals and arbitrary processes are not reconstructed after a
+  disconnect or reboot unless explicitly declared and supervised.
+- The current spike has no persistent disk encryption, browser, grant broker,
+  route proxy, environment login boundary, audit implementation, signed Atlas
+  releases, or physical-hardware evidence.
+- The live ISO's local-console autologin is a dogfood bootstrap, not an
+  acceptable persistent appliance control.
 
 ## Attack Surface, Mitigations, and Attacker Stories
 
-### 1. Local control API and privileged helpers
-
-**Attacker story:** A malicious repository sends requests to the Atlas Unix socket, spoofs another workspace identifier, exploits a parser or helper, and obtains host-level operations.
-
-**Required mitigations:**
-
-- authenticate Unix-socket callers from peer credentials and kernel-enforced workload membership
-- minimize privileged API surface and split high-risk helpers by capability
-- use typed, versioned messages with strict size, path, and argument validation
-- never construct privileged shell commands from request strings
-- bind every authorization decision to the observed principal and current policy
-- rate-limit requests and make sensitive mutations idempotent and auditable
-- fuzz parsers and add cross-workspace authorization regressions
-
-### 2. Workspace isolation and host escape
-
-**Attacker story:** Generated code exploits permissive mounts, Linux capabilities, device access, namespace configuration, Docker sockets, ptrace, or a shared cache to escape its workspace or steal another workspace's data.
-
-**Required mitigations:**
-
-- run workloads as distinct non-root OS principals with cgroup or systemd-scope ownership
-- deny host Docker and control-plane sockets from ordinary workloads
-- drop Linux capabilities, constrain devices, mounts, ptrace, IPC, and kernel interfaces
-- use stronger container, user-namespace, microVM, or VM isolation where risk requires it
-- partition writable state, browser profiles, caches, temporary directories, and runtime sockets
-- allow cross-workspace cache reuse only through immutable content-addressed data or a mediated publication path; never use an untrusted shared writable cache
-- make isolation guarantees discoverable through conformance, not inferred from marketing names
-
-### 3. Credential broker and secret delivery
-
-**Attacker story:** Prompt injection convinces an agent to request a broad token, reads it from another process, exfiltrates it to a website, or reuses it after the operator believes it was revoked.
-
-**Required mitigations:**
-
-- keep source credentials in a control-plane store inaccessible to workloads
-- prefer on-demand protocol helpers or proxied operations over bearer-token materialization
-- issue the narrowest available audience, repository, operation, and duration scope
-- bind grants to the requesting workspace or workload and reject cross-principal replay
-- show approvals outside agent-controlled output with exact scope and expiry
-- log requests, issuance, use where observable, denial, expiry, and revocation without logging secrets
-- support immediate revocation and quarantine of a compromised workspace
-- treat services that cannot issue meaningfully scoped credentials as a documented degraded mode
-
-### 4. Outbound network and data exfiltration
-
-**Attacker story:** A malicious dependency or prompt-injected agent sends readable source code, artifacts, browser data, or a freshly issued bearer token to an attacker-controlled internet service.
-
-**Required mitigations and declared limits:**
-
-- state plainly that the default v0 developer profile permits ordinary internet egress and does not provide data-loss prevention
-- prevent workload routes to the host control plane, other workspaces, cloud metadata endpoints, and private infrastructure unless explicitly delegated
-- prefer audience-bound proxied operations over copyable bearer credentials where downstream services support them
-- make egress capability and any restrictions visible through workload policy and `atlas doctor`
-- support deny-by-default, destination-allowlisted, or proxied egress profiles for higher-risk work in later milestones
-- record useful connection metadata when policy and privacy requirements permit, without implying that logging blocks exfiltration
-- treat disclosure of data inside a workload's documented readable and network authority as misuse of granted authority, not proof of an isolation escape
-
-### 5. Browser, display, and takeover
-
-**Attacker story:** A hostile page steals an authenticated profile, reaches a browser-debug endpoint, reads clipboard or downloads, escapes through a browser vulnerability, or tricks an operator into taking over a deceptive session.
-
-**Required mitigations:**
-
-- isolate browser processes and profiles per workspace and trust level
-- keep automation and debugging endpoints on authenticated local boundaries, never open wildcard listeners
-- separate ephemeral automation profiles from high-trust human-assisted profiles
-- make takeover state, controlling party, recording state, and return of control unambiguous
-- require a fresh operator action before injecting sensitive input into an agent-visible session
-- sanitize filenames and isolate downloads from executable control-plane paths
-- patch browsers rapidly and consider stronger sandbox or VM boundaries for high-trust profiles
-- treat screenshots, video, clipboard, and browser history as sensitive workspace artifacts
-
-### 6. Preview discovery and routing
-
-**Attacker story:** A workload publishes an unintended administrative port, uses the router for SSRF, steals another preview hostname, or causes an unauthenticated development server to become public.
-
-**Required mitigations:**
-
-- default every discovered service to private and unpublished
-- require an explicit policy or command to create a route
-- bind routes to workspace identity and verify the target process or namespace
-- authenticate before proxying, use unguessable handles only as a secondary defense, and expire shares
-- prevent arbitrary upstream targets, host-network pivots, metadata access, and cross-workspace routing
-- display route visibility, owner, target, expiry, and recent access in activity
-- apply request, bandwidth, and connection limits
-
-### 7. Pairing, remote control, and recovery
-
-**Attacker story:** An attacker observes a pairing code, replays enrollment, takes over an abandoned device, or uses recovery SSH to bypass Atlas authorization.
-
-**Required mitigations:**
-
-- use short-lived, single-use pairing ceremonies bound to host and device public keys
-- require local or already trusted confirmation for high-impact enrollment where feasible
-- authenticate and encrypt every control channel independently of private-network membership
-- enumerate, expire, and revoke paired devices and active sessions
-- make recovery SSH opt-in or tightly configured, key-only, separately logged, and revocable
-- provide a physical or console recovery path that rotates host and device trust after compromise
-
-### 8. Optional hosted services
-
-**Attacker story:** A compromised rendezvous or relay redirects an operator, impersonates a host, reads relayed content, extends a public share, or blocks recovery.
-
-**Required mitigations:**
-
-- preserve end-to-end host and operator authentication through relays
-- give rendezvous services metadata and routing authority only, not host-control credentials
-- encrypt sensitive relayed payloads end to end where practical
-- make public-share expiry and revocation host-enforced
-- define offline and self-hosted paths and keep local recovery independent
-- minimize retained metadata and document exactly what a hosted service can observe
-
-### 9. Update and software supply chain
-
-**Attacker story:** A malicious package, mirror, CI job, signing-key compromise, or downgrade replaces privileged Atlas components on every host.
-
-**Required mitigations:**
-
-- authenticate release metadata and artifacts with offline-protected trust roots
-- produce reproducible or attestable builds with an auditable dependency inventory
-- separate OS, Atlas, and workspace package trust domains
-- prevent workloads from modifying update configuration or trusted keys
-- use staged rollout, health checks, rollback, anti-downgrade policy, and emergency revocation
-- surface update provenance and current security state through `atlas doctor`
-- retain a documented recovery path that does not depend on the compromised channel
-
-### 10. Audit integrity and attribution
-
-**Attacker story:** A compromised workload deletes logs, floods the event stream, forges an agent identifier, or stores secrets in arguments so that Atlas itself leaks them later.
-
-**Required mitigations:**
-
-- write security events through a control-plane-owned path inaccessible to workloads
-- use kernel-derived workspace and workload identity in records
-- distinguish proven host identity from unverified client annotations
-- redact environment values, tokens, headers, command payloads, and sensitive browser data by default
-- rate-limit low-value events without dropping security state transitions
-- chain, sign, or export important records to an operator-controlled off-host sink
-- document retention and provide a deletion policy for sensitive recordings and artifacts
-
-### 11. Resource exhaustion and availability
-
-**Attacker story:** A fork bomb, browser swarm, disk-filling build, network flood, or log storm prevents inspection and leaves the host unrecoverable.
-
-**Required mitigations:**
-
-- apply per-workspace CPU, memory, process, file-descriptor, disk, and network budgets
-- reserve resources for control-plane and recovery services
-- enforce storage quotas and bounded logs, recordings, snapshots, and browser caches
-- provide operator-visible pressure signals and deterministic stop, quarantine, and cleanup actions
-- test recovery during exhausted memory and disk conditions
-- keep destructive cleanup explicit and separate from durable-state deletion
-
-### 12. Persistent storage and physical theft
-
-**Attacker story:** A thief removes a drive or boots alternate media and extracts repositories, browser cookies, pairing keys, or cached credentials.
-
-**Required mitigations:**
-
-- support full-disk encryption with a documented unattended-boot tradeoff
-- use hardware-backed key sealing where compatible with recovery requirements
-- encrypt especially sensitive credential and browser stores separately where useful
-- avoid retaining source credentials and minimize token lifetime at rest
-- make remote device revocation and downstream credential revocation possible after theft
-- define backup encryption, restore authorization, and secure factory-reset semantics
-
-### 13. Integration collisions and confused deputy behavior
-
-**Attacker story:** Two clients believe they own the same workspace or terminal, a client passes an Atlas capability to the wrong task, or Atlas applies Blue policy on behalf of a process it merely hosts.
-
-**Required mitigations:**
-
-- keep Atlas resource identities separate from client conversation and session identifiers
-- allow one active writer lease per workspace branch and require forks for independent concurrent mutation
-- require an exclusive control lease for terminal input and browser takeover while keeping observer attachment explicit
-- scope capabilities to audience and principal rather than reusable bearer handles
-- bind grants to workloads by default; workspace policy may preauthorize a request but must not make a reusable credential ambient
-- make lifecycle ownership and takeover visible to all attached operators or clients
-- keep downstream authorization in the consuming product and enforce only explicit machine-local grants
-- never let Atlas act as a Blue or Fabric principal solely because it hosts a Blue workload
+| Priority | Scenario and capability gain | Prerequisites | Impact | Existing controls | Required mitigation | Evidence |
+| --- | --- | --- | --- | --- | --- | --- |
+| Critical hypothesis | Tailnet policy lets an unintended peer log in as `atlas-operator`, gaining passwordless sudo and host root | enrolled host plus permissive network and SSH policy | total host, environment, credential, and update compromise | password-disabled local account, Tailscale-only intended path, no OpenSSH | require a dedicated Atlas tailnet tag, narrow source identities, fresh check for administrator login, device revocation, and local recovery | Current authority is visible in `nixos/modules/atlas-host.nix` and `flake.nix`; tailnet policy is external and unverified |
+| Critical hypothesis | Update or build compromise replaces the Atlas host or enrollment helper | compromised nixpkgs input, release process, signing key, or builder | fleet-wide privileged code execution | pinned flake input and root-only Nix authority | signed release metadata, provenance, staged rollout, health checks, anti-downgrade, and offline recovery | Pin and Nix policy implemented in `flake.lock` and `nixos/modules/atlas-host.nix`; release controls absent |
+| High hypothesis | An environment escapes through mounts, devices, capabilities, ptrace, namespaces, or a privileged socket | hostile process inside environment | host root or another environment's data and authority | demonstration services use dynamic users, private network, dropped capabilities, and read-only host protections | choose and test an interactive environment backend; deny control sockets; isolate writable state, devices, IPC, and caches | Demonstration only: `nixos/configurations/spike-host.nix` |
+| High hypothesis | A second environment reads another environment's browser profile, grant, recording, or code | two persistent environments and an incomplete filesystem boundary | cross-environment identity and data theft | top-level sensitive state roots have restrictive ownership where implemented | per-environment ownership or isolated mount trees; cross-environment regression tests; immutable shared caches | Top-level modes implemented by `nixos/modules/atlas-host.nix`; per-environment backend absent |
+| High hypothesis | A raw browser-debug endpoint lets an authorized environment export cookies or reusable session credentials | persistent authenticated profile plus broad automation protocol | durable account takeover outside Atlas | none implemented | capability-specific browser adapters, authenticated local endpoints, protected profile filesystem, narrower action-only mode for high-trust identities, fast browser patching | Design requirement only |
+| High hypothesis | Prompt injection obtains a broad or long-lived token and exfiltrates it | credential broker or materialized secret plus internet egress | downstream account or repository compromise | runtime secret root reserved; canonical external-path and resolved-target constraints for enrollment key | narrow derivative grants, out-of-band approval, audience binding, revocation, no secret logging, degraded-mode reporting | General broker absent; enrollment-key path tests at `nixos/tests/module-evaluation.nix` |
+| High hypothesis | A route publishes an administrative or unintended port, pivots to host metadata, or targets another environment | future route broker with attacker-controlled target | private data exposure, SSRF, or cross-environment access | no route is currently implemented or exposed | explicit publication, environment-bound upstream validation, private authentication, expiry, rate limits, and public sharing as separate grant | Design requirement only |
+| High hypothesis | Physical theft exposes source, browser sessions, grants, tailnet state, or recovery material | persistent unencrypted installation | offline credential and data theft | current live ISO is ephemeral | full-disk encryption, hardware-backed sealing where supportable, separate sensitive stores, encrypted backups, remote revocation, secure reset | Persistent installer and encryption absent |
+| Medium hypothesis | Tailscale auth key leaks from a declarative build or broadly readable runtime file | automated enrollment using `authKeyFile` | unauthorized node enrollment or tailnet access within key scope | canonical external runtime-path type, Nix-store and resolved-target rejection, and evaluation regression | require short-lived scoped keys, strict file mode, deletion after enrollment, rotation, and no logging | Nix-path, store-path, and dot-segment representations rejected by `nixos/tests/module-evaluation.nix`; runtime lifecycle remains open |
+| Medium hypothesis | A malicious environment exhausts resources and blocks inspection or recovery | interactive environment with unbounded CPU, memory, tasks, disk, or recordings | host denial of service and possible state loss | separate weighted slices, control-plane memory reservation, systemd-oomd | per-environment quotas, bounded logs and recordings, pressure tests, deterministic quarantine and cleanup | Slice controls in `nixos/modules/atlas-host.nix`; per-environment quotas absent |
+| Medium hypothesis | A client label or logical agent identifier is trusted as the environment principal | capability-aware client or local control socket | confused-deputy access to another environment | contract requires kernel identity; no control daemon exists | authenticate peer credentials and boundary membership; bind every grant and route to the observed principal | Design requirement only |
+| Medium hypothesis | Local-console autologin on a persistent image gives anyone with physical access host administration | ISO bootstrap copied into installed system | local host-root access | autologin is scoped to the live ISO output | remove autologin from persistent images; use single-use enrollment and authenticated recovery | ISO-only configuration in `flake.nix` |
+| Medium hypothesis | An environment deletes or floods activity evidence or places secrets in logged arguments | future audit pipeline plus hostile process | loss of attribution or secondary secret exposure | audit root is control-owned; no audit writer exists | control-plane-owned event path, redaction, rate limits, tamper evidence, off-host export, retention controls | State root in `nixos/modules/atlas-host.nix`; implementation absent |
 
 ## Severity Calibration (Critical, High, Medium, Low)
 
-Severity reflects impact plus plausible exploitability on a dedicated agent host. Internet-reachable, cross-workspace, no-interaction, persistent, or supply-chain-wide paths raise severity. Explicit operator action, narrow scope, short lifetime, strong recovery, and complete evidence may lower it.
-
-Transmission by a default internet-enabled workload of data within its documented readable authority is an explicit v0 non-guarantee, not by itself an Atlas vulnerability. It becomes reportable when Atlas exposes data outside that authority, bypasses a declared egress policy, leaks a source credential, or falsely reports a restriction as enforced.
+Severity reflects plausible privilege gain and impact on a dedicated agent host.
+Internet reachability, cross-environment access, reusable identity theft,
+persistence, no-interaction exploitation, and fleet-wide supply-chain reach
+raise severity. Explicit operator action, narrow scope, short lifetime, reliable
+revocation, and proven recovery may lower it.
 
 ### Critical
 
-- remote compromise of the Atlas control plane or fleet update channel without prior pairing
-- extraction of operator source credentials or unrestricted downstream identities
-- cross-host signing or trust-root compromise that silently installs attacker code broadly
-- an Atlas path that acts as a Blue or Fabric principal without explicit downstream authorization
+- unauthenticated or unintended remote control of the Atlas host
+- extraction of operator source credentials or unrestricted downstream identity
+- compromise of the release channel that silently replaces privileged code on
+  many hosts
+- Atlas acting as a Blue or Fabric principal solely because it hosts a process
 
 ### High
 
-- workspace escape to host root or another workspace's source, browser profile, or grants
-- pairing or relay flaws that permit durable unauthorized host control
-- public exposure of a private preview containing sensitive data or privileged operations
-- theft of a high-trust browser profile or reusable delegated credential
-- audit bypass that makes sensitive credential use unattributable
+- environment escape to host root or another environment's code, profile, grant,
+  surface, or route
+- theft of a reusable authenticated browser identity
+- a private route becoming publicly reachable with sensitive operations
+- durable unauthorized host control through enrollment or recovery
 
 ### Medium
 
-- denial of service requiring operator recovery but not losing durable data or credentials
-- exposure of low-sensitivity workspace metadata to another paired user or workspace
-- a grant lasting beyond intended expiry but retaining narrow scope and prompt revocation
-- a takeover or concurrency flaw causing recoverable workspace corruption
+- denial of service requiring operator recovery without loss of protected data
+- a narrow grant lasting beyond intended expiry but remaining revocable
+- low-sensitivity environment metadata crossing an isolation boundary
+- local-console bootstrap exposure that requires physical access and affects
+  only a disposable live image
 
 ### Low
 
-- non-sensitive diagnostic leakage with no useful attack path
-- inaccurate capability reporting that causes inconvenience but not a security-boundary failure
-- activity gaps for ordinary, non-sensitive operations where security events remain intact
+- non-sensitive diagnostic leakage without a meaningful capability gain
+- inaccurate capability reporting that causes inconvenience but does not weaken
+  a security boundary
+- activity gaps for ordinary operations when sensitive state transitions remain
+  intact
 
-### Re-evaluation triggers
+Transmission by an internet-enabled environment of data within its documented
+readable authority is an explicit non-guarantee, not by itself an Atlas
+vulnerability. It becomes reportable when Atlas exposes data outside that
+authority, leaks a source credential, bypasses an enforced egress policy, or
+falsely reports a restriction as active.
 
-This model must be revisited when Atlas chooses a base OS, isolation backend, networking system, browser architecture, credential provider, update mechanism, remote service, multi-operator model, or first implementation. Each accepted architecture proposal should map its controls and residual risks back to the invariants and attacker stories above.
-
-Repository: local-workspace:sha256:16d6a2034d722e5037122313733d30e34c06b21e3e641e77583564bec9df7191
-Version: codex-security-snapshot/v1:sha256:a286c5028a680fd848057e152aff050f49dc7d757ba48d902eae4da9d1e3c447
+Re-evaluate the model when Atlas selects its persistent installer, environment
+backend, browser protocol, credential provider, route broker, update mechanism,
+or multi-operator model.

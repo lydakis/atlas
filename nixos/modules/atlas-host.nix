@@ -14,34 +14,146 @@ let
     types
     ;
 
-  stateDirectories = [
-    "audit"
-    "browser"
-    "caches"
-    "credentials"
-    "workspaces"
+  isNixStorePath = path: path == "/nix/store" || lib.hasPrefix "/nix/store/" path;
+  isSafeAuthKeyPath =
+    value:
+    let
+      path = toString value;
+      components = builtins.tail (lib.splitString "/" path);
+    in
+    builtins.match "^/[-A-Za-z0-9._+]+(/[-A-Za-z0-9._+]+)*$" path != null
+    && lib.all (component: component != "." && component != "..") components
+    && !(isNixStorePath path);
+
+  dataRoot = toString cfg.dataRoot;
+
+  stateRoot = {
+    group = "root";
+    mode = "0711";
+    owner = "root";
+  };
+
+  stateDirectoryLayout = {
+    audit = {
+      group = "atlas-control";
+      mode = "0750";
+      owner = "atlas-control";
+    };
+    "browser-profiles" = {
+      group = "root";
+      mode = "0711";
+      owner = "root";
+    };
+    caches = {
+      group = "root";
+      mode = "0711";
+      owner = "root";
+    };
+    control = {
+      group = "atlas-control";
+      mode = "0700";
+      owner = "atlas-control";
+    };
+    credentials = {
+      group = "atlas-control";
+      mode = "0700";
+      owner = "atlas-control";
+    };
+    environments = {
+      group = "root";
+      mode = "0711";
+      owner = "root";
+    };
+    grants = {
+      group = "atlas-control";
+      mode = "0700";
+      owner = "atlas-control";
+    };
+    recordings = {
+      group = "root";
+      mode = "0711";
+      owner = "root";
+    };
+    routes = {
+      group = "atlas-control";
+      mode = "0750";
+      owner = "atlas-control";
+    };
+  };
+
+  intendedPrimitives = [
+    "host"
+    "environment"
+    "grant"
+    "surface"
+    "route"
   ];
+
+  mkTmpfilesRule = path: metadata: "d ${path} ${metadata.mode} ${metadata.owner} ${metadata.group} - -";
+
+  atlasEnroll = pkgs.writeShellApplication {
+    name = "atlas-enroll";
+    runtimeInputs = [ pkgs.tailscale ];
+    text = ''
+      usage() {
+        echo "Usage: sudo atlas-enroll"
+        echo "Interactively enroll this host in Tailscale${lib.optionalString cfg.tailscale.ssh " and enable private SSH"}."
+      }
+
+      if [ "$#" -eq 1 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; then
+        usage
+        exit 0
+      fi
+
+      if [ "$#" -ne 0 ]; then
+        usage >&2
+        exit 2
+      fi
+
+      if [ "$EUID" -ne 0 ]; then
+        echo "atlas-enroll must run as root; use sudo atlas-enroll" >&2
+        exit 1
+      fi
+
+      exec tailscale up --qr ${lib.optionalString cfg.tailscale.ssh "--ssh"}
+    '';
+  };
 in
 {
   options.atlas.host = {
     enable = mkEnableOption "the Atlas static host contract";
 
     dataRoot = mkOption {
-      type = types.path;
+      type = types.addCheck types.externalPath (value: toString value == "/var/lib/atlas");
       default = "/var/lib/atlas";
       description = ''
-        Mutable Atlas state. This path deliberately sits outside the Nix store
-        and must be preserved independently of a system generation.
+        Fixed v0 mount point for mutable Atlas state. Deployments that use a
+        separate disk or volume must mount it at /var/lib/atlas. The path must
+        be preserved independently of a system generation.
       '';
     };
 
-    operatorAuthorizedKeys = mkOption {
-      type = types.listOf types.str;
-      default = [ ];
-      example = literalExpression ''[ "ssh-ed25519 AAAA... operator" ]'';
+    tailscale.enable = mkEnableOption "the Tailscale connectivity adapter";
+
+    tailscale.authKeyFile = mkOption {
+      type = types.nullOr (types.addCheck types.externalPath isSafeAuthKeyPath);
+      default = null;
+      example = literalExpression ''"/run/secrets/atlas-tailscale-auth-key"'';
       description = ''
-        Public keys allowed to enter the recovery operator account. SSH stays
-        disabled when this list is empty.
+        Optional external runtime path containing a short-lived Tailscale
+        enrollment key. Nix path values, non-canonical paths, and Nix store
+        paths are rejected. The resolved runtime path is also checked before
+        enrollment. When omitted, the operator enrolls interactively with
+        `sudo atlas-enroll`.
+      '';
+    };
+
+    tailscale.ssh = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Enable Tailscale SSH during enrollment. Authorization remains governed
+        by the operator's tailnet policy and local Atlas account boundaries.
       '';
     };
 
@@ -55,24 +167,56 @@ in
   config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = lib.hasPrefix "/" (toString cfg.dataRoot);
-        message = "atlas.host.dataRoot must be an absolute path";
+        assertion =
+          cfg.tailscale.authKeyFile == null
+          || !(isNixStorePath (toString cfg.tailscale.authKeyFile));
+        message = "atlas.host.tailscale.authKeyFile must be a runtime secret outside the Nix store";
       }
       {
-        assertion = (toString cfg.dataRoot) != "/nix" && !(lib.hasPrefix "/nix/" (toString cfg.dataRoot));
-        message = "atlas.host.dataRoot must not be inside the Nix store";
+        assertion = cfg.tailscale.authKeyFile == null || cfg.tailscale.enable;
+        message = "atlas.host.tailscale.enable must be true when authKeyFile is configured";
+      }
+      {
+        assertion = !config.services.openssh.enable;
+        message = "atlas.host requires OpenSSH to remain disabled; use Tailscale SSH for host administration";
       }
     ];
 
     atlas.host.contract = {
-      version = 1;
-      dataRoot = toString cfg.dataRoot;
-      stateDirectories = stateDirectories;
-      controlSlice = "atlas-control.slice";
-      workloadSlice = "atlas-workloads.slice";
-      nixAllowedUsers = [ "root" ];
-      nixTrustedUsers = [ "root" ];
-      remoteOperatorEnabled = cfg.operatorAuthorizedKeys != [ ];
+      version = 3;
+      intent.primitives = intendedPrimitives;
+      implementation.primitives = [ "host" ];
+      state = {
+        root = dataRoot;
+        rootMode = stateRoot.mode;
+        rootOwner = stateRoot.owner;
+        rootGroup = stateRoot.group;
+        directories = stateDirectoryLayout;
+      };
+      configuration = {
+        connectivity = {
+          openSshConfigured = false;
+          tailscale = {
+            adapterEnabled = cfg.tailscale.enable;
+            sshRequested = cfg.tailscale.enable && cfg.tailscale.ssh;
+            enrollmentMode =
+              if !cfg.tailscale.enable then
+                "disabled"
+              else if cfg.tailscale.authKeyFile == null then
+                "interactive"
+              else
+                "auth-key-file";
+          };
+        };
+        nix = {
+          allowedUsers = [ "root" ];
+          trustedUsers = [ "root" ];
+        };
+        resourceSlices = {
+          control = "atlas-control.slice";
+          environments = "atlas-environments.slice";
+        };
+      };
     };
 
     environment.etc."atlas/host-contract.json".text = builtins.toJSON cfg.contract;
@@ -83,12 +227,10 @@ in
       jq
       tmux
       util-linux
-    ];
+    ]
+    ++ lib.optional cfg.tailscale.enable atlasEnroll;
 
-    networking.firewall = {
-      enable = true;
-      allowedTCPPorts = lib.optionals (cfg.operatorAuthorizedKeys != [ ]) [ 22 ];
-    };
+    networking.firewall.enable = true;
 
     nix.settings = {
       allowed-users = lib.mkForce [ "root" ];
@@ -100,13 +242,11 @@ in
       trusted-users = lib.mkForce [ "root" ];
     };
 
-    services.openssh = mkIf (cfg.operatorAuthorizedKeys != [ ]) {
+    services.tailscale = mkIf cfg.tailscale.enable {
       enable = true;
-      settings = {
-        KbdInteractiveAuthentication = false;
-        PasswordAuthentication = false;
-        PermitRootLogin = "no";
-      };
+      openFirewall = true;
+      authKeyFile = cfg.tailscale.authKeyFile;
+      extraUpFlags = lib.optionals cfg.tailscale.ssh [ "--ssh" ];
     };
 
     security.sudo.wheelNeedsPassword = false;
@@ -129,10 +269,37 @@ in
         };
         script = ''
           set -eu
-          test -d ${lib.escapeShellArg (toString cfg.dataRoot)}
-          ${lib.concatMapStringsSep "\n" (directory: ''
-            test -d ${lib.escapeShellArg "${toString cfg.dataRoot}/${directory}"}
-          '') stateDirectories}
+          test -d ${lib.escapeShellArg dataRoot}
+          test "$(stat -c %a ${lib.escapeShellArg dataRoot})" = ${lib.escapeShellArg (lib.removePrefix "0" stateRoot.mode)}
+          test "$(stat -c %U ${lib.escapeShellArg dataRoot})" = ${lib.escapeShellArg stateRoot.owner}
+          test "$(stat -c %G ${lib.escapeShellArg dataRoot})" = ${lib.escapeShellArg stateRoot.group}
+          ${lib.concatStringsSep "\n" (
+            lib.mapAttrsToList (directory: metadata: ''
+              test -d ${lib.escapeShellArg "${dataRoot}/${directory}"}
+              test "$(stat -c %a ${lib.escapeShellArg "${dataRoot}/${directory}"})" = ${lib.escapeShellArg (lib.removePrefix "0" metadata.mode)}
+              test "$(stat -c %U ${lib.escapeShellArg "${dataRoot}/${directory}"})" = ${lib.escapeShellArg metadata.owner}
+              test "$(stat -c %G ${lib.escapeShellArg "${dataRoot}/${directory}"})" = ${lib.escapeShellArg metadata.group}
+            '') stateDirectoryLayout
+          )}
+        '';
+      };
+
+      services.tailscaled-autoconnect = mkIf (
+        cfg.tailscale.enable && cfg.tailscale.authKeyFile != null
+      ) {
+        preStart = ''
+          auth_key_path=${lib.escapeShellArg (toString cfg.tailscale.authKeyFile)}
+          if [ ! -f "$auth_key_path" ]; then
+            echo "Atlas Tailscale auth-key path is not a regular file: $auth_key_path" >&2
+            exit 1
+          fi
+          resolved="$(${pkgs.coreutils}/bin/readlink -f -- "$auth_key_path")"
+          case "$resolved" in
+            /nix/store|/nix/store/*)
+              echo "Atlas Tailscale auth-key path resolves inside the Nix store" >&2
+              exit 1
+              ;;
+          esac
         '';
       };
 
@@ -143,7 +310,7 @@ in
           MemoryLow = "256M";
           TasksMax = 2048;
         };
-        atlas-workloads.sliceConfig = {
+        atlas-environments.sliceConfig = {
           CPUWeight = 100;
           IOWeight = 100;
           TasksMax = 32768;
@@ -153,18 +320,15 @@ in
       targets.atlas-host = {
         description = "Atlas host contract is ready";
         wantedBy = [ "multi-user.target" ];
-        wants = [ "network-online.target" ];
-        after = [ "network-online.target" ];
+        wants = [ "network-online.target" ] ++ lib.optional cfg.tailscale.enable "tailscaled.service";
+        after = [ "network-online.target" ] ++ lib.optional cfg.tailscale.enable "tailscaled.service";
       };
 
-      tmpfiles.rules = [
-        "d ${toString cfg.dataRoot} 0750 atlas-control atlas-control - -"
-        "d ${toString cfg.dataRoot}/audit 0750 atlas-control atlas-control - -"
-        "d ${toString cfg.dataRoot}/browser 0711 root root - -"
-        "d ${toString cfg.dataRoot}/caches 0711 root root - -"
-        "d ${toString cfg.dataRoot}/credentials 0700 atlas-control atlas-control - -"
-        "d ${toString cfg.dataRoot}/workspaces 0711 root root - -"
-      ];
+      tmpfiles.rules =
+        [ (mkTmpfilesRule dataRoot stateRoot) ]
+        ++ lib.mapAttrsToList (
+          directory: metadata: mkTmpfilesRule "${dataRoot}/${directory}" metadata
+        ) stateDirectoryLayout;
     };
 
     users = {
@@ -176,14 +340,13 @@ in
         atlas-control = {
           isSystemUser = true;
           group = "atlas-control";
-          home = "${toString cfg.dataRoot}/control";
+          home = "${dataRoot}/control";
         };
 
         atlas-operator = {
           isNormalUser = true;
           extraGroups = [ "wheel" ];
           hashedPassword = "!";
-          openssh.authorizedKeys.keys = cfg.operatorAuthorizedKeys;
         };
       };
     };

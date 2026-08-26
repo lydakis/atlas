@@ -1,266 +1,344 @@
 # Atlas product thesis
 
-Status: working thesis, August 2026
+Status: working thesis, revised August 2026
 
 ## The picture
 
-Atlas is an operating environment for computers whose primary user is software.
+Atlas is an operating environment for computers whose primary user is
+software.
 
-Install it on a physical machine or VM that nobody needs to sit in front of. The machine becomes a dependable place where agents can write and run code, use websites and graphical applications, expose what they build, and continue working after every client disconnects. A human remains the operator and can inspect, approve, intervene, or take control.
+Flash it onto a physical computer that nobody plans to sit in front of. Pair
+the machine once, then use Codex, Herdr, T3 Code, SSH, Blue, or another agent
+interface from the devices already in your hands. Atlas makes the remote
+computer safe and useful for agents without becoming the way you talk to them.
 
 Atlas is headless, but not blind.
 
+## The product target is a dedicated computer
+
+The primary Atlas product is a managed image for a physical machine dedicated
+mostly or entirely to agents. Owning the system can provide boot-to-ready
+behavior, predictable storage, private remote access, isolation, unattended
+updates, rollback, and recovery.
+
+Virtual machines remain useful in three supporting roles:
+
+- fast development and automated testing of the Atlas image
+- an optional trial or server deployment when dedicated hardware is unavailable
+- a possible internal isolation backend for higher-risk environments
+
+Running an Atlas VM on a person's laptop for every agent is not the initial
+product story. It inherits the laptop's availability, security domain, and
+resource constraints, and overlaps with existing local sandbox products.
+
 ## The problem
 
-Giving an agent a remote shell is easy. Giving it a complete, durable, observable computer is not.
+Agent interfaces are improving quickly. They already own conversations,
+projects, agent selection, terminals, diffs, task state, and human supervision.
+Atlas should make those products better rather than recreate them.
 
-Today an operator must assemble Linux, SSH, private networking, persistent sessions, workspaces, containers, browsers, virtual displays, port forwarding, credentials, audit, updates, backups, and recovery. Each agent interface either rebuilds part of this stack or assumes somebody else already did.
+The missing layer is the unattended computer beneath them. An operator still
+has to assemble and maintain:
 
-T3 Code, Herdr, the Codex app, agent CLIs, and products such as Blue solve a different problem. They determine how people launch, supervise, and communicate with agents. They should not each have to turn an arbitrary computer into a safe and dependable agent host.
+- private networking and secure remote login
+- isolation between unrelated agents and identities
+- browser profiles, graphical displays, observation, takeover, and recording
+- safe delivery of credentials and website authority
+- private access to services bound to local ports
+- durable storage, resource control, updates, backups, and recovery
 
-Atlas supplies that missing computer layer.
-
-## Who it is for first
-
-The first operator owns or administers one to five physical or virtual machines dedicated primarily to agents. They want to use their existing agent interfaces, keep control of the hardware and data, and avoid becoming the systems integrator for every machine.
-
-This is a product for a general class of dedicated compute, not for one person's current collection of devices.
+Each agent product either rebuilds some of that system or assumes the operator
+has already done it correctly.
 
 ## Product thesis
 
-There is room for an opinionated host environment beneath agent products.
-
-Atlas is not an agent harness, chat interface, IDE, model runtime, or orchestration framework. It provides reattachable terminal-session primitives where required, but does not own the terminal or conversation experience. It is the machine layer beneath those products:
+There is room for an opinionated agent appliance beneath existing agent
+products.
 
 ```text
-Codex app · T3 Code · Herdr · SSH · Blue · any agent CLI
+Codex · Herdr · T3 Code · SSH · Blue · any agent client
                          │
-              stable local host contract
+             ordinary remote connection
                          │
-     workspace · workload · preview · browser · identity
+       environment · grant · surface · route
                          │
-          Atlas image or supported Linux install
+                   Atlas host
                          │
-                physical machine or VM
+              dedicated physical machine
 ```
+
+Atlas is not an agent harness, chat interface, IDE, model runtime, project
+manager, Git workflow, or orchestration framework. It does not require an
+`atlas chat`, `atlas task`, or Atlas-owned coding session.
 
 Atlas makes three commitments:
 
-1. **Durable, attributable work.** An agent gets an isolated workspace and workload identity that survives client disconnection and can be inspected or recovered.
-2. **Visible, reachable results.** Services, browsers, and graphical surfaces are private by default and easy for an operator to open, observe, and take over.
-3. **Scoped access with evidence.** Agents receive explicit, limited capabilities instead of ambient host secrets, and important use is attributable and reviewable.
+1. **Existing tools work normally.** An agent client can treat an Atlas
+   environment as an ordinary remote Linux target and retain its own project,
+   worktree, terminal, and conversation model.
+2. **Authority is compartmentalized.** Files, processes, browser identities,
+   credentials, routes, and resource budgets belong to an enforceable
+   environment rather than becoming ambient host state.
+3. **A human can see and intervene.** Sensitive grants, browser control,
+   recordings, private routes, health, updates, and recovery remain visible and
+   controllable from a paired operator device.
 
-If these commitments are not substantially better than configuring an ordinary Linux server, Atlas does not yet have a product.
+If those commitments are not substantially better than manually combining
+Linux, Tailscale, SSH, containers, browser tools, and systemd, Atlas does not
+yet have a product.
 
-The core abstraction is the complete execution context of an agent:
+## Core primitives
 
-```text
-execution context =
-  workspace branch
-  + supervised workload
-  + resource envelope
-  + network boundary
-  + terminal, browser, and display surfaces
-  + delegated grants
-  + attributable event stream
-```
+Atlas exposes five host-level primitives.
 
-Atlas makes that context a first-class host resource that can be created, attached to, forked, constrained, observed, checkpointed, reconstructed, moved, and destroyed. The client still decides what the agent does.
+### Host
 
-## Interface independence has a mechanism
+A physical Atlas computer with a hardware and software identity, declared
+capabilities, health state, private connectivity, update lineage, and recovery
+path.
 
-Atlas integrates at the agent process inside the machine, not at the client conversation.
+### Environment
 
-Every agent interface eventually starts a process in a workspace. Inside that workspace, Atlas exposes ordinary and versioned machine-local interfaces:
+A persistent Linux compartment into which an existing agent tool connects. An
+environment owns an enforceable OS principal, files, process and resource
+boundaries, network context, browser identities, grants, surfaces, routes, and
+activity.
 
-- an `atlas` CLI on `PATH`, with stable human output and machine-readable JSON
-- an MCP adapter for clients and agents that support MCP
-- a local authenticated API over a Unix socket for richer integrations
-- conventional environment, filesystem, credential-helper, port, and process behavior for tools with no Atlas awareness
+An environment is not a repository or task. Codex, Herdr, T3 Code, Git, or the
+operator may clone repositories, create worktrees, run terminals, and manage
+projects inside it. Atlas should only add repository primitives later if a
+specific host-level guarantee cannot be supplied by those tools.
 
-Every managed process must cross an Atlas launch boundary, such as an Atlas-owned workspace shell or a stable `atlas workload run` entrypoint. Interface independence means that a client does not need an Atlas-specific conversation plugin. It does not mean an arbitrary unmanaged process is retroactively given an Atlas identity.
+### Grant
 
-The host derives identity from kernel-enforced workspace and workload boundaries. It does not trust a process to declare which agent or workspace it is.
+Operator-approved authority made available to one environment for a defined
+audience, operation set, and lifetime. A grant may deliver a short-lived token,
+mediate a protocol operation, or authorize use of a browser identity. It is not
+a copy of the operator's password vault.
 
-This means a shell-compatible agent can benefit without a custom Atlas plugin. An Atlas-aware client can add richer previews, approvals, activity, browser attachment, and lifecycle controls without becoming the only way to use the machine.
+### Surface
 
-T3 Code may own its projects, threads, terminals, diffs, and mobile experience. Herdr may own its sessions, panes, and agent status. The Codex app may own its task experience. Blue may treat Atlas as an execution destination. Atlas owns the machine-local resources beneath those experiences.
+A browser or graphical desktop that an agent can operate and an operator can
+observe, record, or take over. Browser profiles, cookies, screenshots,
+recordings, clipboard state, and downloads are sensitive environment state.
 
-The Atlas CLI manages and inspects the machine. The same binary can expose different methods according to the caller's proven role. A workload can request authority but cannot approve its own request:
+### Route
 
-```bash
-# inside a workload
-atlas inspect
-atlas preview request --port 3000
-atlas credential request github --scope repo:read
+Private, authenticated access from a paired device to a service listening
+inside an environment. Detecting a port does not publish it. Public sharing is
+a separate, explicit, expiring grant.
 
-# from a paired operator device
-atlas host list
-atlas workspace inspect blue
-atlas preview open blue
-atlas browser attach blue
-atlas grant approve blue github
-atlas activity blue
-```
+These are machine resources beneath client concepts. Atlas does not try to map
+them onto every client's conversations, panes, threads, or tasks.
 
-There should not need to be an `atlas chat`.
+## Existing-client independence has a mechanism
 
-## The initial product nucleus
+Atlas cannot enforce isolation or credential policy around a process it cannot
+identify. Existing-tool compatibility therefore needs an environment entry
+boundary, but not an Atlas coding workflow.
 
-Atlas should first make one workflow unusually complete:
+The baseline entry can be conventional:
 
-1. Provision or install a supported Linux host and pair it securely.
-2. Start an unmodified agent through the Atlas launch boundary from any shell-compatible interface.
-3. Let an Atlas-supervised workload and its reattachable terminal continue independently of the client connection.
-4. Discover a development port automatically and turn it into a private authenticated URL through explicit policy or action.
-5. Let the agent use an isolated browser that the operator can watch and take over.
-6. Delegate one narrowly scoped service identity without exposing the operator's ambient credentials.
-7. Show the operator what ran, changed, connected, and used that identity.
-8. Reboot or update the host without losing declared durable state.
+- an SSH target and Linux login that lands inside an environment
+- a remote-development target exposed by an existing client
+- a login shell or process launcher supplied by the environment
+- a small adapter when a client supports richer host integrations
 
-This nucleus is deliberately narrower than the eventual platform. Terminal persistence alone is not enough. Browser automation alone is not enough. The product is the coherent boundary around work, surfaces, access, and operator control.
+After entry, the tool behaves normally. A direct host-root shell or unmanaged
+host process receives no environment isolation or grant guarantees.
 
-## The longer capability map
+Atlas-aware clients may consume structured interfaces for approvals, browser
+attachment, routes, health, and activity. Compatibility cannot require a
+conversation plugin for any particular client.
 
-The initial nucleus can grow into six capability families:
+## The first distinctive use case
 
-- **Code:** durable workspaces, snapshots, forks, recovery, and movement of files, repository state, and declared workload metadata between hosts
-- **Compute:** supervised process trees, resource accounting, isolation, persistent services, disposable jobs, and optional container or VM backends
-- **Interaction:** terminal sessions, isolated browsers, virtual displays, graphical application streaming, and explicit human takeover
-- **Preview:** automatic service discovery, private authenticated URLs, controlled public sharing, screenshots, recordings, and live views
-- **Identity:** delegated credentials, trust-separated browser profiles, approvals, attribution, revocation, and audit history
-- **Connectivity:** secure pairing, private mesh access, reconnection, recovery SSH, and access from computers, tablets, and phones
+The first product proof is an existing agent client using a persistent,
+observable browser identity on a physical Atlas machine.
 
-State movement means reconstructing declared work from durable files and metadata. It does not mean transparent migration of arbitrary live processes.
+1. Flash Atlas onto a representative spare computer.
+2. Enroll it into the operator's private network and connect using SSH.
+3. Enter one persistent agent environment with an existing agent tool.
+4. Start an isolated browser surface with one low-risk test identity.
+5. Let the operator authenticate that browser once without copying a password
+   into the environment.
+6. Let the agent operate the authenticated site through a bounded computer-use
+   interface.
+7. Let the operator watch, record, take over, and return control.
+8. Expose one development server through a tailnet-private route.
+9. Create a second environment and prove it cannot access the first
+   environment's files, processes, profile, grants, surface, or route.
+10. Reboot or update the host and preserve the state declared durable.
 
-## State parallelism
+This does not begin with the operator's primary personal identity. It begins
+with a disposable or low-risk account so that Atlas can prove its boundary
+before being trusted with consequential authority.
 
-Parallel agents are primarily a state-isolation problem, not a CPU-scheduling problem. They collide through shared checkouts, ports, package caches, databases, browser profiles, credentials, generated files, and abandoned processes.
+## Credential model
 
-Atlas should make workspace branching cheap and coherent:
+Atlas distinguishes three forms of access.
 
-```bash
-atlas workspace fork project --count 8
-```
+1. **Materialized secret:** a token or password is delivered to a process. The
+   process can read and exfiltrate it, so this is a documented degraded mode.
+2. **Brokered operation:** Atlas or a local helper performs a narrow operation
+   or produces a short-lived derivative credential without exposing the source
+   secret. Git credential helpers, SSH agents, cloud session credentials, and
+   request-signing proxies can fit this model.
+3. **Browser identity:** session credentials remain in a protected browser
+   profile while an agent receives permission to operate a browser surface.
 
-The result is eight workspace branches with independent writer ownership, workload trees, port namespaces, browser state, grants, resource budgets, and event streams. Shared toolchains and caches may be reused only through immutable or brokered mechanisms that prevent one workspace from poisoning another.
+Browser control is authority, even when the agent never receives the original
+password. An agent controlling a logged-in browser can act as that user. Raw
+browser-debug protocols may also expose cookies, so higher-trust identities may
+require a narrower screenshot-and-action interface rather than unrestricted
+debug access.
 
-Atlas provides these execution contexts. It does not choose models, prompts, tasks, or how many agents a client should launch. A harness can request eight branches and place an agent in each; Atlas returns attributable branches, outputs, and candidate changes rather than becoming the harness itself.
+Atlas should create separate browser identities by purpose and trust level. It
+should not synchronize a person's complete browser profile or password vault
+onto an autonomous machine.
 
-Fork and explicit merge are preferred to a shared multi-writer filesystem. Moving a branch between hosts transfers a checkpoint and writer lease, not a live process image.
+## Code and parallelism
 
-## Image and installer
+Atlas isolates environments, not Git strategies.
 
-Atlas has one capability core and two delivery paths.
+Inside one environment, the selected agent tool may use ordinary clones,
+worktrees, branches, or its own project model. Separate environments require
+separate writable state. Git worktrees share repository metadata and therefore
+belong inside one trust boundary. Stronger isolation may use separate clones or
+copy-on-write filesystem snapshots, with immutable object caches where safe.
 
-The **managed image** is the product destination for a machine dedicated to agents. Controlling the system can provide boot-to-ready behavior, a known storage layout, unattended service supervision, workload isolation, update rollback, drift resistance, and predictable recovery.
+Atlas should add an opinionated checkout or fork operation only after evidence
+shows that existing tools cannot provide the required isolation, recovery, or
+movement semantics.
 
-The **supported Linux install** is the adoption and validation path for an existing server, VM, or development machine. It should expose the same local contract, but some guarantees depend on the underlying host.
+## Connectivity
 
-`atlas doctor` should report capability conformance and missing guarantees. A client should not need a separate integration for each delivery path.
+The first connectivity adapter is Tailscale because it provides stable private
+reachability across changing networks. The intended baseline is:
 
-```text
-Managed image                     Supported Linux
-─────────────                     ───────────────
-same capability core             same capability core
-boot-to-ready appliance           package or installer
-managed security baseline         inspected host baseline
-atomic recovery target            host-dependent recovery
-strong drift guarantees           explicit conformance gaps
-```
+- no publicly reachable administrative port by default
+- enrollment using a short-lived or interactive ceremony
+- SSH over the tailnet, with authorization controlled by tailnet policy
+- private routes reachable only by authorized tailnet identities
+- local or console recovery that does not depend on an Atlas cloud
 
-The installer or VM is likely the fastest way to validate the architecture. The image remains strategically important only where owning the full OS produces measurable reliability, security, or recovery benefits.
+Tailscale is an adapter, not the Atlas identity model. Tailnet membership gives
+network reachability; Atlas still authorizes environments, grants, surfaces,
+routes, and host operations.
 
-An installer can provide capabilities. A managed image can guarantee invariants. On the managed image, every process that receives Atlas workspace capabilities must enter through the workload boundary, control-plane resources must remain available under pressure, and storage, updates, rollback, and recovery must follow a known design.
-
-The base distribution, image technology, update model, and isolation backend are intentionally undecided. Atlas should build on established kernel and distribution mechanisms rather than inventing them.
-
-The first architecture spike uses NixOS because a pinned system declaration, buildable VM and ISO outputs, and generation rollback directly test the managed-image thesis. NixOS is the leading candidate after that spike, not a product commitment. Atlas should retain it only if the next proofs show that declarative host policy produces a materially safer and more recoverable appliance than an OCI image-based alternative such as bootc.
+The core machine must remain useful without an Atlas-operated cloud service.
+Optional rendezvous, relays, public sharing, update mirrors, and off-host audit
+storage must be explicit and replaceable where practical.
 
 ## Operator surface
 
-Atlas does not need its own agent conversation UI. It does need a small operator surface for actions that do not fit safely in a terminal alone: pairing, approvals, browser and display takeover, recovery, and perhaps live activity.
+The Atlas CLI is an administrative and automation surface, not the daily agent
+experience. It may support pairing, conformance checks, environment lifecycle,
+grants, browser observation, routes, updates, backup, and recovery.
 
-That surface may be a local web application used through the private network. It is an operating console, not another agent client.
+A small operator web interface may be more appropriate for approvals, browser
+takeover, recordings, and use from a phone. It remains an operating console,
+not another agent client.
 
-## Identity boundary
+## Image and supported install
 
-Atlas is a trusted host and credential broker. It authenticates the local workspace, enforces the operator's grant, and delivers the resulting capability to that workload.
+The managed image is the product destination. A supported Linux installation
+may expose the same primitives for adoption and comparison, but it cannot claim
+the same boot, drift, storage, update, or recovery guarantees unless the host
+satisfies them.
 
-Atlas must not silently become the downstream principal. A service identity belongs to the operator, workspace, agent, or product that was explicitly authorized. Atlas cannot infer that hosting a process authorizes Atlas itself to act as that process.
+NixOS is the current prototype vehicle because the completed spike validates a
+pinned host declaration, mutable state outside the Nix store, system resource
+separation, and generation rollback. It is not a permanent product decision.
+Virtual machines continue to exercise the image in development and CI while
+the next product proof runs on representative physical hardware.
 
-Credentials should be short-lived, scoped, revocable, and absent from the workspace until requested. Browser cookies and profiles are credentials and require the same rigor.
-
-## Cloud boundary
-
-The core machine must remain useful without an Atlas-operated cloud service. Local workspaces, supervision, private-network access, previews, browser control, credential brokering, audit, updates, and recovery need local or self-hostable paths.
-
-Optional hosted rendezvous, relays, update mirrors, public preview sharing, and off-host audit storage may improve the product. They must be explicit dependencies, replaceable where practical, and unable to turn a disconnected Atlas host into a useless computer.
+The bootc comparison should occur after the environment, surface, grant, and
+route contract is concrete enough to port. The comparison should test the same
+product behavior rather than choose a base from image mechanics alone.
 
 ## Delivery sequence
 
-The first proof is one continuous story, but it should be built in narrow layers:
-
-1. **Durability and visibility:** pair one host, create an isolated workspace, launch through the Atlas entrypoint, reattach to its terminal, and publish one private preview.
-2. **Visual interaction:** add one ephemeral browser profile with observation, an exclusive takeover lease, and clear return of control.
-3. **One delegated identity:** support one downstream service with narrow derivative credentials and prove request, approval, use attribution where observable, expiry, denial, and revocation.
-4. **Reconstruction:** reboot and reconstruct documented workspaces, declared services, private routes, persistent profiles, and activity state.
-5. **State parallelism:** fork one workspace into independently writable branches and prove that workloads do not collide through files, processes, ports, browsers, grants, or resource budgets.
-
-MCP, public sharing, broad graphical application support, cross-host movement, multiple operators, universal credential brokering, and a custom image can wait until the relevant layer is compelling.
+1. **Physical host:** persistent installation, private enrollment, SSH,
+   encrypted state design, update, and recovery.
+2. **Environment:** one enforceable Linux compartment that an existing agent
+   client can use as a normal remote target.
+3. **Surface:** one isolated browser profile with observation, recording, and
+   exclusive takeover.
+4. **Grant:** authenticate one low-risk browser identity, then add one narrow
+   brokered service credential.
+5. **Route:** expose one environment service privately through the tailnet.
+6. **Isolation proof:** demonstrate that a second environment cannot cross any
+   file, process, profile, grant, surface, route, or resource boundary.
+7. **Reconstruction:** reboot and update without losing state declared durable.
 
 ## First proof
 
-Atlas v0 succeeds when a fresh supported Linux machine or VM demonstrates all of the following:
+Atlas v0 succeeds when:
 
-1. Installation and secure pairing take less than ten minutes.
-2. Two independent agent interfaces launch through the same host contract, including one Atlas does not control.
-3. An Atlas-owned terminal and workload continue across client disconnects and can be reattached without tying lifetime to either client.
-4. Separate workspaces have kernel-enforced identities, resource boundaries, and attributable activity.
-5. A discovered development service becomes privately reachable after explicit policy or action, without manual port forwarding.
-6. An agent controls an isolated browser that the operator can observe and take over.
-7. One short-lived, scoped credential can be granted, used, audited, and revoked without exposing the operator's source credential.
-8. Reboot and update preserve or deliberately reconstruct all documented durable state.
-9. `atlas doctor` explains which guarantees the host satisfies and which it cannot.
-10. A workspace can be forked into two independently writable branches whose workloads can use the same local port without filesystem, process, browser, grant, or routing collisions.
-
-The proof can begin as an installer or VM. It should not claim appliance-grade guarantees until those guarantees are tested on an owned image.
+1. A supported physical machine can be flashed, enrolled, and reached without
+   a permanently attached display.
+2. SSH and private routes are unavailable from the public network by default.
+3. An existing agent interface uses an environment without adopting an Atlas
+   conversation, project, terminal, or Git model.
+4. Two environments have kernel-enforced identities, private writable state,
+   separate process and resource boundaries, and attributable activity.
+5. One browser identity remains unavailable to every environment except the
+   one holding its grant.
+6. An agent uses the browser while the operator can observe, take over, record,
+   and revoke access.
+7. Raw source credentials are never placed in the environment or Nix store.
+8. One service becomes reachable through an explicit private route without a
+   public listener or manual port forwarding.
+9. Reboot and update preserve or deliberately reconstruct documented durable
+   state.
+10. `atlas doctor` reports which guarantees the machine actually satisfies.
 
 ## Boundaries
 
 Atlas initially does not:
 
-- replace T3 Code, Herdr, the Codex app, agent CLIs, or Blue
-- define how an agent thinks, plans, remembers, or communicates
-- require a particular model provider or subscription
-- synchronize a personal password vault onto an autonomous machine
-- give agent workloads arbitrary root access to the host control plane
-- expose every host customization at the cost of reproducibility
+- replace Codex, Herdr, T3 Code, SSH, Blue, or another agent client
+- define conversations, prompts, tasks, models, repositories, or worktrees
+- require a particular model provider or agent subscription
+- synchronize a personal password vault or primary browser profile
+- claim that an agent with authorized browser control is harmless
+- give environments arbitrary root access to the host control plane
+- prevent an internet-enabled environment from disclosing data it is allowed
+  to read
 - compete as a hyperscale sandbox cloud
-- promise arbitrary live process migration or perfect checkpointing
-- prevent an internet-enabled workload from disclosing data it is legitimately allowed to read in its own workspace
+- promise arbitrary live-process migration or process-memory persistence
 - make Atlas itself the principal in downstream systems
 
 ## Blue reuse
 
-Atlas remains product-neutral. Blue may treat an Atlas host as an execution destination and consume its workspace, workload, preview, browser, display, identity-broker, and activity interfaces.
-
-Atlas owns machine-local execution mechanics. Blue continues to own its execution profiles, route authorization, claims, leases, fencing, and Fabric-facing identity. Hosting a Blue process never authorizes Atlas to act as that process or principal.
+Blue may treat an Atlas environment as an execution destination and consume
+grants, surfaces, routes, health, and activity interfaces. Atlas owns
+machine-local enforcement. Blue retains execution profiles, route
+authorization, claims, leases, fencing, and Fabric-facing identity. Hosting a
+Blue process never authorizes Atlas to act as that process or principal.
 
 ## Kill tests
 
-Atlas should be reconsidered if any of these remain true after the first proof:
+Atlas should be reconsidered if:
 
-- the useful experience is indistinguishable from a documented bundle of SSH, systemd, containers, Tailscale, and browser tools
-- every agent client needs bespoke Atlas integration before it benefits
-- identity and isolation cannot be derived from enforceable host boundaries
-- the browser and preview experience is not materially easier than existing tools
-- owning the OS does not produce enough reliability or recovery benefit to justify an image
+- existing clients require Atlas-specific conversation or project integrations
+  before the host is useful
+- the environment is indistinguishable from an ordinary Linux account or
+  manually configured container
+- browser identity isolation cannot prevent cross-environment profile access
+- observation and takeover are not materially safer or easier than existing
+  remote-desktop and browser tools
+- owning the OS does not create measurable security, reliability, or recovery
+  advantages
 
 ## Strategic test
 
-Atlas is worth continuing if people with dedicated or underused compute choose to turn it into an Atlas instead of manually administering another Linux server, while continuing to use the agent interfaces they already prefer.
+Atlas is worth continuing if people with dedicated or underused computers turn
+them into Atlas hosts instead of manually administering another Linux server,
+while continuing to use the agent interfaces they already prefer.
 
 The short promise is:
 
-> Turn a computer nobody will sit in front of into a complete, observable computer for agents.
+> Turn a computer nobody will sit in front of into a complete, observable
+> computer for agents.

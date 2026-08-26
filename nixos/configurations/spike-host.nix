@@ -4,19 +4,21 @@
   ...
 }:
 let
-  mkSpikeWorkload =
+  mkSpikeEnvironment =
     name: response:
     let
       site = pkgs.writeTextDir "index.html" response;
     in
     {
-      description = "Atlas isolated spike workload ${name}";
+      description = "Atlas isolated spike environment ${name}";
       wantedBy = [ "atlas-host.target" ];
       after = [ "atlas-host-contract.service" ];
       serviceConfig = {
         ExecStart = "${pkgs.python3}/bin/python -m http.server 3000 --bind 127.0.0.1 --directory ${site}";
-        Slice = "atlas-workloads.slice";
+        Slice = "atlas-environments.slice";
         DynamicUser = true;
+        StateDirectory = "atlas/environments/spike-${name}";
+        StateDirectoryMode = "0700";
         UMask = "0077";
 
         AmbientCapabilities = "";
@@ -40,10 +42,13 @@ let
     };
 in
 {
-  atlas.host.enable = true;
+  atlas.host = {
+    enable = true;
+    tailscale.enable = true;
+  };
 
   # The spike deliberately has no ambient login credential. Remote access is
-  # enabled only when an operator public key is supplied to the host module.
+  # enabled only after interactive or runtime-secret Tailscale enrollment.
   users.allowNoPasswordLogin = true;
 
   documentation.enable = false;
@@ -66,7 +71,7 @@ in
   };
 
   systemd.services = {
-    atlas-spike-alpha = mkSpikeWorkload "alpha" "atlas workload alpha\n";
-    atlas-spike-beta = mkSpikeWorkload "beta" "atlas workload beta\n";
+    atlas-spike-alpha = mkSpikeEnvironment "alpha" "atlas environment alpha\n";
+    atlas-spike-beta = mkSpikeEnvironment "beta" "atlas environment beta\n";
   };
 }

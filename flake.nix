@@ -1,5 +1,5 @@
 {
-  description = "Atlas NixOS host architecture spike";
+  description = "Atlas physical-first NixOS host architecture spike";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
@@ -55,6 +55,17 @@
             "${nixpkgs}/nixos/modules/installer/cd-dvd/iso-image.nix"
             {
               isoImage.squashfsCompression = "zstd -Xcompression-level 1";
+              services.openssh.enable = nixpkgs.lib.mkForce false;
+              services.getty.autologinUser = "atlas-operator";
+              users.users.root.hashedPassword = nixpkgs.lib.mkForce "!";
+              environment.etc."motd".text = ''
+                Atlas physical-host spike
+
+                This is a non-persistent live image. To enroll the host into
+                Tailscale and enable private SSH, run:
+
+                  sudo atlas-enroll
+              '';
             }
           ];
         in
@@ -62,6 +73,7 @@
           default = vmHost.config.system.build.toplevel;
           vm = vmHost.config.system.build.vm;
           iso = isoHost.config.system.build.isoImage;
+          physical-iso = isoHost.config.system.build.isoImage;
           host-contract = pkgs.writeText "atlas-host-contract.json" (
             builtins.toJSON vmHost.config.atlas.host.contract
           );
@@ -74,6 +86,11 @@
           pkgs = import nixpkgs { inherit system; };
         in
         {
+          module-evaluation = import ./nixos/tests/module-evaluation.nix {
+            inherit pkgs;
+            inherit (nixpkgs) lib;
+            atlasModule = self.nixosModules.default;
+          };
           host-contract = import ./nixos/tests/host-contract.nix {
             inherit pkgs;
             atlasModule = self.nixosModules.default;

@@ -1,284 +1,374 @@
 # Atlas interoperability contract
 
-Status: design contract, August 2026
+Status: design contract, revised August 2026
 
-This document defines how arbitrary agent interfaces use Atlas without surrendering their conversation, session, or product model. It describes required behavior, not a chosen implementation architecture.
+This document defines how existing agent interfaces use Atlas without
+surrendering their conversation, project, terminal, or product model. It
+describes required behavior, not a chosen isolation backend or control-plane
+implementation.
 
 ## Core rule
 
-Atlas integrates at the process running inside the machine.
+An existing agent tool should experience an Atlas environment as a normal
+remote Linux target.
 
-An agent client only needs to start a process through an Atlas workspace entrypoint. Atlas-aware clients may use richer APIs, but baseline usefulness cannot depend on a conversation plugin for T3 Code, Herdr, the Codex app, Blue, or any other particular client.
+The baseline integration is an ordinary environment entry such as an SSH login,
+remote-development target, or environment login shell. Once inside, Codex,
+Herdr, T3 Code, Blue, an agent CLI, or a human operator manages its own
+projects, repositories, worktrees, terminals, processes, and conversations.
 
-No plugin does not mean no integration boundary. A client must invoke an Atlas-owned workspace shell, `atlas workload run`, or an equivalent stable entrypoint so the process receives the correct principal, resource envelope, and lifecycle supervision.
+No plugin does not mean no enforcement boundary. A process receives Atlas
+environment capabilities only after entering through an authenticated identity
+that the host maps to a kernel-enforced environment boundary. A process running
+directly as the host administrator is outside that guarantee.
 
 ## Ownership
 
 | Concern | Owner |
 | --- | --- |
-| conversations, tasks, prompts, model selection | agent client or harness |
-| client terminals, panes, and presentation | agent client or harness |
-| workspace identity and durable files | Atlas |
-| workload lifetime, supervision, and resource accounting | Atlas |
-| reattachable PTY, attachments, and control lease | Atlas |
-| previews, browsers, displays, and attachment | Atlas |
-| local credential delivery and use attribution | Atlas |
+| conversations, tasks, prompts, models, agent selection | agent client or harness |
+| projects, repositories, branches, worktrees, diffs | agent client, Git, or operator |
+| terminals, panes, client reconnection, presentation | agent client or harness |
+| host installation, health, update, rollback, recovery | Atlas |
+| environment identity, isolation, durable home, resource budget | Atlas |
+| browser profiles, displays, observation, recording, takeover | Atlas |
+| local credential grants and use attribution where observable | Atlas |
+| private routes from paired devices to environment services | Atlas |
 | downstream authorization policy | operator or consuming product |
 | optional remote relay and rendezvous | deployer-selected service |
 
-Atlas names resources beneath client concepts. It does not try to unify every client's thread or session namespace.
+Atlas may supervise processes for containment and recovery without claiming
+ownership of the client's logical session. It does not create a universal
+namespace for projects, threads, panes, or coding tasks.
 
 ## Actors
 
 - **Operator:** the human who owns or administers the host and grants authority.
-- **Operator client:** a CLI or future web console used to pair, inspect, approve, attach, and recover.
-- **Agent client or harness:** T3 Code, Herdr, Codex, Blue, an agent CLI, or another process launcher.
-- **Workspace workload:** an untrusted process tree running with an Atlas-assigned identity and resource boundary.
-- **Atlas host services:** privileged components that supervise resources and mediate access.
-- **Optional remote service:** a replaceable rendezvous, relay, public-share, update, or off-host audit service.
-
-## Required local surfaces
-
-Atlas has two directions of control:
-
-- the **workload plane** lets a process inside a workspace use machine capabilities under its kernel-derived identity
-- the **operator plane** lets a paired human inspect, approve, attach, stop, and recover from another device
-
-Both operate on the same resources and policy. They use different authentication and must not be collapsed into one ambient bearer credential.
-
-### Shell-compatible baseline
-
-A process in an Atlas workspace receives conventional operating-system behavior:
-
-- a normal filesystem and working directory
-- a stable workspace identifier in metadata, without authority being based on that value
-- process and service supervision that is independent of the launching connection
-- conventional loopback port binding and service discovery
-- standard credential-helper integration where an ecosystem supports it
-- `atlas` on `PATH`
-
-An unmodified shell-based agent launched through the stable entrypoint must be able to benefit from workspace durability, private previews, and basic inspection. A process launched directly into a client-owned SSH PTY without crossing the entrypoint receives no Atlas guarantee of identity, supervision, or reattachment.
-
-### CLI
-
-Every automation-safe command must support a versioned JSON response. Human-readable output is a presentation of the same underlying model. The command set visible to a caller is authorized by its proven role.
-
-```bash
-# workload plane
-atlas inspect --json
-atlas preview request --port 3000 --json
-atlas browser create --profile ephemeral --json
-atlas credential request github --scope repo:read --json
-atlas activity list --json
-
-# agent-client launcher plane
-atlas workspace shell project --json
-atlas workload run --workspace project --pty -- command arg
-
-# paired operator plane
-atlas host inspect --json
-atlas workspace list --json
-atlas preview approve --request <id> --private --json
-atlas browser attach --surface <id> --json
-atlas grant approve --request <id> --json
-atlas device revoke <id> --json
-```
-
-The relevant caller roles are workload, agent-client launcher, local host administrator, and paired remote operator. They may use one binary and resource schema, but each authenticates through a different context and receives only its authorized methods. In particular, a workload can request a grant but cannot approve one, and a launcher can create a workload without acquiring the workload's future credentials.
-
-The command names are illustrative until an implementation proposal is accepted. The behavioral resources are part of the contract.
-
-### Local API
-
-A versioned local API should be available over a Unix-domain socket for clients that need streaming events, browser attachment, approvals, or efficient lifecycle control.
-
-The service must authenticate the calling process using kernel-derived identity such as peer credentials, its assigned workspace principal, and its workload boundary. A request field that says `workspace_id` or `agent_id` is never sufficient authority.
-
-### MCP adapter
-
-An MCP server may expose safe subsets of the same resource model to compatible agents and clients. MCP is an adapter, not the canonical control plane. Disabling it must not remove the CLI or local API contract.
-
-### Remote operator API
-
-The operator CLI and console use an authenticated, versioned host API through a private network path, SSH tunnel, or selected relay. Requests are bound to a paired operator device and evaluated by the host. A relay must not be able to manufacture operator or host authority.
-
-The remote API may share schemas and resources with the local API, but it exposes an operator-specific authorization surface. A workload cannot reach operator-only methods merely by connecting to the same transport.
+- **Operator device:** a paired computer, tablet, or phone used for host
+  operations, approvals, observation, and recovery.
+- **Agent client or harness:** Codex, Herdr, T3 Code, Blue, an agent CLI, or
+  another tool that connects to and runs inside an environment.
+- **Environment process:** an untrusted process tree running with an
+  Atlas-assigned kernel identity and boundary.
+- **Atlas host services:** privileged processes that manage environments,
+  grants, surfaces, routes, host health, and recovery.
+- **Private-network provider:** initially Tailscale, which supplies reachability
+  but does not replace Atlas authorization.
+- **Optional remote service:** a replaceable rendezvous, relay, public-sharing,
+  update, or off-host audit service.
 
 ## Resource model
 
-Atlas exposes two related groups of resources.
+Atlas exposes five primary resources.
 
-Operator-plane resources:
+### Host
 
-- `host`: a paired Atlas machine, its capabilities, health, policy, and recovery state
-- `device`: a paired operator device or client identity with lifecycle and revocation state
-- `operation`: an observable, cancellable where safe, long-running control-plane action
+A `host` is a paired Atlas machine. Its observable contract includes:
 
-Execution-plane resources:
+- stable host identity and human-safe name
+- hardware and software architecture
+- connectivity and enrollment state
+- supported environment, grant, surface, and route capabilities
+- storage, encryption, backup, update, rollback, and recovery conformance
+- current health, resource pressure, and security-relevant degradation
 
-- `workspace`: a durable, forkable branch of files, metadata, policy, writer ownership, and reconstruction information
-- `workload`: a supervised process tree bound to one workspace branch, with identity, limits, lifecycle, and exit state
-- `session`: a host-owned reattachable PTY or other I/O session bound to a workload, with observers and an exclusive control lease
-- `surface`: a private preview, browser, display, screenshot, recording, or attachment endpoint
-- `grant`: an operator-approved, scoped, expiring capability bound to a workload by default
-- `event`: an attributable record of a lifecycle, access, policy, or sensitive-use action
+### Environment
 
-Identifiers are opaque and stable within the lifetime documented for each resource. User-supplied labels are not security identities.
+An `environment` is a persistent Linux compartment for one trust context. It
+owns:
 
-The complete execution context is the relationship among a workspace branch, its workload, resource and network boundaries, sessions and surfaces, grants, and event stream. It is an aggregate, not a replacement for the individual resources.
+- an enforceable OS principal and process boundary
+- a private writable home and runtime state
+- a resource budget and accounting scope
+- a network context and outbound policy
+- references to its grants, surfaces, routes, and activity
 
-## Workspace and workload semantics
+An environment is not a repository, branch, task, terminal, or agent. Those
+objects may exist inside it and remain owned by the selected client.
 
-The initial contract chooses explicit state ownership over shared mutation:
+Environment labels are not security identities. The host derives authority
+from the authenticated entry path, OS principal, cgroup or scope membership,
+namespace membership, and any stronger selected isolation backend.
 
-1. A workspace branch has one active writer lease.
-2. A writable workload must hold that lease. Independent concurrent writers use forked workspace branches.
-3. A workload is bound to exactly one workspace branch for its lifetime.
-4. Processes inside one workload may interact according to its isolation profile. Separate workloads cannot signal, trace, attach to, or consume each other's resources by default.
-5. A grant is workload-bound by default and disappears or becomes unusable when that workload ends. Workspace policy may preauthorize a future request, but it does not place a credential in every future workload.
-6. Child processes remain in the parent's workload boundary. A container or VM that cannot preserve that boundary must be launched as a registered nested or separate workload.
-7. Terminal or browser takeover grants one caller an exclusive control lease while allowing explicitly authorized observers.
-8. Moving a writable branch to another host checkpoints durable state, transfers the writer lease, and reconstructs declared resources. It does not migrate process memory.
+### Grant
 
-Clients can attach concurrently for observation. Mutating control, terminal input, browser takeover, and writer ownership require explicit lease semantics rather than last-writer-wins behavior.
+A `grant` is operator-approved authority bound to one environment by default.
+It includes:
 
-## Terminal and process continuity
+- requesting environment and, where provable, requesting process
+- downstream audience and allowed operations
+- issue, expiry, renewal, denial, and revocation state
+- delivery mode: materialized secret, derived credential, brokered operation,
+  or browser-identity authorization
+- evidence of use where the protocol makes that observable
 
-Atlas distinguishes process survival from interactive continuity.
+A process can request authority but cannot approve its own request. A grant
+cannot be replayed by another environment merely by copying an identifier.
 
-- Declared services and noninteractive jobs are supervised independently of the launching connection.
-- Interactive continuity is guaranteed only when Atlas owns the PTY as a `session` resource and the client attaches through its stream.
-- A disconnected attachment does not terminate the session or workload.
-- Only the holder of the session's control lease can write input. Other authorized attachments are observers.
-- A host reboot does not preserve process memory or PTY state. Atlas reconstructs only resources declared as restartable.
-- A process launched in a client-owned PTY may survive according to that client's behavior, but Atlas does not promise reattachment to arbitrary stdin and stdout streams.
+### Surface
 
-## Identity and attribution
+A `surface` is a browser or graphical desktop that can have an agent controller,
+operator observers, and at most one interactive controller at a time. Its
+contract includes:
 
-The host maps every workload to an enforceable kernel boundary, initially expected to include an OS principal plus a systemd scope or cgroup. Stronger isolation may add user namespaces, containers, microVMs, or separate VMs.
+- owning environment and trust level
+- ephemeral or persistent profile policy
+- automation interface and its authority
+- current controller, observers, and takeover state
+- recording, screenshot, clipboard, download, and retention policy
 
-Atlas authorizes local requests from observed process identity and boundary membership. Capability tokens are used only when authority must cross a boundary that kernel peer identity cannot cover. Tokens must be scoped, short-lived, audience-bound, and revocable.
+Browser control is account authority. A screenshot-and-action interface and a
+raw browser-debug protocol are different capabilities and must be reported as
+such. Atlas must not imply that cookies remain inaccessible when the selected
+automation protocol can export them.
 
-Activity records distinguish at least:
+### Route
 
-- operator action
-- agent-client action
-- workspace workload action
-- Atlas control-plane action
-- optional remote-service action
+A `route` maps a service inside one environment to an authenticated private
+endpoint. Its contract includes:
 
-Atlas records what it can prove. It must not claim to know which model, prompt, or logical subagent caused an operation unless the client supplies signed or otherwise trustworthy provenance.
+- owning environment and target process or network namespace
+- target port and protocol
+- private or explicitly public visibility
+- authorized devices or tailnet identities
+- lifetime, limits, health, and recent access evidence
 
-## Response and compatibility rules
+Port discovery creates metadata only. It never creates a route by itself.
 
-Machine-readable responses use an envelope with:
+## Existing-tool entry
 
-- schema version
-- request or operation identifier
-- resource identity and state
-- structured result or error code
-- human-safe diagnostic text
-- links or capability handles where applicable
+### Level 0: normal remote Linux
 
-Compatibility rules:
+The first compatibility level requires no Atlas-specific conversation plugin.
+The client connects to an environment through SSH or another conventional
+remote target and receives:
 
-1. Existing fields retain meaning within a major schema version.
-2. New optional fields may be added without a major version change.
-3. Automation branches on error codes, not prose.
-4. Long operations return an operation resource and observable state transitions.
-5. Repeated mutating requests support idempotency keys where retries are plausible.
-6. Sensitive values are never returned in logs, diagnostics, or activity records.
+- a normal shell, filesystem, home directory, and loopback network
+- the toolchain installed for that environment
+- isolation from the host control plane and other environments
+- conventional credential-helper and browser-control endpoints where granted
+- private service routing without opening public ports
 
-## Capability discovery and conformance
+The client continues to own process and PTY lifetime unless it explicitly asks
+Atlas to supervise a declared service. Atlas does not promise to reconstruct an
+arbitrary client-owned terminal after disconnection or reboot.
 
-The managed image and supported Linux install expose the same resource model. They can provide different guarantees.
+### Level 1: capability-aware
 
-`atlas doctor --json` reports:
+A client may use versioned local interfaces for structured environment status,
+grant requests, surface creation or attachment, route requests, and activity.
+These capabilities improve the experience but do not replace the Level 0 path.
 
-- contract and schema versions
-- available resource capabilities
-- isolation and identity backend
-- preview, browser, and display support
-- credential broker support
-- connectivity and recovery paths
-- update and rollback guarantees
-- known host conflicts or degraded guarantees
+### Level 2: policy-integrated
 
-A client asks for capabilities and degrades explicitly. It does not infer guarantees from the distribution name or installation method.
+A product such as Blue may supply signed workload provenance or downstream
+authorization policy. Atlas still enforces only its machine-local boundary and
+must not infer that hosting a process authorizes Atlas to act as that product's
+principal.
 
-## Approvals
+## Local and remote interfaces
 
-Approval is a control-plane action, not a terminal prompt injected into an agent session.
+### Conventional interfaces first
 
-An approval request includes the requesting workspace and workload, requested capability, target service, scope, duration, reason, and consequences. Approval may occur through the CLI or operator console. The resulting grant is bound to the requesting principal and cannot be replayed by another workspace.
+Atlas should prefer interfaces existing tools already understand:
 
-## Service discovery and publication
+- SSH and standard Linux users
+- filesystem permissions and dedicated home directories
+- Unix sockets and peer credentials
+- standard credential helpers and SSH agents
+- loopback ports and HTTP proxies
+- browser computer-use, WebDriver, or debugging protocols with explicit
+  capability differences
 
-Atlas may automatically discover that a workload is listening on a port. Discovery creates local metadata only. It does not create a remotely reachable route.
+### Administrative CLI
 
-A route requires either an explicit operator or client action or a previously approved workspace policy. The route is private and authenticated by default, bound to the workspace and target workload, and visible in activity. Public sharing is a separate expiring grant.
+The `atlas` CLI is a host administration and automation surface. It is not the
+primary coding interface.
 
-## Connectivity
+Illustrative commands are:
 
-The local contract does not require an Atlas-operated cloud. Remote clients may reach the host through a private mesh, direct network path, SSH tunnel, or a selected relay.
+```bash
+atlas status --json
+atlas doctor --json
+atlas pair
+atlas environment list --json
+atlas environment inspect <name> --json
+atlas grant approve <request> --json
+atlas surface observe <surface>
+atlas surface take-over <surface>
+atlas route open <environment> --port 3000 --private
+atlas update
+atlas rollback
+```
 
-Pairing establishes device and operator trust. Network reachability alone does not confer Atlas authority. Public preview sharing is a separate, explicit capability and is never the default form of service discovery.
+Command names remain illustrative until an implementation proposal is
+accepted. Automation-safe commands use versioned machine-readable responses,
+structured error codes, and idempotency keys where retries are plausible.
 
-### Outbound network boundary
+### Local control interface
 
-Atlas v0 permits ordinary internet egress for the default developer workload profile. Atlas isolates what a workload can read and which credentials it can obtain, but it does not prevent that workload from transmitting data it is legitimately authorized to read.
+A versioned local interface may be available over a Unix-domain socket for
+clients that need streaming events or structured capabilities. The service
+authenticates callers using peer credentials and their observed environment
+membership. Request fields such as `environment_id`, `agent_id`, or
+`workspace_id` never establish authority.
 
-Restricted or allowlisted egress can become an isolation capability for higher-risk profiles. Until then, Atlas must not imply data-loss prevention, destination-level credential confinement, or protection against exfiltration by an authorized internet-enabled workload.
+### MCP adapter
+
+An MCP server may expose safe subsets of grants, surfaces, routes, health, and
+activity to compatible clients. MCP is an adapter, not the canonical control
+plane. Disabling it cannot remove normal SSH access or the host's local
+management path.
+
+### Remote operator interface
+
+The operator CLI or console reaches the host over the selected private network,
+an SSH tunnel, a direct private path, or a replaceable relay. Requests remain
+bound to a paired operator identity and are evaluated by the host. Network
+reachability alone does not confer operator authority.
+
+## Environment semantics
+
+1. Each environment has a distinct kernel-enforced principal.
+2. Separate environments cannot read, signal, trace, attach to, or consume each
+   other's files, processes, browser profiles, grants, surfaces, or routes by
+   default.
+3. Child processes remain inside the parent's environment boundary.
+4. Host-administrator and Atlas control-plane authority are unavailable inside
+   ordinary environments.
+5. Writable state is private to one environment unless a shared resource is
+   explicitly declared and mediated.
+6. Shared package or repository caches are immutable or brokered so one
+   environment cannot poison another.
+7. The isolation backend and its known gaps are discoverable through
+   conformance rather than inferred from a marketing label.
+8. An environment may contain multiple repositories, worktrees, agent
+   processes, and client sessions because Atlas does not own those concepts.
+
+An implementation may use Linux users, systemd scopes, namespaces, containers,
+microVMs, or VMs. The contract is the observable boundary, not the backend.
+
+## Grants and browser identities
+
+An approval request includes the requesting environment, requested capability,
+target service or identity, operations, duration, reason, and consequences.
+Approval happens outside agent-controlled content.
+
+Source credentials stay in a control-plane or operator-owned store. Where a
+downstream system supports it, Atlas prefers narrow derivative credentials or
+brokered operations over copyable bearer secrets.
+
+A browser profile is a credential container. Atlas binds it to one environment
+and trust level, protects its files from environment processes unless the
+declared automation capability requires broader access, and treats cookies,
+history, downloads, clipboard, screenshots, and recordings as sensitive.
+
+An environment authorized to operate a browser can act with the website
+authority represented by that profile. Isolation prevents other environments
+from acquiring that authority; it does not prevent the authorized environment
+from misusing it.
+
+## Connectivity and SSH
+
+The first adapter is Tailscale. An Atlas image should support interactive or
+short-lived-key enrollment, stable tailnet naming, and SSH over the tailnet.
+
+Tailscale supplies reachability and may supply SSH authentication according to
+tailnet policy. Atlas still controls local OS users, environment membership,
+host administration, grants, surfaces, routes, and recovery. Tailnet membership
+must not grant ambient access to every environment or operator-only method.
+
+Administrative SSH and private routes are unavailable from public interfaces by
+default. A separate local or console recovery path remains necessary because a
+tailnet outage or policy mistake must not strand the host.
+
+The core contract does not require an Atlas-operated cloud. Other private mesh,
+direct network, or self-hosted adapters may be added when a second real adapter
+justifies a generic connectivity seam.
+
+## Route semantics
+
+Atlas may observe that an environment process is listening on a port. Creating
+a route requires an explicit operator or client action or a previously approved
+environment policy.
+
+Routes are private and authenticated by default, bind to the owning environment
+and target namespace, reject arbitrary upstream destinations, and report
+visibility, owner, expiry, limits, and health. Public sharing is a separate
+expiring grant.
+
+## Outbound network boundary
+
+The default developer environment may use the public internet. Atlas isolates
+what the environment can read and which authority it can obtain, but it cannot
+prevent that environment from transmitting data it is legitimately allowed to
+read.
+
+Restricted or allowlisted egress may become a capability for higher-risk
+environments. Until implemented and verified, Atlas must not imply data-loss
+prevention, destination-level credential confinement, or protection against
+exfiltration by an authorized internet-enabled environment.
 
 ## Durability contract
 
-Durability refers to named state with explicit reconstruction behavior, not magical process immortality.
+Durability refers to named state and declared reconstruction behavior, not
+process immortality.
 
 | Event | Guaranteed durable state | Not guaranteed |
 | --- | --- | --- |
-| client disconnect or network change | workspace files, events, supervised workload, declared services, Atlas-owned session | client-owned PTY or connection-local streams |
-| workload process crash | workspace files, events, declarations, persistent profile data | process memory; restart occurs only by declared policy |
-| Atlas API daemon restart | on-disk resources, already supervised workloads, and Atlas-owned PTYs; control state is reconciled | uninterrupted attachment transport during restart |
-| host reboot | workspace files, events, declared services and routes, persistent profiles according to policy | process memory, PTY contents, ephemeral profiles |
-| OS update | the same declared state promised across a reboot, subject to reported conformance | arbitrary unmanaged host state |
-| move to another host | checkpointed files, metadata, declarations, selected profiles and artifacts | live processes, open sockets, transient memory |
-| disk failure or machine loss | only state present in a configured and verified backup or replica | unreplicated local state |
+| client disconnect | environment files, declared services, persistent profiles, grants, routes, events | arbitrary client-owned PTY or connection-local streams |
+| environment process crash | files, declarations, persistent profile data, events | process memory; restart without declared policy |
+| Atlas control restart | on-disk resources and already supervised declared services | uninterrupted operator attachment transport |
+| host reboot | environment files, declared services and routes, persistent profiles, grants according to policy | process memory, PTY contents, ephemeral profiles |
+| OS update | state promised across reboot, subject to reported conformance | arbitrary unmanaged host changes |
+| disk failure or machine loss | only configured and verified backups or replicas | unreplicated local state |
 
-`atlas doctor` reports which rows the current host can satisfy. Backup, checkpoint, fork, and host movement are distinct operations and must not all be labeled sync.
+`atlas doctor` reports which rows the current host can satisfy.
 
-## Client integration levels
+## Capability discovery
 
-- **Level 0, shell-compatible:** the client invokes the stable Atlas workspace entrypoint to start an unmodified agent and gains durable execution, conventional filesystem behavior, CLI access, and private service discovery. Reattachable interactive continuity requires an Atlas-owned session.
-- **Level 1, capability-aware:** the client consumes JSON, MCP, or the local API for structured previews, browser attachment, lifecycle, approvals, and activity.
-- **Level 2, policy-integrated:** a product such as Blue supplies its own signed workload provenance and authorization policy while Atlas continues to enforce only machine-local grants.
+The managed image and a future supported Linux install may expose the same
+resource model with different guarantees. `atlas doctor --json` reports:
 
-All levels use the same host resources. Higher levels add provenance and user experience, not a separate runtime.
+- contract and schema versions
+- environment identity and isolation backend
+- browser automation, observation, recording, and takeover capabilities
+- whether raw browser credentials can be exported through the selected protocol
+- credential delivery and brokering modes
+- private connectivity and recovery paths
+- route authentication and exposure modes
+- storage, update, rollback, and backup guarantees
+- known host conflicts and degraded guarantees
+
+Clients degrade explicitly. They do not infer guarantees from the distribution,
+installation method, or the presence of an `atlas` command.
 
 ## Non-goals
 
 This contract does not define:
 
-- a conversation, prompt, task, or model API
-- a universal namespace for third-party client sessions
-- a remote code editor protocol
-- a container or VM format
-- agent selection, task assignment, or multi-agent orchestration
-- transparent live process migration
-- concurrent shared mutation of one workspace branch
-- data-loss prevention for data an internet-enabled workload is allowed to read
+- conversations, prompts, tasks, or model selection
+- repository, branch, worktree, merge, or diff semantics
+- client terminal, pane, or logical session identity
+- a remote code-editor protocol
+- agent selection, assignment, or orchestration
+- transparent live-process migration
+- data-loss prevention for data an environment is allowed to read
 - downstream product authorization
-- a requirement to trust an Atlas-hosted service
+- a requirement to trust an Atlas-hosted remote service
 
-## Architecture decisions intentionally left open
+## Architecture decisions intentionally open
 
 The contract does not yet choose:
 
-- base Linux distribution or image construction system
-- mutable, image-based, A/B, OSTree, Nix-style, or other update design
-- exact workspace isolation backend
-- private networking implementation
+- final base Linux distribution or image-construction system
+- persistent disk layout and unattended-unlock policy
+- environment isolation backend
 - control-plane implementation language
-- browser automation protocol and streaming technology
-- hosted relay, rendezvous, or public-share provider
+- browser automation and streaming technology
+- credential providers
+- route proxy implementation
+- hosted relay, rendezvous, or public-sharing provider
 
-Those choices should be evaluated against this contract and the threat model, not made prerequisites for discovering the product.
+Those choices should be evaluated against this contract and the threat model,
+not made prerequisites for discovering the product.
