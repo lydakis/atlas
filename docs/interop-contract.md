@@ -30,7 +30,8 @@ directly as the host administrator is outside that guarantee.
 | projects, repositories, branches, worktrees, diffs | agent client, Git, or operator |
 | terminals, panes, client reconnection, presentation | agent client or harness |
 | host installation, health, update, rollback, recovery | Atlas |
-| environment definition, identity, isolation, durable home, resource budget | Atlas |
+| environment definition, disposable instance, identity, isolation, resource budget | Atlas |
+| durable volumes, attachment policy, snapshots, backup, recovery | Atlas and operator |
 | browser profiles, displays, observation, recording, takeover | Atlas |
 | local credential grants and use attribution where observable | Atlas |
 | private routes from paired devices to environment services | Atlas |
@@ -59,7 +60,7 @@ namespace for projects, threads, panes, or coding tasks.
 
 ## Resource model
 
-Atlas exposes five primary resources.
+Atlas exposes six primary resources.
 
 ### Host
 
@@ -68,21 +69,21 @@ A `host` is a paired Atlas machine. Its observable contract includes:
 - stable host identity and human-safe name
 - hardware and software architecture
 - connectivity and enrollment state
-- supported environment, grant, surface, and route capabilities
+- supported environment, volume, grant, surface, and route capabilities
 - storage, encryption, backup, update, rollback, and recovery conformance
 - current health, resource pressure, and security-relevant degradation
 
 ### Environment
 
-An `environment` is a named, reusable trust context realized as a persistent
+An `environment` is a named, reusable execution and trust context realized as a
 Linux compartment. An existing agent client selects or enters it before work
 begins. It owns:
 
 - an enforceable OS principal and process boundary
-- a private writable home and runtime state
+- a resettable root filesystem, writable home, and runtime state
 - a resource budget and accounting scope
 - a network context and outbound policy
-- non-secret configuration
+- composed non-secret variables, tool packages, and Git configuration
 - references to its grants, surfaces, routes, and activity
 
 An environment is not a repository, branch, task, terminal, or agent. Those
@@ -98,15 +99,45 @@ Environment labels are not security identities. The host derives authority
 from the authenticated entry path, OS principal, cgroup or scope membership,
 namespace membership, and any stronger selected isolation backend.
 
-Each environment also has an opaque, non-reusable Atlas identity. Deleting an
-environment requires an explicit lifecycle action for its bound profiles,
-grants, surfaces, and routes. Recreating the same human-readable name inherits
-nothing.
+Each environment also has an opaque Atlas identity. Resetting its current
+instance destroys mutable OS and home state without changing the definition or
+deleting attached volumes. Deleting the environment requires explicit lifecycle
+action for bound profiles, grants, surfaces, and routes. Recreating a deleted
+name inherits nothing.
 
 Some agent products also use `environment` for a saved launch configuration or
 runner destination. A client environment may select an Atlas environment, but
 the two identifiers are not interchangeable and neither a matching name nor a
 client-supplied identifier establishes host authority.
+
+An environment definition may compose ordered reusable layers and instance
+overrides, including aliased packages and non-secret Git settings, into a named
+or explicitly ephemeral environment. Projects and agents select or enter that
+environment
+but are not ownership keys. Several agents may share one environment when they
+intentionally share its processes, mutable OS state, configuration, and
+authority. The detailed composition, entry, and acceptance contract is defined
+by
+[Environment Entry v0](environment-entry-v0.md).
+
+### Volume
+
+A `volume` is durable operator-owned data with an identity and lifecycle
+separate from any environment instance. Its observable contract includes:
+
+- attachment to a specific environment at an explicit absolute path
+- read-write or read-only access
+- persistence across environment reset or replacement
+- ownership, quota, snapshot, backup, and recovery policy where supported
+- discoverable degradation when the host cannot enforce a requested property
+
+Repositories, worktrees, datasets, artifacts, and other human data that must
+outlive an environment belong on volumes. Multiple cooperating environments may
+mount one volume deliberately. An unmounted volume is not reachable merely
+because a process knows its name or host path.
+
+Atlas manages the storage boundary and attachment; Git and the selected agent
+client still own repository semantics and concurrent-write coordination.
 
 ### Grant
 
@@ -162,7 +193,8 @@ The client connects to an environment through SSH or another conventional
 remote target and receives:
 
 - a normal shell, filesystem, home directory, and loopback network
-- the toolchain installed for that environment
+- the toolchain declared for that environment on its normal PATH, with any
+  weaker visibility boundary reported explicitly
 - isolation from the host control plane and other environments
 - conventional credential helpers and a bounded surface-action endpoint where
   granted; raw browser debugging is not a Level 0 guarantee
@@ -251,13 +283,14 @@ reachability alone does not confer operator authority.
 
 1. Each environment has a distinct kernel-enforced principal.
 2. Separate environments cannot read, signal, trace, attach to, or consume each
-   other's files, processes, browser profiles, grants, surfaces, or routes by
-   default.
+   other's resettable files, processes, browser profiles, grants, surfaces,
+   routes, or unmounted volumes by default.
 3. Child processes remain inside the parent's environment boundary.
 4. Host-administrator and Atlas control-plane authority are unavailable inside
    ordinary environments.
-5. Writable state is private to one environment unless a shared resource is
-   explicitly declared and mediated.
+5. Resettable writable state is private to one environment and persists until
+   explicit reset under the environment's reported storage capability. Durable
+   writable state is available only through an explicitly attached volume.
 6. Shared package or repository caches are immutable or brokered so one
    environment cannot poison another.
 7. The isolation backend and its known gaps are discoverable through
@@ -265,15 +298,20 @@ reachability alone does not confer operator authority.
 8. Unless Atlas can prove a narrower process identity and confinement boundary,
    authority delivered to an environment is treated as usable by every process
    inside it.
-9. An environment may contain multiple repositories, worktrees, agent
-   processes, and client sessions because Atlas does not own those concepts.
+9. An environment may contain multiple agent processes and client sessions. A
+   volume may contain multiple repositories and worktrees because Atlas does
+   not own those concepts.
+10. Reset terminates the complete environment workload tree, confirms it is
+    stopped, and atomically detaches its root and home, but never implicitly
+    deletes an attached volume.
 
 An implementation may use Linux users, systemd scopes, namespaces, containers,
 microVMs, or VMs. The contract is the observable boundary, not the backend.
 
 An operator uses separate environments when agent instances require different
-authority sets. This is guidance about selecting trust boundaries, not a claim
-that Atlas can identify a client's logical agent instances.
+authority, dependency, network, reset-policy, or resource contexts. This
+is guidance about selecting trust boundaries, not a claim that Atlas can
+identify a client's logical agent instances.
 
 ## Grants and browser identities
 
@@ -356,18 +394,23 @@ environments. Until implemented and verified, Atlas must not imply data-loss
 prevention, destination-level credential confinement, or protection against
 exfiltration by an authorized internet-enabled environment.
 
-## Durability contract
+## Persistence and durability contract
 
-Durability refers to named state and declared reconstruction behavior, not
-process immortality.
+Persistence and durability are different promises. Resettable environment files
+persist across ordinary operation and, in the product target, across reboot and
+supported update. Durable volumes additionally survive environment reset and
+follow an explicit recovery and backup policy. Volatile execution state, such
+as process memory, open connections, sockets, locks, PID files, `/run`, and
+connection-local terminal state, is reconstructed rather than persisted.
 
 | Event | Guaranteed durable state | Not guaranteed |
 | --- | --- | --- |
-| client disconnect | environment files, declared services, persistent profile data, grant and route records according to policy, events | arbitrary client-owned PTY or connection-local streams; continued authority after expiry or revocation |
-| environment process crash | files, declarations, persistent profile data, events | process memory; restart without declared policy |
+| client disconnect | attached volumes, resettable environment files, persistent profile data, grant and route records according to policy, events | arbitrary client-owned PTY or connection-local streams; continued authority after expiry or revocation |
+| environment process crash | attached volumes, current instance files, declarations, persistent profile data, events | process memory; restart without declared policy |
 | Atlas control restart | on-disk resources and already supervised declared services | uninterrupted operator attachment transport |
-| host reboot | environment files, declared services, route and grant records with effective policy state, encrypted persistent profile data | process memory, PTY contents, ephemeral profiles; profile availability before its declared unlock condition is satisfied |
-| OS update | state promised across reboot, subject to reported conformance | arbitrary unmanaged host changes |
+| environment reset | attached volumes, definition, bindings governed by explicit policy, events | installed packages, resettable root and home, process memory |
+| host reboot | volumes, resettable environment files when `persistent-until-reset` is reported, route and grant records with effective policy state, encrypted persistent profile data | process memory, open connections, `/run`, PTY contents, deliberately ephemeral profiles |
+| OS update | volumes and resettable state promised across reboot, subject to reported conformance | arbitrary unmanaged host or environment-instance changes |
 | disk failure or machine loss | only configured and verified backups or replicas | unreplicated local state |
 
 `atlas doctor` reports which rows the current host can satisfy.

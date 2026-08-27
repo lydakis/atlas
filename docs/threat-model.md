@@ -12,10 +12,11 @@ managed recovery without becoming an agent conversation or coding product.
 This repository does not yet implement that product. It contains design
 contracts and a bounded NixOS spike. The spike defines Atlas state roots,
 control and environment resource slices, root-only Nix authority, interactive
-or runtime-secret Tailscale enrollment, a live physical ISO, and two hardened
-demonstration processes. It does not contain an environment manager, browser,
-credential broker, route proxy, audit service, persistent installer, or update
-controller.
+or runtime-secret Tailscale enrollment, a live physical ISO, disposable
+user-namespaced nspawn environments, durable volumes, and an operator-only
+reset path separated from the public inspection socket. It does not contain
+runtime environment or volume creation, a browser, credential broker, route
+proxy, audit service, persistent installer, or update controller.
 
 Threats below are requirements and hypotheses unless the evidence column says a
 control is implemented and tested. They are not confirmed vulnerabilities.
@@ -24,20 +25,21 @@ control is implemented and tested. They are not confirmed vulnerabilities.
 
 | Component | Current role | Evidence |
 | --- | --- | --- |
-| Atlas host module | Declares state roots, host contract, Tailscale adapter, root-only Nix authority, control/environment slices, and accounts | `nixos/modules/atlas-host.nix` |
-| Spike configuration | Enables Tailscale and runs two hardened demonstration environment processes | `nixos/configurations/spike-host.nix` |
-| Host-contract tests | Check contract intent versus implementation, static configuration, absence of OpenSSH, generated state modes and ownership, environment namespaces, root-only Nix, safe option evaluation, and state survival | `nixos/tests/host-contract.nix`, `nixos/tests/module-evaluation.nix` |
+| Atlas host and environment modules | Declare state roots, volumes, host contract, Tailscale adapter, root-only Nix authority, persistent nspawn entry, split inspection/lifecycle control, control/environment slices, and accounts | `nixos/modules/atlas-host.nix`, `nixos/modules/atlas-environments.nix` |
+| Spike configuration | Enables Tailscale and declares three environments plus one shared project volume | `nixos/configurations/spike-host.nix` |
+| Host-contract tests | Check contract intent, absence of OpenSSH, generated state, anchored peer identity, persistent and concurrent user-namespaced entry, environment mutation, package installation, atomic active-workload reset, explicit volume sharing and denial, root-only Nix, safe option evaluation, and volume survival | `nixos/tests/host-contract.nix`, `nixos/tests/module-evaluation.nix`, `tests/test_atlas_control.py` |
 | Flake outputs | Build VM test artifacts and a non-persistent live ISO with local-console enrollment instructions | `flake.nix` |
 
 ### Effective resources
 
 | Deployment or workflow | Resource or capability | Configuration and precedence | Safe effective value or location | Readers, writers, or recipients | Enforcing control | Evidence or unknowns |
 | --- | --- | --- | --- | --- | --- | --- |
-| All spike hosts | Mutable Atlas state | fixed v0 `atlas.host.dataRoot` | `/var/lib/atlas` with named subdirectories; separate storage must be mounted at that path | root and `atlas-control`; dynamic demonstration identities; future environment-specific owners | exact external-path option constraint and metadata-derived systemd-tmpfiles rules | Implemented and evaluation-tested; not an encrypted partition: `nixos/modules/atlas-host.nix`, `nixos/tests/module-evaluation.nix` |
+| All spike hosts | Mutable Atlas state | fixed v0 `atlas.host.dataRoot` | `/var/lib/atlas` with named subdirectories; separate storage must be mounted at that path | root and `atlas-control`; environment access only through declared mounts | exact external-path option constraint and metadata-derived systemd-tmpfiles rules | Implemented and evaluation-tested; not an encrypted partition: `nixos/modules/atlas-host.nix`, `nixos/tests/module-evaluation.nix` |
 | Interactive enrollment | Tailnet and Tailscale SSH authority | `sudo atlas-enroll` invokes `tailscale up --qr --ssh` | Tailscale-managed state; no auth key embedded in the image | root, `tailscaled`, Tailscale control plane | local root plus tailnet policy | Implemented helper; live enrollment not yet integration-tested: `nixos/modules/atlas-host.nix` |
 | Automated enrollment | Tailscale auth key | operator-selected `atlas.host.tailscale.authKeyFile` | canonical external runtime path resolving outside `/nix/store` | root and NixOS Tailscale autoconnect service | external-path option type, dot-segment and store rejection, runtime resolution check, and file permissions supplied by deployer | Path representation is evaluation-tested; secret lifecycle untested: `nixos/modules/atlas-host.nix`, `nixos/tests/module-evaluation.nix` |
 | Host administration | `atlas-operator` authority | password-disabled local account in wheel; passwordless sudo | local OS account, reached only after selected remote enrollment or console access | tailnet identities allowed to log in as `atlas-operator`; anyone with the live ISO console | tailnet policy and physical possession of the live image | High-impact boundary; no Atlas policy layer yet: `nixos/modules/atlas-host.nix`, `flake.nix` |
-| Environment demonstrations | Process and loopback namespace | dynamic users, private network, hardened systemd services | separate service identities and network namespaces | each demonstration process only | systemd service sandboxing | Implemented and tested; not an interactive environment backend: `nixos/configurations/spike-host.nix`, `nixos/tests/host-contract.nix` |
+| Environment instance | Mutable Ubuntu root and home | declared environment plus pinned OCI base | size-bounded tmpfs at `/run/atlas/environments/<id>`; root recreated on reset or reboot | mapped root inside that environment; privileged Atlas launcher and root-only reset service | persistent user-namespaced systemd-nspawn, anchored cgroup identity, fixed entry sudo rule, external readiness marker | Package install, isolation from host `/etc`, concurrent re-entry, active-workload reset, and generation reload tested; shared-host networking and Nix-store visibility remain degraded |
+| Project volume | Durable source and artifacts | declared volume plus explicit environment mount | `/var/lib/atlas/volumes/<id>/data`, mounted at `/home/agent/work` | only environments with the declared mount, plus host control | nspawn bind with id mapping and per-environment declaration | Sharing between two environments, omission from a third, reset survival, and generation rollback tested; encryption, ACLs, snapshots, and backup absent |
 | Live physical image | First-boot console | ISO-only console autologin as password-disabled `atlas-operator` with passwordless sudo | ephemeral live system with host-root console authority | person with physical console access | physical possession and ISO-only configuration | Deliberately weak dogfood bootstrap; no persistent-image claim: `flake.nix` |
 
 ### Security objective
@@ -55,7 +57,8 @@ retain a recovery path when the private network or control plane fails.
 - operator identity, tailnet policy, paired devices, and enrollment authority
 - source credentials and derivative grants
 - browser cookies, authenticated profiles, recordings, clipboard, and downloads
-- source code, uncommitted work, artifacts, and environment state
+- source code, uncommitted work, artifacts, durable volumes, and disposable
+  environment state
 - route names, targets, authorization, and access history
 - audit records and attribution evidence
 - disk-encryption and backup keys
@@ -68,8 +71,10 @@ flowchart TD
     O[Operator device] -->|Tailnet reachability and operator authentication| H[Atlas host control plane]
     C[Existing agent client] -->|SSH or remote environment entry| EA[Environment A]
     C -->|SSH or remote environment entry| EB[Environment B]
-    H -->|Create, constrain, inspect, stop| EA
-    H -->|Create, constrain, inspect, stop| EB
+    H -->|Declare, constrain, inspect, reset| EA
+    H -->|Declare, constrain, inspect, reset| EB
+    V[Durable volume] -->|Explicit attachment| EA
+    V -->|Optional explicit attachment| EB
     H --> G[Grant broker]
     H --> S[Surface reference monitor]
     H --> R[Private route broker]
@@ -131,8 +136,10 @@ route broker are intended components, not current implementation claims.
 4. **Host control plane to environment:** environments are hostile and cannot
    write policy, host binaries, sockets, audit state, enrollment state, or
    update trust roots.
-5. **Environment to environment:** files, processes, profiles, grants, surfaces,
-   routes, resources, and activity attribution remain separate.
+5. **Environment to environment:** disposable files, processes, profiles,
+   grants, surfaces, routes, unmounted volumes, resources, and activity
+   attribution remain separate. An explicitly shared volume is an intentional
+   exception for its contents only.
 6. **Environment to grant broker:** an environment obtains only approved
    authority. A materialized source credential is an explicit degraded grant,
    not the default or an implicit consequence of entering the environment.
@@ -160,8 +167,8 @@ route broker are intended components, not current implementation claims.
 2. A process receives environment capabilities only through an authenticated
    entry that the host binds to a kernel-enforced principal.
 3. One environment cannot read, signal, trace, attach to, route through, or use
-   another environment's files, profiles, grants, surfaces, or routes by
-   default.
+   another environment's disposable files, profiles, grants, surfaces, routes,
+   or unattached volumes by default.
 4. Ordinary environments cannot modify the Atlas control plane, audit sink,
    update policy, recovery material, or host credential store.
 5. Source credentials never enter the Nix store, process arguments, Atlas audit
@@ -198,7 +205,11 @@ route broker are intended components, not current implementation claims.
     proven host identity from unverified client annotations.
 15. Resource exhaustion in one environment cannot prevent the operator from
     inspecting, stopping, or recovering the host.
-16. Authenticated updates preserve declared guarantees or fail visibly with a
+16. Reset stops the complete environment cgroup, confirms the service is
+    inactive, then atomically detaches and removes its mutable root and home
+    without deleting an attached durable volume. Root inside the environment
+    cannot authorize it.
+17. Authenticated updates preserve declared guarantees or fail visibly with a
     tested recovery path.
 
 ### Assumptions and explicit non-guarantees
@@ -227,8 +238,8 @@ route broker are intended components, not current implementation claims.
 - Client-owned terminals and arbitrary processes are not reconstructed after a
   disconnect or reboot unless explicitly declared and supervised.
 - The current spike has no persistent disk encryption, browser, grant broker,
-  route proxy, environment login boundary, audit implementation, signed Atlas
-  releases, or physical-hardware evidence.
+  route proxy, audit implementation, signed Atlas releases, or physical-hardware
+  evidence.
 - The live ISO's local-console autologin is a dogfood bootstrap, not an
   acceptable persistent appliance control.
 
@@ -238,8 +249,9 @@ route broker are intended components, not current implementation claims.
 | --- | --- | --- | --- | --- | --- | --- |
 | Critical hypothesis | Tailnet policy lets an unintended peer log in as `atlas-operator`, gaining passwordless sudo and host root | enrolled host plus permissive network and SSH policy | total host, environment, credential, and update compromise | password-disabled local account, Tailscale-only intended path, no OpenSSH | require a dedicated Atlas tailnet tag, narrow source identities, fresh check for administrator login, device revocation, and local recovery | Current authority is visible in `nixos/modules/atlas-host.nix` and `flake.nix`; tailnet policy is external and unverified |
 | Critical hypothesis | Update or build compromise replaces the Atlas host or enrollment helper | compromised nixpkgs input, release process, signing key, or builder | fleet-wide privileged code execution | pinned flake input and root-only Nix authority | signed release metadata, provenance, staged rollout, health checks, anti-downgrade, and offline recovery | Pin and Nix policy implemented in `flake.lock` and `nixos/modules/atlas-host.nix`; release controls absent |
-| High hypothesis | An environment escapes through mounts, devices, capabilities, ptrace, namespaces, or a privileged socket | hostile process inside environment | host root or another environment's data and authority | demonstration services use dynamic users, private network, dropped capabilities, and read-only host protections | choose and test an interactive environment backend; deny control sockets; isolate writable state, devices, IPC, and caches | Demonstration only: `nixos/configurations/spike-host.nix` |
-| High hypothesis | A second environment reads another environment's browser profile, grant, recording, or code | two persistent environments and an incomplete filesystem boundary | cross-environment identity and data theft | top-level sensitive state roots have restrictive ownership where implemented | per-environment ownership or isolated mount trees; cross-environment regression tests; immutable shared caches | Top-level modes implemented by `nixos/modules/atlas-host.nix`; per-environment backend absent |
+| High hypothesis | An environment escapes through mounts, devices, capabilities, ptrace, namespaces, the kernel, or the Atlas control socket | hostile mapped-root process inside nspawn | host root or another environment's data and authority | user namespace, disposable private root, explicit bind mounts, exact entry sudo rule, anchored peer/cgroup authorization, read-only public control socket, root-only lifecycle socket, reset denied from an environment | reduce mounted host surfaces, isolate networking and IPC, fuzz the control protocol, test known container escape classes, patch the kernel and systemd quickly, consider stronger backends for hostile multi-tenancy | Interactive nspawn, host `/etc` isolation, cgroup identity, public reset denial, and environment reset denial tested in `nixos/tests/host-contract.nix`; comprehensive escape resistance is not proven |
+| High hypothesis | A second environment reads or corrupts another environment's browser profile, grant, recording, or code | two environments and an incomplete mount or ownership boundary | cross-environment identity and data theft | only declared volumes are mounted; one volume is deliberately shared by two development environments and omitted from `restricted`; top-level sensitive state roots remain control-owned | per-human and per-environment volume ACLs, read-only mounts, isolated browser and grant trees, cross-environment regression tests, snapshot and recovery policy | Shared-volume access and omission are tested; browser and grant resources are not implemented |
+| High hypothesis | A malicious agent destroys or poisons a deliberately shared project volume | write access to a volume shared by cooperating environments | source loss, corrupted Git metadata, or compromised output consumed by another agent | sharing is explicit and environment reset preserves rather than deletes the volume | snapshots, backups, copy-on-write forks, read-only inspection, quotas, ownership and conflict policy | The shared write path and reset survival are implemented; snapshots and recovery are absent |
 | High hypothesis | A raw browser-debug endpoint lets an authorized environment export cookies or reusable session credentials | persistent authenticated profile plus broad automation protocol | durable account takeover outside Atlas | none implemented | capability-specific browser adapters, authenticated local endpoints, protected profile filesystem, narrower action-only mode for high-trust identities, fast browser patching | Design requirement only |
 | High hypothesis | Agent-controlled content, a malicious focused frame, or a compromised worker deceives the operator into entering a source credential into the wrong context | future paired-device console and authenticated browser surface | low-risk account takeover in v0; potentially consequential source-credential theft later | none implemented; v0 limits proof to a low-risk disposable account | broker-owned chrome labels fact provenance; independently enforced destination policy is distinguished from worker reports; context change fences input; reusable-password entry does not claim protection from a compromised worker | Proposed contract: `docs/authenticated-surface-v0.md`, sections "Internal trust partition," "Controller state machine," and "Authentication handoff"; re-evaluate as Critical before consequential credentials |
 | High hypothesis | A stolen, replayed, or cross-surface takeover request obtains operator control of a browser identity | future paired-device console, reachable control channel, and missing request binding | unauthorized account actions or observation of the authentication ceremony | none implemented | paired-device authentication, short-lived single-use request, full context binding, controller epoch, fail-locked expiry and restart | Proposed contract: `docs/authenticated-surface-v0.md`, sections "Paired operator minimum contract" and "Authentication handoff" |
@@ -252,8 +264,8 @@ route broker are intended components, not current implementation claims.
 | High hypothesis | A route publishes an administrative or unintended port, pivots to host metadata, or targets another environment | future route broker with attacker-controlled target | private data exposure, SSRF, or cross-environment access | no route is currently implemented or exposed | explicit publication, environment-bound upstream validation, private authentication, expiry, rate limits, and public sharing as separate grant | Design requirement only |
 | High hypothesis | Physical theft exposes source, browser sessions, grants, tailnet state, or recovery material | persistent unencrypted installation | offline credential and data theft | current live ISO is ephemeral | full-disk encryption, hardware-backed sealing where supportable, separate sensitive stores, encrypted backups, remote revocation, secure reset | Persistent installer and encryption absent |
 | Medium hypothesis | Tailscale auth key leaks from a declarative build or broadly readable runtime file | automated enrollment using `authKeyFile` | unauthorized node enrollment or tailnet access within key scope | canonical external runtime-path type, Nix-store and resolved-target rejection, and evaluation regression | require short-lived scoped keys, strict file mode, deletion after enrollment, rotation, and no logging | Nix-path, store-path, and dot-segment representations rejected by `nixos/tests/module-evaluation.nix`; runtime lifecycle remains open |
-| Medium hypothesis | A malicious environment exhausts resources and blocks inspection or recovery | interactive environment with unbounded CPU, memory, tasks, disk, or recordings | host denial of service and possible state loss | separate weighted slices, control-plane memory reservation, systemd-oomd | per-environment quotas, bounded logs and recordings, pressure tests, deterministic quarantine and cleanup | Slice controls in `nixos/modules/atlas-host.nix`; per-environment quotas absent |
-| Medium hypothesis | A client label or logical agent identifier is trusted as the environment principal | capability-aware client or local control socket | confused-deputy access to another environment | contract requires kernel identity; no control daemon exists | authenticate peer credentials and boundary membership; bind every grant and route to the observed principal | Design requirement only |
+| Medium hypothesis | A malicious environment exhausts resources and blocks inspection or recovery | interactive environment with excessive CPU, memory, tasks, durable-volume writes, logs, or recordings | host denial of service and possible state loss | separate weighted slices, control-plane memory reservation, systemd-oomd, per-environment task limits, and size-bounded disposable tmpfs roots | durable-volume, log, cache, and recording quotas; pressure tests; deterministic quarantine and cleanup | Slice controls and bounded runtime roots in `nixos/modules/atlas-host.nix` and `nixos/modules/atlas-environments.nix`; volume and future recording quotas absent |
+| Medium hypothesis | A client label or logical agent identifier is trusted as the environment principal | capability-aware client or local control socket | confused-deputy access to another environment | the control service derives identity from socket peer UID or an anchored environment cgroup prefix; unknown callers fail closed; misleading descendant names and caller-supplied identity do not authorize reset | apply the same observed-principal rule to every future grant, route, volume, and surface method and test namespace and cgroup edge cases | Unit and booted-host identity and reset tests exist in `tests/test_atlas_control.py` and `nixos/tests/host-contract.nix` |
 | Medium hypothesis | Local-console autologin on a persistent image gives anyone with physical access host administration | ISO bootstrap copied into installed system | local host-root access | autologin is scoped to the live ISO output | remove autologin from persistent images; use single-use enrollment and authenticated recovery | ISO-only configuration in `flake.nix` |
 | Medium hypothesis | An environment deletes or floods activity evidence or places secrets in logged arguments | future audit pipeline plus hostile process | loss of attribution or secondary secret exposure | audit root is control-owned; no audit writer exists | control-plane-owned event path, redaction, rate limits, tamper evidence, off-host export, retention controls | State root in `nixos/modules/atlas-host.nix`; implementation absent |
 

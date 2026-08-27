@@ -60,7 +60,7 @@ Codex · Herdr · T3 Code · SSH · Blue · any agent client
                          │
              ordinary remote connection
                          │
-       environment · grant · surface · route
+    environment · volume · grant · surface · route
                          │
                    Atlas host
                          │
@@ -76,10 +76,13 @@ Atlas makes three commitments:
 1. **Existing tools work normally.** An agent client can treat an Atlas
    environment as an ordinary remote Linux target and retain its own project,
    worktree, terminal, and conversation model.
-2. **Authority is compartmentalized.** Files and processes live inside an
-   enforceable environment, while Atlas-managed browser identities, grants,
-   routes, and resource budgets are bound to that environment rather than
-   becoming ambient host state.
+2. **Resettable machine state and durable data are separate.** Ordinary files,
+   installed tools, home configuration, and mutable OS state live inside a
+   persistent environment instance that the operator may explicitly reset.
+   Repositories and other protected human data live on durable volumes that a
+   reset cannot delete. Live process memory and connections are volatile.
+   Browser identities, grants, routes, and resource budgets remain bound to
+   enforceable Atlas resources rather than becoming ambient host state.
 3. **A human can see and intervene.** Sensitive grants, browser control,
    recordings, private routes, health, updates, and recovery remain visible and
    controllable from a paired operator device.
@@ -90,7 +93,7 @@ yet have a product.
 
 ## Core primitives
 
-Atlas exposes five host-level primitives.
+Atlas exposes six host-level primitives.
 
 ### Host
 
@@ -100,12 +103,25 @@ path.
 
 ### Environment
 
-A named, reusable trust context realized as a persistent Linux compartment. It
-is the target an existing agent tool selects or enters before work begins. An
-environment owns an enforceable OS principal, files, process and resource
-boundaries, and network context. Atlas binds browser identities, grants,
-surfaces, routes, and activity to the environment's opaque, non-reusable
-identity.
+A named, reusable execution and trust context realized as a Linux compartment.
+It is the target an existing agent tool selects or enters before work begins.
+An environment owns an enforceable OS principal, resettable root filesystem and
+home, process and resource boundaries, network context, and non-secret
+configuration. Atlas binds grants, surfaces, routes, and activity to the
+environment's opaque identity.
+
+An environment instance is mutable, persistent, and resettable. Tools installed
+by an agent, caches, ordinary files, and changes under its root or home should
+survive re-entry, environment restart, host reboot, and supported update. An
+explicit reset reconstructs that machine state from its declared seed. Resetting
+the instance must not destroy an attached durable volume.
+
+Volatile execution state is narrower: process memory, open connections, sockets,
+locks, PID files, `/run`, and connection-local terminal state do not survive a
+normal reboot. Declared services may restart from persistent files, but Atlas
+does not promise transparent process checkpointing. Deliberately ephemeral
+environments may be offered later as an explicit policy; they are not the
+default agent experience.
 
 An environment may define non-secret configuration. Secret values are not part
 of that configuration. Source credentials remain in an operator-owned or Atlas
@@ -113,11 +129,37 @@ control-plane store by default; an explicitly approved materialized-secret grant
 is the degraded exception. Grants bind specific authority to the environment
 through an explicit delivery mode.
 
+Environment definitions may compose reusable non-secret layers into a named or
+explicitly ephemeral instance. Projects and agents select an environment; Atlas
+does not
+assign environments to projects. Several agents may use one environment when
+they intentionally share its execution state and authority context. The
+detailed entry contract is defined by
+[Environment Entry v0](environment-entry-v0.md).
+
 An environment is not a repository or task. Codex, Herdr, T3 Code, Git, or the
 operator may clone repositories, create worktrees, run terminals, and manage
 projects and sessions inside it. Atlas should only add repository or session
 primitives later if a specific host-level guarantee cannot be supplied by those
 tools.
+
+The normal product experience begins with one default environment. Additional
+environments are explicit boundaries for different authority, network policy,
+incompatible toolchains, reset policy, or resource limits, not a requirement per
+project, repository, agent, or conversation.
+
+### Volume
+
+Durable operator-owned data attached explicitly to one or more environments at
+a declared path and access mode. Repositories, worktrees, datasets, artifacts,
+and other files that must outlive an environment instance belong on volumes.
+
+A volume is not a container home and does not inherit an environment's
+lifecycle. Resetting or replacing an environment leaves its attached volumes
+intact. Multiple cooperating environments may mount one volume read-write; an
+inspection environment may receive it read-only. Copy-on-write forks and
+per-human ownership are later lifecycle and policy features of the same
+primitive.
 
 ### Grant
 
@@ -164,22 +206,27 @@ conversation plugin for any particular client.
 
 ## The first distinctive use case
 
-The first product proof is an existing agent client using a persistent,
-observable browser identity on a physical Atlas machine.
+The first product proof is an existing agent client using durable code and a
+persistent, observable browser identity on a physical Atlas machine.
 
 1. Flash Atlas onto a representative spare computer.
 2. Enroll it into the operator's private network and connect using SSH.
-3. Enter one persistent agent environment with an existing agent tool.
-4. Start an isolated browser surface with one low-risk test identity.
-5. Let the operator authenticate that browser once without copying a password
+3. Attach a durable project volume and enter one agent environment with an
+   existing agent tool.
+4. Let the agent install a tool and modify its resettable operating system,
+   then reset the environment and prove the project volume survived.
+5. Start an isolated browser surface with one low-risk test identity.
+6. Let the operator authenticate that browser once without copying a password
    into the environment.
-6. Let the agent operate the authenticated site through a bounded computer-use
+7. Let the agent operate the authenticated site through a bounded computer-use
    interface.
-7. Let the operator watch, record, take over, and return control.
-8. Expose one development server through a tailnet-private route.
-9. Create a second environment and prove it cannot access the first
-   environment's files, processes, profile, grants, surface, or route.
-10. Reboot or update the host and preserve the state declared durable.
+8. Let the operator watch, record, take over, and return control.
+9. Expose one development server through a tailnet-private route.
+10. Create a restricted environment without the project volume and prove it
+    cannot access the first environment's resettable state, durable volume,
+    profile, grants, surface, or route.
+11. Reboot or update the host, preserve resettable environment files, and
+    preserve the state declared durable.
 
 This does not begin with the operator's primary personal identity. It begins
 with a disposable or low-risk account so that Atlas can prove its boundary
@@ -221,11 +268,13 @@ onto an autonomous machine.
 
 Atlas isolates environments, not Git strategies.
 
-Inside one environment, the selected agent tool may use ordinary clones,
-worktrees, branches, or its own project model. Separate environments require
-separate writable state. Git worktrees share repository metadata and therefore
-belong inside one trust boundary. Stronger isolation may use separate clones or
-copy-on-write filesystem snapshots, with immutable object caches where safe.
+On an attached volume, the selected agent tool may use ordinary clones,
+worktrees, branches, or its own project model. Several cooperating environments
+may deliberately share that volume, but Atlas does not prevent Git-level races
+or make concurrent writers safe. Git worktrees share repository metadata and
+therefore require a shared trust boundary. Stronger isolation may use separate
+volumes, clones, or copy-on-write volume forks, with immutable object caches
+where safe.
 
 Atlas should add an opinionated checkout or fork operation only after evidence
 shows that existing tools cannot provide the required isolation, recovery, or
@@ -281,16 +330,20 @@ product behavior rather than choose a base from image mechanics alone.
 
 1. **Physical host:** persistent installation, private enrollment, SSH,
    encrypted state with a declared unlock mode, update, and recovery.
-2. **Environment:** one enforceable Linux compartment that an existing agent
-   client can use as a normal remote target.
-3. **Surface:** one isolated browser profile with observation, recording, and
+2. **Environment:** one resettable Linux compartment that an existing agent
+   client can use as a normal remote target and mutate as root without gaining
+   host root.
+3. **Volume:** durable project data that survives environment reset, reboot,
+   update, and recovery according to declared policy.
+4. **Surface:** one isolated browser profile with observation, recording, and
    exclusive takeover.
-4. **Grant:** authenticate one low-risk browser identity, then add one narrow
+5. **Grant:** authenticate one low-risk browser identity, then add one narrow
    brokered service credential.
-5. **Route:** expose one environment service privately through the tailnet.
-6. **Isolation proof:** demonstrate that a second environment cannot cross any
-   file, process, profile, grant, surface, route, or resource boundary.
-7. **Reconstruction:** reboot and update without losing state declared durable.
+6. **Route:** expose one environment service privately through the tailnet.
+7. **Isolation proof:** demonstrate that a second environment cannot cross any
+   unmounted volume, process, profile, grant, surface, route, or resource
+   boundary.
+8. **Reconstruction:** reboot and update without losing state declared durable.
 
 The [Authenticated Surface v0](authenticated-surface-v0.md) contract supplies
 the security boundary for the environment, surface, and browser-grant steps
@@ -306,8 +359,8 @@ Atlas v0 succeeds when:
 2. SSH and private routes are unavailable from the public network by default.
 3. An existing agent interface uses an environment without adopting an Atlas
    conversation, project, terminal, or Git model.
-4. Two environments have kernel-enforced identities, private writable state,
-   separate process and resource boundaries, and attributable activity.
+4. Two environments have kernel-enforced identities, resettable private OS
+   state, separate process and resource boundaries, and attributable activity.
 5. One browser identity remains unavailable to every environment except the
    one holding its grant.
 6. An agent uses the browser while the operator can observe, take over, record,
@@ -316,9 +369,11 @@ Atlas v0 succeeds when:
    the environment, browser password storage, or Nix store.
 8. One service becomes reachable through an explicit private route without a
    public listener or manual port forwarding.
-9. Reboot and update preserve or deliberately reconstruct documented durable
-   state.
-10. `atlas doctor` reports which guarantees the machine actually satisfies.
+9. Reset destroys one environment's installed tools and mutable OS state while
+   preserving its attached durable volume.
+10. Reboot and update preserve resettable environment files and documented
+    durable state.
+11. `atlas doctor` reports which guarantees the machine actually satisfies.
 
 ## Boundaries
 

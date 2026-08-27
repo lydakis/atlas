@@ -1,6 +1,6 @@
 # NixOS host architecture spike
 
-Status: physical-first revision validated in QEMU, physical boot pending
+Status: Environment Entry v0 validated in QEMU, physical boot pending
 
 ## Outcome
 
@@ -27,6 +27,10 @@ The revision after the product-boundary discussion makes two corrections:
    development, automated-test, and optional deployment artifacts.
 2. Atlas environments are OS compartments used by existing agent clients. They
    are not repositories, worktrees, conversations, terminals, or tasks.
+3. Durable data belongs to explicit volumes, while an environment instance owns
+   resettable root, home, installed tools, and caches plus volatile processes.
+   The current tmpfs adapter reconstructs that root after reboot; the product
+   target persists it until explicit reset.
 
 ## Current host contract
 
@@ -37,15 +41,20 @@ The reusable `atlas.host` module currently declares:
 - `tailscale.enable`
 - `tailscale.authKeyFile`
 - `tailscale.ssh`
+- `volumes`
+- `environmentLayers`
+- `environments`
 - the read-only machine contract
 
-Contract version 3 separates three kinds of fact:
+Contract version 5 separates three kinds of fact:
 
-- `intent.primitives` names the five product primitives: host, environment,
-  grant, surface, and route
-- `implementation.primitives` currently contains only `host`
+- `intent.primitives` names the six product primitives: host, environment,
+  volume, grant, surface, and route
+- `implementation.primitives` currently contains `host`, `environment`, and
+  `volume`
 - `configuration` reports static OpenSSH, Tailscale, Nix-authority, and resource
-  slice settings without claiming that connectivity is active at runtime
+  slice settings plus the Environment Entry v0 adapter without claiming that
+  connectivity is active at runtime
 
 The contract also derives its state-directory modes and owners from the same
 layout used to generate systemd-tmpfiles rules.
@@ -54,9 +63,24 @@ The current configuration adds:
 
 - a fixed v0 state mount point at `/var/lib/atlas`; separate storage must be
   mounted there rather than selecting a broader host directory
-- state roots for environments, grants, credentials, browser profiles,
+- state roots for environments, volumes, grants, credentials, browser profiles,
   recordings, routes, caches, and audit data
 - separate `atlas-control.slice` and `atlas-environments.slice` resource lanes
+- named environments with explicit opaque IDs, fixed entry UIDs, disposable
+  Ubuntu root filesystems and homes, and per-environment resource slices
+- durable named volumes with explicit target paths and access modes
+- ordered reusable non-secret configuration layers with instance overrides
+- aliased per-environment package profiles and managed non-secret Git
+  configuration
+- fixed login shells that start interactive or non-interactive commands in
+  persistent, user-namespaced `systemd-nspawn` compartments
+- an environment shell wrapper that preserves variables and the declared PATH
+  when clients create nested interactive shells
+- a socket-activated read-only control service that derives environment identity
+  from peer credentials and anchored cgroup membership, plus a separate
+  root-only lifecycle service for instance reset
+- size-bounded tmpfs roots, external readiness metadata, serialized lifecycle
+  changes, and generation-triggered environment restart
 - a Tailscale daemon and interactive `atlas-enroll` helper
 - optional unattended enrollment from a canonical external runtime auth-key
   path; Nix path values, Nix store aliases, and resolved store targets are
@@ -111,11 +135,100 @@ machine. This is validation timing, not a performance measurement. It validates
 the host configuration, not Tailscale authentication against a real tailnet or
 behavior on physical hardware.
 
+## Environment Entry v0 evidence
+
+The revised Environment Entry v0 integration test passed on August 26, 2026.
+It booted the complete AArch64 host under QEMU and verified:
+
+- left-to-right layer composition and instance overrides
+- evaluation failure for unknown or repeated layers, duplicate identities or
+  UIDs, and caller-defined `ATLAS_` variables
+- fixed interactive and non-interactive entry into the same named environment
+- a pinned Canonical Ubuntu Noble 24.04 root filesystem for the compartment
+- effective environment variables and Atlas identity in both entry modes
+- peer-derived `inspect self` identity, with a non-environment UID failing
+  closed
+- anchored cgroup-derived identity after nspawn moved the payload into its
+  machine scope
+- mapped root inside the environment without host-root mutation
+- a real local Debian package installed with `apt`, persisted across re-entry,
+  and remained absent from a neighboring environment
+- an `/etc` mutation persisted across re-entry without modifying host `/etc`
+- one durable project volume mounted into two development environments and
+  omitted from `restricted`
+- two development environments with different managed Git identities
+- a local repository clone and commit using the effective identity
+- operator-only reset rejected from inside an environment
+- reset removed the installed package, disposable home, and `/etc` mutation
+  while preserving the repository on the attached volume
+- nested client shells preserved environment variables and the declared tool
+  PATH instead of loading the host-global NixOS PATH
+- remote command strings containing shell-variable references reached the
+  environment shell without transport-layer expansion
+- durable volume data across control-service restart, generation switch, and
+  rollback
+
+The persistent-instance hardening revision passed on August 27, 2026. The same
+booted-host contract additionally verified:
+
+- one systemd-owned nspawn service per declared environment
+- simultaneous entries into the same mutable instance
+- workload identity from an anchored service-cgroup prefix, including rejection
+  of misleading descendant cgroup names
+- separate public inspection and root-only lifecycle sockets
+- active workload termination during reset
+- stop verification followed by atomic root detachment, with durable volumes
+  preserved
+- per-environment size-bounded tmpfs roots and external readiness markers
+- updated environment configuration after generation switch and baseline
+  configuration after rollback
+
+The adapter reports shared-host networking as degraded. The current root
+filesystem lives on a size-bounded tmpfs below `/run` and is reconstructed after
+reset or reboot; named volumes live below `/var/lib/atlas` and are durable.
+
+Tool isolation is also reported as degraded. The environment has an ordinary
+Ubuntu filesystem and package manager, while declared Nix tools are available
+through a read-only mount of the host Nix store. This is not an executable
+allowlist.
+
+## Earlier Tailscale and Herdr dogfood evidence
+
+Before the nspawn and volume revision, the AArch64 development VM was enrolled
+interactively into a real Tailscale tailnet and exercised from the host Mac
+without a public OpenSSH listener. That fixed-login adapter run verified:
+
+- ordinary Tailscale SSH entry into `shared-dev`, `personal-dev`, and
+  `restricted`
+- composed variables and distinct managed Git identities over the real SSH
+  path
+- cloning the public Atlas repository and creating an unpushed local commit in
+  `shared-dev` with its configured identity
+- denial of a cross-environment home read from `restricted`
+- Herdr 0.8.2 installing its matching Linux AArch64 remote binary into the
+  environment home and opening its remote TUI
+- the Herdr-created shell receiving the composed Atlas variables and managed
+  Git configuration
+
+That run also found two interoperability defects: nested interactive shells
+loaded the host-global NixOS PATH, and `systemd-run` expanded shell variables in
+some remote command strings. The environment shell wrapper and literal command
+passthrough fixed both defects in that adapter. The current nspawn adapter has
+passed local interactive and non-interactive entry tests, but its exact
+Tailscale SSH and Herdr path has not yet been repeated.
+
+Herdr's default managed SSH multiplexing produced intermittent exit status 255
+over this Tailscale SSH path. Herdr attached successfully with its local
+`[remote].manage_ssh_config = false` setting, which uses plain SSH. Atlas does
+not configure Herdr or adopt its session model.
+
 ## Security boundary
 
-Environment processes are neither Nix allowed users nor Nix trusted users. Nix
-trusted users are effectively root-equivalent because they can influence
-privileged builds and substituters, so the spike admits only root.
+Environment processes are neither Nix allowed users nor Nix trusted users. The
+root identity inside nspawn is remapped by a user namespace and has no general
+host sudo rule. Nix trusted users are effectively root-equivalent because they
+can influence privileged builds and substituters, so the spike admits only host
+root.
 
 The optional Tailscale auth-key setting accepts a canonical external runtime
 path string, not a Nix path or secret value. Evaluation tests reject Nix path
@@ -137,15 +250,23 @@ policy must treat it accordingly.
   flash-to-disk appliance image.
 - Local-console autologin is present only to dogfood enrollment from the live
   image. It is not acceptable for the persistent product.
-- Tailscale enrollment against a real tailnet, policy revocation, SSH
-  reconnection, and network-change behavior have not yet been tested.
+- Tailnet policy revocation, long-lived SSH reconnection, and network-change
+  behavior have not yet been tested.
 - No physical hardware has booted the revised image.
 - `/var/lib/atlas` is not a dedicated encrypted partition with backup and
   recovery behavior.
-- The two demonstration processes prove selected systemd and kernel primitives,
-  not an interactive environment that an agent client can enter.
-- There is no Atlas control daemon, environment manager, browser or display
-  broker, grant broker, route proxy, audit service, or update controller.
+- The fixed login adapter and Herdr have not yet been exercised on physical
+  hardware, and Codex has not yet been tested as a remote target.
+- Runtime creation and deletion of definitions or volumes is not implemented.
+  The split local control services can inspect and reset only declared
+  environments.
+- Each declared environment has one persistent service and supports concurrent
+  entry. Atlas does not yet reconstruct client-owned PTYs or define a durable
+  task supervisor above ordinary Linux process tools.
+- Environment networking is shared with the host, and the host Nix store is
+  visible read-only. Stronger network and tool isolation remain undecided.
+- There is no browser or display broker, grant broker, route proxy, audit
+  service, or update controller.
 - There is no Secure Boot, measured boot, signed Atlas release metadata,
   anti-downgrade policy, or failed-health automatic rollback.
 - No real enrollment key or secret lifecycle has been tested. Evaluation uses
@@ -157,6 +278,7 @@ With Nix installed:
 
 ```bash
 nix flake check --all-systems --no-build
+nix build .#checks.aarch64-linux.control-unit
 nix build .#checks.aarch64-linux.module-evaluation
 nix build .#checks.aarch64-linux.host-contract
 nix build .#packages.aarch64-linux.vm
@@ -169,6 +291,7 @@ Without Nix, the pinned container helper uses the named Docker volume
 ```bash
 docker volume create atlas-nix-store
 ./scripts/nix-container flake check path:/workspace --all-systems --no-build
+./scripts/nix-container build path:/workspace#checks.aarch64-linux.control-unit --no-link
 ./scripts/nix-container build path:/workspace#checks.aarch64-linux.module-evaluation --no-link
 ./scripts/nix-container build path:/workspace#checks.aarch64-linux.host-contract --no-link
 ./scripts/nix-container build path:/workspace#packages.aarch64-linux.vm --no-link
@@ -183,12 +306,13 @@ For the physical live-image flow and its security limits, see
 NixOS is now used as a provisional vehicle to answer the product question. The
 next gates are:
 
-1. Boot the live image on one representative x86 computer and validate
-   interactive Tailscale SSH without a public listener.
+1. Boot the live image on one representative x86 computer and validate entry
+   to `atlas-shared-dev` through interactive Tailscale SSH and one existing
+   client such as Herdr, without a public listener.
 2. Implement and test a persistent disk and recovery design, including encrypted
    state and one declared automatic or operator-assisted unlock mode.
-3. Build one environment that an existing agent client can enter as a normal
-   remote Linux target.
+3. Replace declarative-only environment creation with a small runtime manager
+   that preserves the same entry and peer-derived identity interface.
 4. Implement the [Authenticated Surface v0](authenticated-surface-v0.md)
    contract, add one tailnet-private route, and prove a second environment
    cannot cross those boundaries.

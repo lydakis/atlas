@@ -26,7 +26,7 @@ Codex app · T3 Code · Herdr · SSH · Blue · any agent CLI
                          │
              ordinary remote connection
                          │
-       environment · grant · surface · route
+    environment · volume · grant · surface · route
                          │
                    Atlas host
                          │
@@ -50,24 +50,56 @@ includes:
 - a versioned static host contract at `/etc/atlas/host-contract.json` that
   separates product intent, implemented primitives, and configured mechanisms
 - a mutable data boundary under `/var/lib/atlas`, outside the Nix store
-- state roots for environments, grants, browser profiles, recordings, and routes
+- state roots for environments, volumes, grants, browser profiles, recordings,
+  and routes
 - separate resource lanes for the Atlas control plane and agent environments
+- reusable non-secret configuration, package, and Git-profile layers with
+  named environment definitions
+- fixed environment login targets that enter persistent, user-namespaced Ubuntu
+  Noble compartments supervised by systemd
+- resettable environment roots and homes, plus explicit durable volumes that
+  may be shared across selected environments
+- mapped root inside an environment, so agents can install ordinary Debian
+  packages and mutate their OS without receiving host root
+- a peer-authenticated read-only control socket for doctor, list, and inspect,
+  plus a separate root-only lifecycle socket for environment reset
 - a Tailscale enrollment helper that enables tailnet-private SSH
 - no publicly exposed OpenSSH service
-- two isolated demonstration environments that can use the same local port without colliding
-- a QEMU integration test covering boot, isolation, update, rollback, and state preservation
+- two development environments with different Git identities plus one minimal
+  environment without Git on its declared PATH
+- a QEMU integration test covering persistent and concurrent entry,
+  composition, shared-volume access, package installation, active-workload
+  reset, identity, isolation, update, rollback, and durable-volume preservation
+- an earlier live-tailnet dogfood run using ordinary Tailscale SSH and Herdr's
+  remote thin client against the preceding fixed-login adapter
 
-The spike passed on Apple Silicon using a software-emulated AArch64 guest. See
-the [NixOS spike report](docs/nixos-spike.md) for the evidence and limitations.
+The current nspawn and volume contract passed on Apple Silicon using a
+software-emulated AArch64 guest. The earlier adapter was also enrolled into a
+real tailnet and entered as all three declared environments without exposing a
+public SSH listener. The current adapter's exact Tailscale and Herdr path still
+needs to be repeated. See the [NixOS spike report](docs/nixos-spike.md) for the
+evidence and limitations.
 
 ## What does not exist yet
 
-There is no Atlas control daemon, operator console, environment manager,
-browser service, grant broker, route proxy, audit service, or update controller.
+The local control plane is a deliberately tiny v0, not a runtime environment
+manager. Its split sockets can inspect and reset declared instances, but cannot
+create environment definitions or volumes at runtime. There is no operator
+console, browser service, grant broker, route proxy, audit service, or update
+controller.
 The ISO can exercise interactive Tailscale enrollment on hardware, but it is a
 live boot artifact rather than a persistent installer or production image. Disk
 encryption, Secure Boot, signed releases, automatic failed-update recovery, and
 physical-hardware validation remain future work.
+
+Each environment now has one persistent nspawn service. Entries join that
+service through Linux namespaces and a delegated session cgroup, so concurrent
+clients see one instance and reset can terminate the complete workload tree.
+The spike's resettable roots live on size-bounded tmpfs storage, default to
+1 GiB, and are reconstructed after reset or reboot. This does not yet satisfy
+the product target of disk-backed machine state that persists until explicit
+reset. Networking is shared with the host, and the read-only Nix store is
+visible for declared tools. These gaps are reported rather than hidden.
 
 In short, this repository proves parts of the host substrate. It does not yet
 deliver the agent-computer experience described by the thesis.
@@ -78,6 +110,7 @@ With Nix installed:
 
 ```bash
 nix flake check --all-systems --no-build
+nix build .#checks.aarch64-linux.control-unit
 nix build .#checks.aarch64-linux.module-evaluation
 nix build .#checks.aarch64-linux.host-contract
 nix build .#packages.aarch64-linux.vm
@@ -89,6 +122,7 @@ Without Nix, use Docker and the pinned helper image:
 ```bash
 docker volume create atlas-nix-store
 ./scripts/nix-container flake check path:/workspace --all-systems --no-build
+./scripts/nix-container build path:/workspace#checks.aarch64-linux.control-unit --no-link
 ./scripts/nix-container build path:/workspace#checks.aarch64-linux.module-evaluation --no-link
 ./scripts/nix-container build path:/workspace#checks.aarch64-linux.host-contract --no-link
 ./scripts/nix-container build path:/workspace#packages.aarch64-linux.vm --no-link
@@ -101,7 +135,10 @@ Replace `aarch64-linux` with `x86_64-linux` for an x86 output.
 
 - **Existing-client first:** an Atlas environment should look like a normal remote Linux target.
 - **Headless, not blind:** a person can inspect, approve, observe, take over, and recover work.
-- **Durable by declaration:** named state and services survive or reconstruct; arbitrary process memory does not.
+- **Persistent by default, durable by declaration:** ordinary environment files
+  survive reboot and update in the product target; explicit resettable machine
+  state may be discarded; declared volumes survive environment reset; live
+  process memory and connections do not survive reboot.
 - **Scoped authority:** environments receive explicit grants, not ambient host secrets or root-equivalent build access.
 - **Private by default:** network reachability and port discovery do not publish a service.
 - **Local-first:** the core machine remains useful without an Atlas-operated cloud.
@@ -110,16 +147,17 @@ Replace `aarch64-linux` with `x86_64-linux` for an x86 output.
 ## Architecture decision still open
 
 NixOS is the current prototype vehicle, not a commitment. The next product
-proof follows the product-thesis checklist on physical hardware. Authenticated
-Surface v0 supplies its browser and takeover security boundary; the same proof
-also exercises environment entry, capability reporting, one private route,
-reboot, update, and a second environment that cannot cross those boundaries. A
-bootc/OCI comparison follows once that behavior is concrete enough to port and
-compare honestly.
+proof adds persistent disk-backed resettable roots and private environment
+networking on physical hardware. Authenticated Surface v0 then supplies the
+browser and takeover security boundary, capability reporting, and one private
+route. A bootc/OCI comparison follows once that behavior is concrete enough to
+port and compare honestly.
 
 ## Documentation
 
 - [Product thesis](docs/product-thesis.md)
+- [Roadmap](docs/roadmap.md)
+- [Environment Entry v0](docs/environment-entry-v0.md)
 - [Authenticated Surface v0](docs/authenticated-surface-v0.md)
 - [Interop contract](docs/interop-contract.md)
 - [Threat model](docs/threat-model.md)

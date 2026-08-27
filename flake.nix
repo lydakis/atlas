@@ -35,6 +35,13 @@
               graphics = false;
               memorySize = 2048;
             };
+
+            # The development VM has no public listener. Give its local serial
+            # console a bootstrap path so an operator can enroll Tailscale and
+            # then exercise the same fixed environment logins as physical
+            # hardware. Cloud and physical artifacts configure their own entry.
+            networking.hostName = nixpkgs.lib.mkForce "atlas-spike-local";
+            services.getty.autologinUser = "atlas-operator";
           }
         ];
     in
@@ -86,6 +93,19 @@
           pkgs = import nixpkgs { inherit system; };
         in
         {
+          control-unit =
+            pkgs.runCommand "atlas-control-unit"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+              }
+              ''
+                mkdir -p work/src work/tests
+                cp ${./src/atlas_control.py} work/src/atlas_control.py
+                cp ${./tests/test_atlas_control.py} work/tests/test_atlas_control.py
+                cd work
+                python3 -m unittest discover -s tests -v
+                touch "$out"
+              '';
           module-evaluation = import ./nixos/tests/module-evaluation.nix {
             inherit pkgs;
             inherit (nixpkgs) lib;

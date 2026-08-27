@@ -79,17 +79,24 @@ let
       mode = "0750";
       owner = "atlas-control";
     };
+    volumes = {
+      group = "root";
+      mode = "0711";
+      owner = "root";
+    };
   };
 
   intendedPrimitives = [
     "host"
     "environment"
+    "volume"
     "grant"
     "surface"
     "route"
   ];
 
-  mkTmpfilesRule = path: metadata: "d ${path} ${metadata.mode} ${metadata.owner} ${metadata.group} - -";
+  mkTmpfilesRule =
+    path: metadata: "d ${path} ${metadata.mode} ${metadata.owner} ${metadata.group} - -";
 
   atlasEnroll = pkgs.writeShellApplication {
     name = "atlas-enroll";
@@ -120,6 +127,8 @@ let
   };
 in
 {
+  imports = [ ./atlas-environments.nix ];
+
   options.atlas.host = {
     enable = mkEnableOption "the Atlas static host contract";
 
@@ -168,8 +177,7 @@ in
     assertions = [
       {
         assertion =
-          cfg.tailscale.authKeyFile == null
-          || !(isNixStorePath (toString cfg.tailscale.authKeyFile));
+          cfg.tailscale.authKeyFile == null || !(isNixStorePath (toString cfg.tailscale.authKeyFile));
         message = "atlas.host.tailscale.authKeyFile must be a runtime secret outside the Nix store";
       }
       {
@@ -183,9 +191,13 @@ in
     ];
 
     atlas.host.contract = {
-      version = 3;
+      version = 5;
       intent.primitives = intendedPrimitives;
-      implementation.primitives = [ "host" ];
+      implementation.primitives = [
+        "host"
+        "environment"
+        "volume"
+      ];
       state = {
         root = dataRoot;
         rootMode = stateRoot.mode;
@@ -216,19 +228,22 @@ in
           control = "atlas-control.slice";
           environments = "atlas-environments.slice";
         };
+        environmentEntry = cfg.environmentContract;
       };
     };
 
     environment.etc."atlas/host-contract.json".text = builtins.toJSON cfg.contract;
 
-    environment.systemPackages = with pkgs; [
-      curl
-      git
-      jq
-      tmux
-      util-linux
-    ]
-    ++ lib.optional cfg.tailscale.enable atlasEnroll;
+    environment.systemPackages =
+      with pkgs;
+      [
+        curl
+        git
+        jq
+        tmux
+        util-linux
+      ]
+      ++ lib.optional cfg.tailscale.enable atlasEnroll;
 
     networking.firewall.enable = true;
 
@@ -284,9 +299,7 @@ in
         '';
       };
 
-      services.tailscaled-autoconnect = mkIf (
-        cfg.tailscale.enable && cfg.tailscale.authKeyFile != null
-      ) {
+      services.tailscaled-autoconnect = mkIf (cfg.tailscale.enable && cfg.tailscale.authKeyFile != null) {
         preStart = ''
           auth_key_path=${lib.escapeShellArg (toString cfg.tailscale.authKeyFile)}
           if [ ! -f "$auth_key_path" ]; then
@@ -324,11 +337,12 @@ in
         after = [ "network-online.target" ] ++ lib.optional cfg.tailscale.enable "tailscaled.service";
       };
 
-      tmpfiles.rules =
-        [ (mkTmpfilesRule dataRoot stateRoot) ]
-        ++ lib.mapAttrsToList (
-          directory: metadata: mkTmpfilesRule "${dataRoot}/${directory}" metadata
-        ) stateDirectoryLayout;
+      tmpfiles.rules = [
+        (mkTmpfilesRule dataRoot stateRoot)
+      ]
+      ++ lib.mapAttrsToList (
+        directory: metadata: mkTmpfilesRule "${dataRoot}/${directory}" metadata
+      ) stateDirectoryLayout;
     };
 
     users = {
