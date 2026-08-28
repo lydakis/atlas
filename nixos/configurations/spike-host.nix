@@ -7,6 +7,7 @@
   atlas.host = {
     enable = true;
     tailscale.enable = true;
+    storage.adapter = "btrfs-subvolume";
 
     environmentLayers = {
       base.variables = {

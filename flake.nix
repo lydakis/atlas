@@ -28,6 +28,7 @@
         system:
         mkHost system [
           "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix"
+          ./nixos/configurations/btrfs-vm-storage.nix
           {
             virtualisation = {
               cores = 2;
@@ -61,6 +62,8 @@
           isoHost = mkHost system [
             "${nixpkgs}/nixos/modules/installer/cd-dvd/iso-image.nix"
             {
+              atlas.host.dataRootPersistence = "volatile-live-image";
+              atlas.host.storage.adapter = nixpkgs.lib.mkForce "host-directory";
               isoImage.squashfsCompression = "zstd -Xcompression-level 1";
               services.openssh.enable = nixpkgs.lib.mkForce false;
               services.getty.autologinUser = "atlas-operator";

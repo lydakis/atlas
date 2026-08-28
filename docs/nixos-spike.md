@@ -1,6 +1,7 @@
 # NixOS host architecture spike
 
-Status: Environment Entry v0 validated in QEMU, physical boot pending
+Status: elastic Btrfs-backed Environment Entry v0 with root snapshots validated
+in QEMU, encrypted physical storage pending
 
 ## Outcome
 
@@ -29,8 +30,12 @@ The revision after the product-boundary discussion makes two corrections:
    are not repositories, worktrees, conversations, terminals, or tasks.
 3. Durable data belongs to explicit volumes, while an environment instance owns
    resettable root, home, installed tools, and caches plus volatile processes.
-   The current tmpfs adapter reconstructs that root after reboot; the product
-   target persists it until explicit reset.
+   The current Btrfs adapter preserves that root across reboot until explicit
+   reset, lets it grow with the Atlas data filesystem, and supplies cheap root
+   snapshots and restore.
+4. Agents are programs using an environment, not environment owners or Linux
+   identities. The spike's `/home/agent` is temporary; the owner-account and
+   elevation contract is not yet settled.
 
 ## Current host contract
 
@@ -38,6 +43,7 @@ The reusable `atlas.host` module currently declares:
 
 - `enable`
 - `dataRoot`
+- `storage.adapter`
 - `tailscale.enable`
 - `tailscale.authKeyFile`
 - `tailscale.ssh`
@@ -46,7 +52,7 @@ The reusable `atlas.host` module currently declares:
 - `environments`
 - the read-only machine contract
 
-Contract version 5 separates three kinds of fact:
+Contract version 7 separates three kinds of fact:
 
 - `intent.primitives` names the six product primitives: host, environment,
   volume, grant, surface, and route
@@ -66,8 +72,9 @@ The current configuration adds:
 - state roots for environments, volumes, grants, credentials, browser profiles,
   recordings, routes, caches, and audit data
 - separate `atlas-control.slice` and `atlas-environments.slice` resource lanes
-- named environments with explicit opaque IDs, fixed entry UIDs, disposable
-  Ubuntu root filesystems and homes, and per-environment resource slices
+- named environments with explicit opaque IDs, fixed entry UIDs, persistent
+  resettable Ubuntu root filesystems and homes, and per-environment resource
+  slices
 - durable named volumes with explicit target paths and access modes
 - ordered reusable non-secret configuration layers with instance overrides
 - aliased per-environment package profiles and managed non-secret Git
@@ -79,8 +86,10 @@ The current configuration adds:
 - a socket-activated read-only control service that derives environment identity
   from peer credentials and anchored cgroup membership, plus a separate
   root-only lifecycle service for instance reset
-- size-bounded tmpfs roots, external readiness metadata, serialized lifecycle
-  changes, and generation-triggered environment restart
+- Btrfs environment roots, read-only applied seeds, named root snapshots, and
+  durable-volume subvolumes under `/var/lib/atlas`, with external readiness
+  metadata, serialized fail-closed lifecycle changes, and generation-triggered
+  environment restart
 - a Tailscale daemon and interactive `atlas-enroll` helper
 - optional unattended enrollment from a canonical external runtime auth-key
   path; Nix path values, Nix store aliases, and resolved store targets are
@@ -159,7 +168,7 @@ It booted the complete AArch64 host under QEMU and verified:
 - two development environments with different managed Git identities
 - a local repository clone and commit using the effective identity
 - operator-only reset rejected from inside an environment
-- reset removed the installed package, disposable home, and `/etc` mutation
+- reset removed the installed package, resettable home, and `/etc` mutation
   while preserving the repository on the attached volume
 - nested client shells preserved environment variables and the declared tool
   PATH instead of loading the host-global NixOS PATH
@@ -179,13 +188,41 @@ booted-host contract additionally verified:
 - active workload termination during reset
 - stop verification followed by atomic root detachment, with durable volumes
   preserved
-- per-environment size-bounded tmpfs roots and external readiness markers
+- per-environment resettable roots and external readiness markers
 - updated environment configuration after generation switch and baseline
   configuration after rollback
 
-The adapter reports shared-host networking as degraded. The current root
-filesystem lives on a size-bounded tmpfs below `/run` and is reconstructed after
-reset or reboot; named volumes live below `/var/lib/atlas` and are durable.
+The persistent-storage work first replaced tmpfs roots with fixed-size ext4
+images below `/var/lib/atlas` and verified persistence across reboot. Product
+review rejected the mandatory 1 GiB ceiling: the primary environment must feel
+like the machine, not a small container within it. An elastic directory adapter
+then proved the corrected lifecycle. The current persistent VM mounts a
+dedicated Btrfs data disk and has validated:
+
+- package, `/etc`, ordinary home, and durable-volume persistence across host
+  reboot
+- reconstruction of `/run` and live execution state after reboot
+- elastic use of the Atlas data filesystem with no default per-environment
+  quota
+- read-only applied seeds and writable copy-on-write roots
+- stale applied-seed repair before entry or reset consumes the seed
+- named read-only root snapshot creation, listing, restore, and deletion
+- explicit snapshot refusal for non-recursive nested Btrfs subvolumes, with
+  recursive reset cleanup still succeeding
+- snapshot restore removing later root changes while preserving later durable
+  volume changes
+- explicit COW reset removing package, `/etc`, and home changes while preserving
+  the volume
+- fail-closed reset when a managed root is replaced by a symbolic link or an
+  invalid filesystem object
+- resettable root and durable-volume state surviving generation switch and
+  rollback
+
+The adapter reports shared-host networking, encryption, and storage-reserve
+policy as degraded. Resettable roots and named volumes live on the dedicated
+Btrfs data filesystem, but it is not yet encrypted, full-filesystem recovery is
+untested, Atlas does not yet claim protected recovery capacity, and optional
+multi-environment quotas are absent.
 
 Tool isolation is also reported as degraded. The environment has an ordinary
 Ubuntu filesystem and package manager, while declared Nix tools are available
@@ -253,8 +290,14 @@ policy must treat it accordingly.
 - Tailnet policy revocation, long-lived SSH reconnection, and network-change
   behavior have not yet been tested.
 - No physical hardware has booted the revised image.
-- `/var/lib/atlas` is not a dedicated encrypted partition with backup and
-  recovery behavior.
+- `/var/lib/atlas` is not a dedicated encrypted partition with unlock, backup,
+  and recovery behavior.
+- Resettable roots and durable volumes share the Atlas data filesystem. Atlas
+  does not yet protect host recovery capacity or offer optional quotas for
+  additional environments, volumes, logs, recordings, and caches.
+- `/home/agent` is still a prototype path for mapped root. The human owner
+  account, conventional home layout, and environment-local elevation contract
+  remain undecided.
 - The fixed login adapter and Herdr have not yet been exercised on physical
   hardware, and Codex has not yet been tested as a remote target.
 - Runtime creation and deletion of definitions or volumes is not implemented.
@@ -309,8 +352,10 @@ next gates are:
 1. Boot the live image on one representative x86 computer and validate entry
    to `atlas-shared-dev` through interactive Tailscale SSH and one existing
    client such as Herdr, without a public listener.
-2. Implement and test a persistent disk and recovery design, including encrypted
-   state and one declared automatic or operator-assisted unlock mode.
+2. Put the persistent root behavior on physical encrypted storage with one
+   declared automatic or operator-assisted unlock mode, a protected host
+   recovery reserve, automatic primary durable owner storage, recovery
+   behavior, and optional quotas for additional environments.
 3. Replace declarative-only environment creation with a small runtime manager
    that preserves the same entry and peer-derived identity interface.
 4. Implement the [Authenticated Surface v0](authenticated-surface-v0.md)

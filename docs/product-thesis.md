@@ -91,6 +91,365 @@ If those commitments are not substantially better than manually combining
 Linux, Tailscale, SSH, containers, browser tools, and systemd, Atlas does not
 yet have a product.
 
+## The intended product experience
+
+Atlas is a self-hosted computer for agents: remotely configured, compatible
+with any agent client, permissive inside environments, protective of
+human-owned data and authority, and recoverable when agents make a mess.
+
+The ordinary experience should be:
+
+```text
+Install Atlas on a dedicated computer or VPS
+                         │
+            pair a trusted phone or computer
+                         │
+       apply a non-secret environment declaration
+                         │
+          attach or synchronize owner data
+                         │
+          attach narrowly scoped credentials
+                         │
+          use Codex, Herdr, SSH, or any client
+                         │
+ inspect · route · observe · take over · snapshot · reset
+```
+
+The first installation offers local-only connectivity or enrollment into the
+operator's tailnet. Tailscale is the first private-connectivity adapter, but it
+is not the Atlas identity model. Tailnet membership makes the host reachable;
+Atlas pairing determines which devices may inspect, configure, grant authority,
+publish routes, operate surfaces, or perform destructive recovery actions.
+
+A paired controller applies an inspectable, portable, non-secret declaration.
+That declaration may compose templates for common toolchains, packages, Git
+configuration, public variables, resource policy, volume attachments, and
+network behavior. It never contains reusable credentials and never executes a
+repository-carried setup script ambiently. The current NixOS configuration is
+the prototype expression of this model, not the intended remote format.
+
+A future declaration could look approximately like this:
+
+```toml
+[environment]
+base = "ubuntu-24.04"
+
+[packages]
+git = "latest"
+python = "3.13"
+node = "24"
+
+[git]
+name = "George Lydakis"
+email = "george@labblue.ai"
+
+[variables]
+NODE_ENV = "development"
+
+[[volumes]]
+name = "projects"
+target = "/home/george/Developer"
+```
+
+Atlas may provide inspectable templates such as `developer`, `frontend`,
+`python`, `browser-automation`, and `minimal`, plus organization-specific
+templates. A template is declarative input to the same model, not an arbitrary
+host-privileged setup script.
+
+Most owners begin with one default environment. It should feel like their
+machine: ordinary mutable Ubuntu, persistent across disconnect and reboot, with
+the freedom to install packages, change `/etc`, run services, and use graphical
+applications. Additional environments are optional boundaries for conflicting
+toolchains, different authority, network policy, concurrent services, or risky
+work. They are not created automatically for every agent, repository, or task.
+
+```text
+Atlas host
+├── kernel, control plane, recovery, and private connectivity
+├── durable human-owned volumes
+└── one or more Ubuntu environments
+    ├── resettable mutable root
+    ├── explicitly attached owner data
+    └── any number of agent applications and human-operated clients
+```
+
+Agents are applications, not owners or identities. Several agents may
+intentionally share one environment and its authority. Inside it they can have
+environment-local administrative freedom without receiving host control.
+When isolation matters, the owner creates another environment and selectively
+attaches shared read-write data, read-only data, or a future copy-on-write
+volume fork.
+
+Data safety is expressed as separate promises. A durable volume survives
+environment reset. Snapshots and backups recover accidental or malicious data
+changes. Encryption protects data at rest. Copy-on-write roots make machine
+recovery cheap but do not make concurrent writers safe. Git, worktrees, rsync,
+and existing synchronization tools remain ordinary ways to move and coordinate
+files; Atlas supplies lifecycle and authority boundaries rather than inventing
+a project model.
+
+"My data is safe" therefore expands into several independently testable
+questions:
+
+- does it survive environment reset?
+- can it be recovered after accidental deletion or corruption?
+- can an environment with read access modify it?
+- can one malicious environment reach another owner's data?
+- can it be recovered after disk or machine loss?
+- is it private if the physical computer or VPS account is compromised?
+
+The volume model should eventually expose at least three attachment modes:
+
+1. **Shared read-write:** cooperating environments deliberately manipulate the
+   same files.
+2. **Read-only:** an environment may inspect data but cannot modify it.
+3. **Copy-on-write fork:** an environment receives an inexpensive private view
+   that the owner later adopts, merges, or discards.
+
+For source code, separate checkouts or Git worktrees may be safer than several
+independent agents mutating one working directory. Atlas provides the storage
+and isolation mechanisms; the selected client and Git retain checkout and merge
+semantics.
+
+Configuration and authority remain distinct. Packages, Git name and email,
+tool versions, and non-secret variables belong to environment configuration.
+API keys, SSH authority, cloud sessions, and authenticated browser identities
+are grants. A paired operator attaches those grants deliberately to an
+environment or, when Atlas can enforce a narrower boundary, to a shorter-lived
+invocation. Brokered operations and short-lived derivatives are preferred over
+copying reusable source credentials into the environment.
+
+The separation is:
+
+1. **Configuration:** packages, tool versions, public variables, Git name and
+   email, and resource policy.
+2. **Owner data:** repositories, artifacts, datasets, worktrees, and
+   uncommitted work.
+3. **Grants:** API keys, SSH authority, cloud sessions, GitHub credentials, and
+   authenticated browser identities.
+
+The paired operator should be able to say, for example, "allow this environment
+to use my GitHub push authority and this OpenAI key until revoked." A brokered
+credential is preferable when the underlying protocol allows Atlas to perform
+the narrow operation without delivering a reusable source credential.
+
+### Private reachability and pairing
+
+The first-boot choice should be understandable without Atlas vocabulary:
+
+```text
+Choose connectivity
+
+○ Local only
+● Join my Tailscale network
+○ Configure later
+```
+
+Interactive Tailscale enrollment can display a login URL and QR code. Automated
+installation can consume a short-lived, scoped auth key from a runtime secret,
+never from the image or portable environment declaration. A controller already
+on the tailnet then reaches Atlas through its private address or name.
+
+Three authorities remain separate:
+
+- **Tailscale membership** makes the Atlas host reachable.
+- **Atlas pairing** identifies a trusted operator device.
+- **Atlas policy** decides whether that device may inspect, configure, attach
+  grants, publish routes, operate surfaces, snapshot, reset, or recover.
+
+Local-only use applies the same Atlas pairing and authorization model without a
+tailnet. Tailscale is the preferred transport, not a mandatory Atlas cloud or a
+substitute for Atlas authorization.
+
+The administrative CLI and operator interface control the machine; they do not
+replace agent clients. An illustrative future flow is:
+
+```text
+atlas pair
+atlas apply -f developer.toml
+atlas enter default
+atlas volume sync projects ./Developer
+atlas grant attach default github-work
+atlas route publish default 3000
+atlas surface open default --app ./my-app
+atlas snapshot create default before-upgrade
+atlas reset default
+```
+
+The same paired-device protocol should support a phone. A phone is especially
+useful for approving grants, completing authentication, viewing screenshots or
+recordings, briefly taking over a surface, revoking access, and performing an
+emergency stop. A laptop remains more convenient for editing declarations and
+extended terminal work.
+
+The product experience can be similar on owned hardware and a VPS, but the
+security promise differs. On owned hardware Atlas may control disk encryption,
+boot integrity, recovery media, and physical access assumptions. A VPS provider
+controls the hypervisor and may be able to inspect disk or memory. Atlas can
+still provide environment isolation and recovery there, but it cannot protect
+the owner from the infrastructure provider.
+
+The first product is intentionally single-owner: one human, one normal default
+environment, several concurrent agent applications, and optional additional
+environments. Multi-human operation remains possible later, but introduces
+volume ownership, environment membership, grant ownership, approval policy,
+audit attribution, and administrator roles. It is a separate security and
+product milestone, not another Unix account added to v0.
+
+The first compelling end-to-end milestone is:
+
+> Install Atlas, pair a laptop, apply a developer environment, connect with
+> Herdr or Codex, clone a repository onto durable storage, run multiple agents,
+> expose a private preview, and confidently reset the environment without
+> losing the work.
+
+That proof should include this concrete sequence:
+
+1. Declare a default environment with Git, Python, non-secret variables, and a
+   Git identity.
+2. Attach the owner's project volume and enter through an existing client.
+3. Clone a repository, create uncommitted work, install a package, and modify
+   `/etc`.
+4. Let several agent processes use the same environment concurrently.
+5. Reboot and prove persistent machine state and owner data remain.
+6. Snapshot the root, change it, restore it, and prove owner data was not rolled
+   back with machine state.
+7. Reset the environment and prove installed packages and resettable changes
+   disappeared while the repository and uncommitted work survived.
+8. Create a second environment, run the same loopback port in both, and prove
+   their networks do not collide or cross.
+9. Publish one selected port privately to the paired device.
+10. Start one graphical application surface, let an agent operate and record
+    it, then let the owner observe and take over from the paired device.
+
+### Headless, not blind
+
+Agents sometimes need pixels, pointer input, keyboards, browsers, and graphical
+applications even when no human will sit in front of the machine. Atlas should
+let an environment create a bounded graphical surface, usually a lightweight
+virtual display containing one application rather than a conventional desktop.
+The agent can inspect and operate it, take screenshots, record a demonstration,
+test a graphical build, and retain selected output as an artifact. A complete
+desktop remains an opt-in escape hatch.
+
+```text
+Environment
+├── processes
+├── network
+├── resettable root
+├── attached volumes
+├── grants
+└── surfaces
+    ├── browser
+    ├── single graphical application
+    ├── optional desktop
+    └── terminal or graphical recording
+```
+
+The default graphical presentation could be deliberately simple:
+
+```text
+┌──────────────────────────────────────────┐
+│ Atlas · default · application-name       │
+├──────────────────────────────────────────┤
+│                                          │
+│             Application UI               │
+│                                          │
+└──────────────────────────────────────────┘
+```
+
+Underneath, a minimal virtual Wayland compositor can host one application, with
+XWayland compatibility where needed. The environment believes it has a normal
+display even though no physical screen is attached.
+
+An agent should be able to:
+
+- take screenshots
+- inspect accessibility information
+- move the pointer and type
+- navigate browser pages
+- launch and test graphical development builds
+- record a short demonstration
+- produce screenshots or videos as durable artifacts
+- leave a surface available for later inspection
+
+Terminal capture is a related artifact rather than a graphical surface. Tools
+such as asciinema can preserve a command transcript while graphical recording
+preserves pixels, input transitions, and selected application metadata.
+
+The owner does not need to discover the right window through a permanent VNC
+desktop. Atlas presents the relevant application directly on a paired device.
+The owner may observe it, take exclusive control, return control to the agent,
+or destroy it. Raw VNC, RDP, or browser-debug endpoints may be compatibility
+transports, but they are not the authorization boundary and are never published
+merely because they exist.
+
+The intended takeover experience is not "connect to VNC and find the right
+window." It is "the agent needs you to authenticate; open this surface."
+
+1. Atlas pauses agent input and observation for that surface.
+2. The operator sees broker-owned chrome naming the host, environment,
+   application, browser identity, and destination.
+3. The operator takes exclusive control on a paired device.
+4. Sensitive input is excluded from agent context, recording, clipboard
+   observation, and audit payloads where the boundary can enforce that claim.
+5. The operator explicitly returns control to the agent.
+6. Atlas records the authority transition without recording the secret.
+
+A host-owned surface broker authenticates viewers, enforces the controller
+state, and carries the stream over an end-to-end-protected paired-device
+channel. WebRTC may provide the primary interactive transport. VNC or RDP can
+remain compatibility options behind the same broker rather than permanent
+network listeners.
+
+Generic environment-owned surfaces and protected browser surfaces have
+different trust. An ordinary graphical application or disposable browser may
+run entirely inside the environment. A valuable authenticated browser identity
+must keep its profile, cookies, automation endpoint, display, and operator-input
+path outside the environment. During authentication Atlas fences agent input
+and observation, shows broker-owned context to the operator, accepts protected
+human input, and returns bounded control only after the takeover transition is
+complete. The detailed boundary is defined by
+[Authenticated Surface v0](authenticated-surface-v0.md).
+
+The two browser trust levels should be explicit:
+
+**Environment-owned browser**
+
+- runs completely inside Ubuntu
+- gives the environment effective access to its profile and cookies
+- fits testing, scraping, disposable identities, and low-risk accounts
+- can be discarded with environment state
+
+**Protected Atlas browser**
+
+- keeps its profile and session authority outside the environment
+- exposes a bounded observation and action interface through the surface broker
+- lets the human authenticate through a protected takeover path
+- fits valuable persistent identities where raw profile access is unacceptable
+
+No polished login handoff can protect cookies that live inside an environment
+where the agent has administrative authority. Valuable browser identities
+require the separate host-controlled worker boundary.
+
+The machine primitives compose without collapsing into one remote-desktop
+feature:
+
+| Primitive | Purpose |
+| --- | --- |
+| Host | Own the machine, control plane, updates, recovery, and connectivity |
+| Environment | Provide a reusable Linux filesystem, process, authority, resource, and network boundary |
+| Volume | Hold human-owned durable data independently of environment reset |
+| Grant | Supply a credential or delegated authority deliberately and revocably |
+| Route | Make one selected TCP or HTTP service privately reachable |
+| Surface | Carry pixels and input for one graphical application or browser |
+| Recording | Retain selected terminal or graphical evidence as an artifact |
+
+A browser login may compose an Environment, Grant, Surface, and Route, but none
+silently creates another. Detecting a port does not publish it. Creating a
+surface does not attach credentials. Attaching a grant does not expose a
+service. This separation is the basis of Atlas's machine-level security model.
+
 ## Core primitives
 
 Atlas exposes six host-level primitives.
@@ -170,10 +529,12 @@ a copy of the operator's password vault.
 
 ### Surface
 
-A browser or graphical desktop that an agent can operate and an operator can
-observe, record, or take over. Browser profiles, cookies, screenshots,
-recordings, clipboard state, and downloads are sensitive Atlas-managed state
-bound to an environment, not files owned by that environment.
+A browser, graphical application, or optional desktop that an agent can operate
+and an operator can observe, record, or take over. The default product surface
+is a bounded single-application virtual display, not a permanent full desktop.
+Browser profiles, cookies, screenshots, recordings, clipboard state, and
+downloads are sensitive Atlas-managed state bound to an environment, not files
+owned by that environment.
 
 ### Route
 

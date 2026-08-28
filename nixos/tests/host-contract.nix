@@ -61,6 +61,7 @@ pkgs.testers.runNixOSTest {
     imports = [
       atlasModule
       ../configurations/spike-host.nix
+      ../configurations/btrfs-vm-storage.nix
     ];
 
     virtualisation = {
@@ -73,7 +74,9 @@ pkgs.testers.runNixOSTest {
     import json
     import shlex
 
-    start_all()
+    # The storage contract includes an in-place reboot. Keep QEMU alive across
+    # the guest reboot so the driver reconnects to the same persistent disk.
+    machine.start(allow_reboot=True)
 
     machine.wait_for_unit("atlas-host.target")
     machine.wait_for_unit("tailscaled.service")
@@ -88,7 +91,7 @@ pkgs.testers.runNixOSTest {
         return machine.fail(invocation)
 
     contract = json.loads(machine.succeed("cat /etc/atlas/host-contract.json"))
-    assert contract["version"] == 5
+    assert contract["version"] == 7
     assert contract["intent"]["primitives"] == ["host", "environment", "volume", "grant", "surface", "route"]
     assert contract["implementation"]["primitives"] == ["host", "environment", "volume"]
     assert contract["state"]["root"] == "/var/lib/atlas"
@@ -100,21 +103,32 @@ pkgs.testers.runNixOSTest {
     assert contract["configuration"]["nix"]["allowedUsers"] == ["root"]
     assert contract["configuration"]["nix"]["trustedUsers"] == ["root"]
     environment_entry = contract["configuration"]["environmentEntry"]
-    assert environment_entry["version"] == 3
+    assert environment_entry["version"] == 5
     assert environment_entry["composition"]["declarative"] is True
     assert environment_entry["composition"]["runtimeCreation"] is False
-    assert environment_entry["composition"]["disposableRoots"] is True
+    assert environment_entry["composition"]["disposableRoots"] is False
+    assert environment_entry["composition"]["resettableRoots"] is True
+    assert environment_entry["composition"]["rebootPersistentRoots"] is True
     assert environment_entry["composition"]["durableVolumes"] is True
     assert environment_entry["composition"]["persistentInstances"] is True
     assert environment_entry["composition"]["concurrentEntry"] is True
     assert environment_entry["identity"]["source"] == "unix-peer-credentials-and-anchored-cgroup"
     assert environment_entry["identity"]["callerAuthoredIdentityAccepted"] is False
     shared = environment_entry["environments"]["shared-dev"]
+    personal = environment_entry["environments"]["personal-dev"]
     assert shared["id"] == "11111111-1111-4111-8111-111111111111"
     assert shared["entry"]["loginUser"] == "atlas-shared-dev"
     assert shared["runtime"]["backend"] == "systemd-nspawn-service"
-    assert shared["runtime"]["lifecycle"] == "disposable"
-    assert shared["runtime"]["storageMax"] == "1G"
+    assert shared["runtime"]["lifecycle"] == "resettable"
+    assert shared["runtime"]["persistence"] == "until-explicit-reset"
+    assert shared["runtime"]["storage"]["adapter"] == "btrfs-subvolume"
+    assert shared["runtime"]["storage"]["copyOnWrite"] is True
+    assert shared["runtime"]["storage"]["snapshots"] is True
+    assert shared["runtime"]["storage"]["seedHostPath"].endswith("/seed")
+    assert shared["runtime"]["storage"]["snapshotsHostPath"].endswith("/snapshots")
+    assert len(shared["runtime"]["storage"]["seed"]["id"]) == 64
+    assert shared["runtime"]["storage"]["seedPrepareCommand"].startswith("/nix/store/")
+    assert shared["runtime"]["rootHostPath"] == "/var/lib/atlas/environments/11111111-1111-4111-8111-111111111111/rootfs"
     assert shared["runtime"]["baseImage"]["distribution"] == "ubuntu"
     assert shared["volumes"] == [{
         "access": "read-write",
@@ -134,7 +148,7 @@ pkgs.testers.runNixOSTest {
         "email": "atlas@labblue.ai",
         "name": "George Lydakis",
     }
-    assert environment_entry["environments"]["personal-dev"]["git"]["config"]["user"]["email"] == "george@lydakis.me"
+    assert personal["git"]["config"]["user"]["email"] == "george@lydakis.me"
     assert environment_entry["environments"]["restricted"]["packages"] == {}
     projects = environment_entry["volumes"]["projects"]
     assert projects["durability"] == "host-durable"
@@ -160,8 +174,18 @@ pkgs.testers.runNixOSTest {
     assert doctor["result"]["networkIsolation"] == {"mode": "shared-host", "status": "degraded"}
     assert doctor["result"]["rootIsolation"]["mode"] == "systemd-nspawn-user-namespace"
     assert doctor["result"]["rootIsolation"]["hostRootShared"] is False
-    assert doctor["result"]["storage"]["mode"] == "bounded-disposable-root-with-explicit-volumes"
-    assert doctor["result"]["storage"]["bounded"] is True
+    assert doctor["result"]["storage"]["mode"] == "btrfs-copy-on-write-with-explicit-volumes"
+    assert doctor["result"]["storage"]["bounded"] is False
+    assert doctor["result"]["storage"]["copyOnWrite"] is True
+    assert doctor["result"]["storage"]["snapshots"] is True
+    assert doctor["result"]["storage"]["rollback"] is True
+    assert doctor["result"]["storage"]["hostRecoveryReserve"] is False
+    assert doctor["result"]["storage"]["rootPersistsAcrossReboot"] is True
+    assert doctor["result"]["storage"]["resettable"] is True
+    assert doctor["result"]["storage"]["atRestEncryption"] == {
+        "mode": "none",
+        "status": "degraded",
+    }
     listed = json.loads(machine.succeed("atlas environment list --json"))
     assert [item["name"] for item in listed["result"]] == ["personal-dev", "restricted", "shared-dev"]
     machine.fail("atlas environment inspect self --json")
@@ -176,6 +200,14 @@ pkgs.testers.runNixOSTest {
     machine.succeed(f"systemctl is-active {shlex.quote(shared['process']['serviceUnit'])}")
     machine.succeed("machinectl show atlas-shared-dev -p State --value | grep -Fx running")
     machine.fail("atlas --socket /run/atlas/control.sock environment reset shared-dev --json")
+    machine.fail(
+        "atlas --socket /run/atlas/control.sock environment snapshot list shared-dev --json"
+    )
+    entry(
+        "atlas-shared-dev",
+        "atlas environment snapshot list shared-dev --json",
+        succeed=False,
+    )
 
     assert entry("atlas-shared-dev", "git config --get user.email").strip() == "atlas@labblue.ai"
     assert entry("atlas-personal-dev", "git config --get user.email").strip() == "george@lydakis.me"
@@ -237,9 +269,48 @@ pkgs.testers.runNixOSTest {
     assert entry("atlas-personal-dev", "cat work/repo-a/environment-probe").strip() == sentinel
     entry("atlas-restricted", "cat /home/agent/work/repo-a/environment-probe", succeed=False)
 
+    restricted = environment_entry["environments"]["restricted"]
+    restricted_root = restricted["runtime"]["rootHostPath"]
+    restricted_saved_root = f"{restricted_root}.saved"
+    projects_path = projects["hostPath"]
+    machine.succeed(f"systemctl stop {shlex.quote(restricted['process']['serviceUnit'])}")
+    machine.succeed(f"mv {restricted_root} {restricted_saved_root}")
+    machine.succeed(f"ln -s {projects_path} {restricted_root}")
+    entry("atlas-restricted", "true", succeed=False)
+    assert machine.succeed(f"cat {projects_path}/repo-a/environment-probe").strip() == sentinel
+    machine.succeed(f"rm {restricted_root}; mv {restricted_saved_root} {restricted_root}")
+    entry("atlas-restricted", "true")
+
+    restricted_stale_mount = f"{restricted_root}/stale-project-mount"
+    machine.succeed(f"systemctl stop {shlex.quote(restricted['process']['serviceUnit'])}")
+    machine.succeed(f"mkdir -p {shlex.quote(restricted_stale_mount)}")
+    machine.succeed(
+        f"mount --bind {shlex.quote(projects_path)} {shlex.quote(restricted_stale_mount)}"
+    )
+    entry("atlas-restricted", "true", succeed=False)
+    machine.fail(f"systemctl is-active {shlex.quote(restricted['process']['serviceUnit'])}")
+    assert machine.succeed(f"cat {projects_path}/repo-a/environment-probe").strip() == sentinel
+    machine.succeed(f"umount {shlex.quote(restricted_stale_mount)}")
+    machine.succeed(f"rmdir {shlex.quote(restricted_stale_mount)}")
+    entry("atlas-restricted", "true")
+
+    restricted_ready = restricted["runtime"]["readyHostPath"]
+    machine.succeed(f"systemctl stop {shlex.quote(restricted['process']['serviceUnit'])}")
+    machine.succeed(f"rm -f {shlex.quote(restricted_ready)}")
+    repaired_restricted = json.loads(
+        machine.succeed("atlas environment reset restricted --json")
+    )
+    assert repaired_restricted["ok"] is True
+    machine.succeed(f"btrfs subvolume show {shlex.quote(restricted_root)}")
+    machine.succeed(f"test -f {shlex.quote(restricted_ready)}")
+    entry("atlas-restricted", "true")
+
     assert entry("atlas-shared-dev", "id -u").strip() == "0"
-    entry("atlas-shared-dev", "echo disposable > /etc/atlas-disposable-state")
-    machine.fail("test -e /etc/atlas-disposable-state")
+    entry("atlas-shared-dev", "echo persistent > /etc/atlas-persistent-state")
+    entry("atlas-shared-dev", "echo persistent-home > /home/agent/persistent-home")
+    entry("atlas-shared-dev", "echo volatile > /run/atlas-volatile-state")
+    entry("atlas-personal-dev", "echo reset-before-reentry > /etc/atlas-offline-reset-state")
+    machine.fail("test -e /etc/atlas-persistent-state")
 
     package_result = entry(
         "atlas-shared-dev",
@@ -250,6 +321,107 @@ pkgs.testers.runNixOSTest {
     assert entry("atlas-shared-dev", "atlas-proof-tool").strip() == "atlas-proof-tool-installed"
     entry("atlas-shared-dev", "test -f /usr/lib/systemd/system/atlas-proof-tool.service")
     entry("atlas-personal-dev", "command -v atlas-proof-tool", succeed=False)
+
+    shared_root = shared["runtime"]["rootHostPath"]
+    state_parent = shared_root.rsplit("/", 1)[0]
+    machine.succeed(f"test -d {shared_root}")
+    machine.succeed(
+        f"test $(findmnt -n -o UUID -T {shared_root}) = $(findmnt -n -o UUID -T /var/lib/atlas)"
+    )
+    machine.fail(f"mountpoint -q {shared_root}")
+    machine.succeed("test $(stat -f -c %T /var/lib/atlas) = btrfs")
+    machine.succeed(f"btrfs subvolume show {shared_root}")
+    machine.succeed(f"btrfs subvolume show {shared['runtime']['storage']['seedHostPath']}")
+    machine.succeed(f"btrfs subvolume show {projects_path}")
+    assert entry("atlas-shared-dev", "readlink /sbin/init").strip() == "/run/atlas-host-systemd/lib/systemd/systemd"
+    entry("atlas-shared-dev", "test -x /sbin/init")
+    journald_unit = "/usr/lib/systemd/system/systemd-journald.service"
+    assert entry("atlas-shared-dev", f"readlink {journald_unit}").strip() == (
+        "/run/atlas-host-systemd/example/systemd/system/systemd-journald.service"
+    )
+    entry("atlas-shared-dev", f"test -f {journald_unit}")
+
+    snapshot = json.loads(
+        machine.succeed("atlas environment snapshot create shared-dev before-restore --json")
+    )
+    assert snapshot["result"]["created"] is True
+    assert snapshot["result"]["snapshot"] == "before-restore"
+    snapshot_path = f"{state_parent}/snapshots/before-restore"
+    machine.succeed(f"btrfs subvolume show {snapshot_path}")
+    machine.succeed(f"test $(btrfs property get -ts {snapshot_path} ro | cut -d= -f2) = true")
+
+    machine.reboot()
+    machine.wait_for_unit("atlas-host.target")
+    machine.wait_for_unit("atlas-control.socket")
+    machine.wait_for_unit("atlas-manage.socket")
+    machine.fail(f"systemctl is-active {shlex.quote(shared['process']['serviceUnit'])}")
+    machine.fail(f"systemctl is-active {shlex.quote(personal['process']['serviceUnit'])}")
+    personal_root = personal["runtime"]["rootHostPath"]
+    personal_ready = personal["runtime"]["readyHostPath"]
+    personal_seed = personal["runtime"]["storage"]["seedHostPath"]
+    expected_personal_seed_id = personal["runtime"]["storage"]["seed"]["id"]
+    personal_seed_orphan = f"{personal['runtime']['rootHostPath'].rsplit('/', 1)[0]}/.seed.interrupted-reset"
+    machine.succeed(
+        f"btrfs property set -ts {personal_seed} ro false; "
+        f"echo {'0' * 64} > {personal_seed}/etc/atlas/seed-id; "
+        f"touch {personal_seed}/etc/atlas/stale-seed; "
+        f"btrfs property set -ts {personal_seed} ro true; "
+        f"btrfs subvolume create {personal_seed_orphan}"
+    )
+    machine.succeed(
+        f"btrfs subvolume delete {shlex.quote(personal_root)}; "
+        f"rm -f {shlex.quote(personal_ready)}"
+    )
+    offline_reset = json.loads(machine.succeed("atlas environment reset personal-dev --json"))
+    assert offline_reset["ok"] is True
+    machine.succeed(f"btrfs subvolume show {shlex.quote(personal_root)}")
+    machine.succeed(f"test -f {shlex.quote(personal_ready)}")
+    assert machine.succeed(f"cat {personal_seed}/etc/atlas/seed-id").strip() == expected_personal_seed_id
+    machine.fail(f"test -e {personal_seed}/etc/atlas/stale-seed")
+    machine.fail(f"test -e {personal_seed_orphan}")
+    entry("atlas-personal-dev", "test -e /etc/atlas-offline-reset-state", succeed=False)
+    assert entry("atlas-shared-dev", "cat /etc/atlas-persistent-state").strip() == "persistent"
+    assert entry("atlas-shared-dev", "cat /home/agent/persistent-home").strip() == "persistent-home"
+    assert entry("atlas-shared-dev", "atlas-proof-tool").strip() == "atlas-proof-tool-installed"
+    entry("atlas-shared-dev", "test -e /run/atlas-volatile-state", succeed=False)
+    assert entry("atlas-shared-dev", "cat work/repo-a/environment-probe").strip() == sentinel
+
+    machine.succeed(f"btrfs subvolume show {snapshot_path}")
+    machine.succeed(f"test $(btrfs property get -ts {snapshot_path} ro | cut -d= -f2) = true")
+    listed_snapshots = json.loads(
+        machine.succeed("atlas environment snapshot list shared-dev --json")
+    )
+    assert listed_snapshots["result"]["snapshots"] == ["before-restore"]
+
+    entry("atlas-shared-dev", "echo after-snapshot > /etc/atlas-after-snapshot")
+    entry("atlas-shared-dev", "echo durable-after-snapshot > work/repo-a/after-snapshot")
+    restored = json.loads(
+        machine.succeed("atlas environment snapshot restore shared-dev before-restore --json")
+    )
+    assert restored["result"]["restored"] is True
+    entry("atlas-shared-dev", "test -e /etc/atlas-after-snapshot", succeed=False)
+    assert entry("atlas-shared-dev", "cat work/repo-a/after-snapshot").strip() == "durable-after-snapshot"
+    assert entry("atlas-shared-dev", "atlas-proof-tool").strip() == "atlas-proof-tool-installed"
+
+    deleted_snapshot = json.loads(
+        machine.succeed("atlas environment snapshot delete shared-dev before-restore --json")
+    )
+    assert deleted_snapshot["result"]["deleted"] is True
+    machine.fail(f"test -e {snapshot_path}")
+
+    entry(
+        "atlas-shared-dev",
+        "${pkgs.btrfs-progs}/bin/btrfs subvolume create /opt/atlas-nested && "
+        "echo nested-state > /opt/atlas-nested/state",
+    )
+    nested_snapshot = json.loads(
+        machine.succeed(
+            "atlas environment snapshot create shared-dev nested-root --json || true"
+        )
+    )
+    assert nested_snapshot["ok"] is False
+    assert nested_snapshot["error"]["code"] == "unsupported"
+    assert entry("atlas-shared-dev", "cat /opt/atlas-nested/state").strip() == "nested-state"
 
     long_command = "echo active > work/repo-a/long-entry; sleep 300"
     machine.succeed(
@@ -271,15 +443,30 @@ pkgs.testers.runNixOSTest {
     )
     assert concurrent.strip() == "concurrent"
 
+    reset_orphan = f"{state_parent}/.rootfs.interrupted-reset"
+    reset_seed_orphan = f"{state_parent}/.seed.interrupted-reset"
+    machine.succeed(f"mkdir -p {reset_orphan}; echo partial > {reset_orphan}/state")
+    machine.succeed(f"btrfs subvolume create {reset_seed_orphan}")
+
     reset = json.loads(machine.succeed("atlas environment reset shared-dev --json"))
     assert reset["ok"] is True
     assert reset["result"]["reset"] is True
     assert reset["result"]["preservedVolumes"] == ["projects"]
     machine.wait_until_fails(f"test -d /proc/{long_host_pid}", timeout=60)
+    machine.fail(f"test -e {reset_orphan}")
+    machine.fail(f"test -e {reset_seed_orphan}")
     machine.execute("systemctl kill --kill-who=all --signal=KILL atlas-long-entry.service")
     machine.execute("systemctl stop --no-block atlas-long-entry.service")
+    entry_orphan = f"{state_parent}/.rootfs.interrupted-entry"
+    entry_seed_orphan = f"{state_parent}/.seed.interrupted-entry"
+    machine.succeed(f"mkdir -p {entry_orphan}; echo partial > {entry_orphan}/state")
+    machine.succeed(f"btrfs subvolume create {entry_seed_orphan}")
     entry("atlas-shared-dev", "command -v atlas-proof-tool", succeed=False)
-    entry("atlas-shared-dev", "test -e /etc/atlas-disposable-state", succeed=False)
+    machine.fail(f"test -e {entry_orphan}")
+    machine.fail(f"test -e {entry_seed_orphan}")
+    entry("atlas-shared-dev", "test -e /opt/atlas-nested", succeed=False)
+    entry("atlas-shared-dev", "test -e /etc/atlas-persistent-state", succeed=False)
+    entry("atlas-shared-dev", "test -e /home/agent/persistent-home", succeed=False)
     assert entry("atlas-shared-dev", "cat work/repo-a/environment-probe").strip() == sentinel
     assert entry("atlas-shared-dev", "cat work/repo-a/concurrent-entry").strip() == "concurrent"
     entry("atlas-shared-dev", "git config --global --get alias.proof", succeed=False)
@@ -291,8 +478,11 @@ pkgs.testers.runNixOSTest {
     assert allowed_users == "root"
     assert trusted_users == "root"
 
+    entry("atlas-shared-dev", "echo update-persistent > /etc/atlas-update-state")
+
     def assert_shared_state():
         assert entry("atlas-shared-dev", "cat work/repo-a/environment-probe").strip() == sentinel
+        assert entry("atlas-shared-dev", "cat /etc/atlas-update-state").strip() == "update-persistent"
 
     assert_shared_state()
     machine.succeed("systemctl restart atlas-control.service")

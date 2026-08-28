@@ -32,11 +32,15 @@ let
 
   loginUser = name: "atlas-${name}";
   loginHome = environment: "/run/atlas/entry-users/${environment.id}";
-  environmentRuntimeParent = environment: "/run/atlas/environments/${environment.id}";
-  environmentRuntimeRoot = environment: "${environmentRuntimeParent environment}/rootfs";
-  environmentRuntimeReady = environment: "${environmentRuntimeParent environment}/rootfs.ready";
+  environmentStateParent = environment: "${toString cfg.dataRoot}/environments/${environment.id}";
+  environmentRuntimeRoot = environment: "${environmentStateParent environment}/rootfs";
+  environmentRuntimeReady = environment: "${environmentStateParent environment}/rootfs.ready";
+  environmentSeed = environment: "${environmentStateParent environment}/seed";
+  environmentSnapshots = environment: "${environmentStateParent environment}/snapshots";
   environmentLock = environment: "/run/atlas/locks/${environment.id}.lock";
   volumePath = volume: "${toString cfg.dataRoot}/volumes/${volume.id}/data";
+  dataRootPersistent = cfg.dataRootPersistence == "reboot-persistent";
+  btrfsStorage = cfg.storage.adapter == "btrfs-subvolume";
   escapedSliceSegment = name: lib.replaceStrings [ "-" ] [ "\\x2d" ] name;
   sliceName = name: "atlas-environments-${escapedSliceSegment name}";
   sliceUnit = name: "${sliceName name}.slice";
@@ -61,6 +65,45 @@ let
     architecture = ubuntuArchitecture;
     source = "canonical-oci-rootfs";
   };
+  bootstrapTree = ''
+    bootstrap_tree() {
+      local target="$1"
+      tar --extract --gzip --numeric-owner --file=${ubuntuRootfs} --directory="$target"
+      install -d -m 0755 \
+        "$target/etc/atlas" \
+        "$target/etc/systemd/system" \
+        "$target/home/agent" \
+        "$target/home/agent/work" \
+        "$target/run/atlas" \
+        "$target/run/atlas-host-systemd" \
+        "$target/usr/lib/systemd"
+      sed -i -E 's#^(root:[^:]*:[^:]*:[^:]*:[^:]*):/root:#\1:/home/agent:#' \
+        "$target/etc/passwd"
+      ln -sfn /run/atlas-host-systemd/lib/systemd/systemd "$target/sbin/init"
+      rm -rf -- "$target/usr/lib/systemd/system"
+      install -d -m 0755 "$target/usr/lib/systemd/system"
+      while IFS= read -r -d "" source_path; do
+        relative_path="''${source_path#./}"
+        install -d -m 0755 "$target/usr/lib/systemd/system/$relative_path"
+      done < <(
+        cd ${pkgs.systemd}/example/systemd/system
+        find . -mindepth 1 -type d -print0
+      )
+      while IFS= read -r -d "" source_path; do
+        relative_path="''${source_path#./}"
+        ln -sfn \
+          "/run/atlas-host-systemd/example/systemd/system/$relative_path" \
+          "$target/usr/lib/systemd/system/$relative_path"
+      done < <(
+        cd ${pkgs.systemd}/example/systemd/system
+        find . -mindepth 1 ! -type d -print0
+      )
+      ln -sfn /usr/lib/systemd/system/multi-user.target \
+        "$target/etc/systemd/system/default.target"
+    }
+  '';
+  seedBootstrapDigest = builtins.hashString "sha256" bootstrapTree;
+  seedId = builtins.hashString "sha256" "${ubuntuRootfs}:${pkgs.systemd}:${seedBootstrapDigest}";
 
   effectiveVariables =
     environment:
@@ -105,7 +148,7 @@ let
     inherit (volume) id owner;
     inherit name;
     hostPath = volumePath volume;
-    durability = "host-durable";
+    durability = if dataRootPersistent then "host-durable" else "host-volatile";
   };
   volumeRecords = mapAttrs volumeRecord cfg.volumes;
 
@@ -131,12 +174,22 @@ let
     resources = environment.resources;
     runtime = {
       backend = "systemd-nspawn-service";
-      lifecycle = "disposable";
-      persistence = "until-reset-or-reboot";
+      lifecycle = "resettable";
+      persistence = if dataRootPersistent then "until-explicit-reset" else "until-reset-or-host-reboot";
       resettable = true;
       rootHostPath = environmentRuntimeRoot environment;
       readyHostPath = environmentRuntimeReady environment;
-      storageMax = environment.runtimeSize;
+      storage = {
+        adapter = cfg.storage.adapter;
+        copyOnWrite = btrfsStorage;
+        snapshots = btrfsStorage;
+      }
+      // optionalAttrs btrfsStorage {
+        seedHostPath = environmentSeed environment;
+        snapshotsHostPath = environmentSnapshots environment;
+        seed.id = seedId;
+        seedPrepareCommand = "${seedPreparers.${name}}/bin/atlas-prepare-seed-${name}";
+      };
       baseImage = baseImageRecord;
     };
     process = {
@@ -162,7 +215,7 @@ let
 
   doctor = {
     status = "experimental";
-    adapter = "nixos-nspawn-service-v0";
+    adapter = if btrfsStorage then "nixos-nspawn-btrfs-v0" else "nixos-nspawn-directory-v0";
     composition = {
       declarative = true;
       named = true;
@@ -171,8 +224,10 @@ let
       ephemeralRuntimeCreation = false;
       packages = true;
       managedGitConfig = true;
-      disposableRoots = true;
-      durableVolumes = true;
+      disposableRoots = false;
+      resettableRoots = true;
+      rebootPersistentRoots = dataRootPersistent;
+      durableVolumes = dataRootPersistent;
       persistentInstances = true;
       concurrentEntry = true;
     };
@@ -187,9 +242,23 @@ let
       packageManager = "apt";
     };
     storage = {
-      mode = "bounded-disposable-root-with-explicit-volumes";
-      status = "experimental";
-      bounded = true;
+      mode =
+        if btrfsStorage then
+          "btrfs-copy-on-write-with-explicit-volumes"
+        else
+          "elastic-host-directory-with-explicit-volumes";
+      status = if btrfsStorage then "experimental" else "degraded";
+      bounded = false;
+      copyOnWrite = btrfsStorage;
+      snapshots = btrfsStorage;
+      rollback = btrfsStorage;
+      hostRecoveryReserve = false;
+      rootPersistsAcrossReboot = dataRootPersistent;
+      resettable = true;
+      atRestEncryption = {
+        mode = "none";
+        status = "degraded";
+      };
     };
     networkIsolation = {
       mode = "shared-host";
@@ -311,6 +380,7 @@ let
           --directory=${lib.escapeShellArg runtimeRoot}
           --private-users=pick
           --private-users-ownership=map
+          --bind-ro=${pkgs.systemd}:/run/atlas-host-systemd
           --bind-ro=/nix/store:/nix/store
           --bind-ro=/etc/atlas:/etc/atlas
           --bind=/run/atlas/control.sock:/run/atlas/control.sock
@@ -322,12 +392,139 @@ let
     }
   ) cfg.environments;
 
+  seedPreparers = mapAttrs (
+    name: environment:
+    let
+      stateParent = environmentStateParent environment;
+      seedRoot = environmentSeed environment;
+    in
+    pkgs.writeShellApplication {
+      name = "atlas-prepare-seed-${name}";
+      runtimeInputs = [
+        pkgs.btrfs-progs
+        pkgs.coreutils
+        pkgs.findutils
+        pkgs.gnused
+        pkgs.gnutar
+        pkgs.gzip
+      ];
+      text = ''
+        refuse_mounts_below() {
+          local managed_path="$1"
+          local mount_target
+          if [ ! -r /proc/self/mountinfo ]; then
+            echo "Atlas could not inspect mount state" >&2
+            return 1
+          fi
+          while IFS=' ' read -r _ _ _ _ mount_target _; do
+            case "$mount_target" in
+              "$managed_path"|"$managed_path"/*)
+                echo "Atlas refused a lifecycle path with mounts below it" >&2
+                return 1
+                ;;
+            esac
+          done < /proc/self/mountinfo
+        }
+
+        delete_managed_tree() {
+          local managed_path="$1"
+          if [ ! -e "$managed_path" ]; then
+            return 0
+          fi
+          if btrfs subvolume show "$managed_path" >/dev/null 2>&1; then
+            btrfs subvolume delete --recursive --commit-after -- "$managed_path" >/dev/null
+          else
+            rm -rf -- "$managed_path"
+          fi
+        }
+
+        make_private_path() {
+          local pattern="$1"
+          local temporary_path
+          temporary_path="$(mktemp -d --tmpdir=${lib.escapeShellArg stateParent} "$pattern.XXXXXX")"
+          rmdir -- "$temporary_path"
+          printf '%s\n' "$temporary_path"
+        }
+
+        ${bootstrapTree}
+
+        if [ -L ${lib.escapeShellArg stateParent} ] || [ ! -d ${lib.escapeShellArg stateParent} ]; then
+          echo "Atlas refused an invalid environment state parent" >&2
+          exit 1
+        fi
+        if [ -L ${lib.escapeShellArg seedRoot} ] || \
+           { [ -e ${lib.escapeShellArg seedRoot} ] && \
+             ! btrfs subvolume show ${lib.escapeShellArg seedRoot} >/dev/null 2>&1; }; then
+          echo "Atlas refused an invalid Btrfs seed" >&2
+          exit 1
+        fi
+
+        shopt -s nullglob
+        private_seed_paths=(
+          ${stateParent}/.deleting-seed.*
+          ${stateParent}/.seed.*
+        )
+        shopt -u nullglob
+        for private_seed_path in "''${private_seed_paths[@]}"; do
+          if [ -L "$private_seed_path" ] || [ ! -d "$private_seed_path" ]; then
+            echo "Atlas refused an invalid private seed path" >&2
+            exit 1
+          fi
+          refuse_mounts_below "$private_seed_path"
+          delete_managed_tree "$private_seed_path"
+        done
+
+        seed_matches=false
+        if [ -d ${lib.escapeShellArg seedRoot} ] && \
+           [ "$(cat ${lib.escapeShellArg "${seedRoot}/etc/atlas/seed-id"} 2>/dev/null || true)" = ${lib.escapeShellArg seedId} ] && \
+           [ "$(btrfs property get -ts ${lib.escapeShellArg seedRoot} ro 2>/dev/null || true)" = ro=true ]; then
+          seed_matches=true
+        fi
+
+        if [ "$seed_matches" = true ]; then
+          exit 0
+        fi
+
+        temporary_seed="$(make_private_path .seed)"
+        old_seed=""
+        cleanup_seed() {
+          if [ -n "$temporary_seed" ] && [ -e "$temporary_seed" ]; then
+            delete_managed_tree "$temporary_seed"
+          fi
+        }
+        trap cleanup_seed EXIT
+        btrfs subvolume create "$temporary_seed" >/dev/null
+        bootstrap_tree "$temporary_seed"
+        printf '%s\n' ${lib.escapeShellArg seedId} > "$temporary_seed/etc/atlas/seed-id"
+        btrfs property set -ts "$temporary_seed" ro true
+
+        if [ -e ${lib.escapeShellArg seedRoot} ]; then
+          old_seed="$(make_private_path .deleting-seed)"
+          mv -T -- ${lib.escapeShellArg seedRoot} "$old_seed"
+        fi
+        if ! mv -T -- "$temporary_seed" ${lib.escapeShellArg seedRoot}; then
+          if [ -n "$old_seed" ] && [ -e "$old_seed" ]; then
+            mv -T -- "$old_seed" ${lib.escapeShellArg seedRoot}
+          fi
+          exit 1
+        fi
+        temporary_seed=""
+        if [ -n "$old_seed" ] && [ -e "$old_seed" ]; then
+          delete_managed_tree "$old_seed"
+        fi
+        trap - EXIT
+      '';
+    }
+  ) cfg.environments;
+
   entryLaunchers = mapAttrs (
     name: environment:
     let
-      runtimeParent = environmentRuntimeParent environment;
+      stateParent = environmentStateParent environment;
       runtimeRoot = environmentRuntimeRoot environment;
       runtimeReady = environmentRuntimeReady environment;
+      seedRoot = environmentSeed environment;
+      snapshotsRoot = environmentSnapshots environment;
       environmentShell = environmentShells.${name};
       environmentAssignments = environmentAssignmentLines name environment;
       service = environmentServiceUnit name;
@@ -343,7 +540,8 @@ let
         pkgs.gzip
         pkgs.systemd
         pkgs.util-linux
-      ];
+      ]
+      ++ lib.optionals btrfsStorage [ pkgs.btrfs-progs ];
       text = ''
                 if [ "$#" -eq 1 ] && [ "$1" = "interactive" ]; then
                   command=(${environmentShell} -i)
@@ -353,11 +551,84 @@ let
                   echo "Atlas entry launcher rejected unsupported arguments" >&2
                   exit 2
                 fi
+                storage_adapter=${lib.escapeShellArg cfg.storage.adapter}
 
                 exec 9>${lib.escapeShellArg (environmentLock environment)}
                 flock 9
-                runtime_mount_unit="$(systemd-escape --path --suffix=mount ${lib.escapeShellArg runtimeParent})"
-                systemctl start "$runtime_mount_unit"
+
+                refuse_mounts_below() {
+                  local managed_path="$1"
+                  local mount_target
+                  if [ ! -r /proc/self/mountinfo ]; then
+                    echo "Atlas could not inspect mount state" >&2
+                    return 1
+                  fi
+                  while IFS=' ' read -r _ _ _ _ mount_target _; do
+                    case "$mount_target" in
+                      "$managed_path"|"$managed_path"/*)
+                        echo "Atlas refused a lifecycle path with mounts below it" >&2
+                        return 1
+                        ;;
+                    esac
+                  done < /proc/self/mountinfo
+                }
+
+                delete_managed_tree() {
+                  local managed_path="$1"
+                  if [ ! -e "$managed_path" ]; then
+                    return 0
+                  fi
+                  if [ "$storage_adapter" = btrfs-subvolume ] && \
+                     btrfs subvolume show "$managed_path" >/dev/null 2>&1; then
+                    btrfs subvolume delete --recursive --commit-after -- "$managed_path" >/dev/null
+                  else
+                    rm -rf -- "$managed_path"
+                  fi
+                }
+
+                make_private_path() {
+                  local pattern="$1"
+                  local temporary_path
+                  temporary_path="$(mktemp -d --tmpdir=${lib.escapeShellArg stateParent} "$pattern.XXXXXX")"
+                  rmdir -- "$temporary_path"
+                  printf '%s\n' "$temporary_path"
+                }
+
+                ${bootstrapTree}
+
+                if [ -L ${lib.escapeShellArg stateParent} ] || [ ! -d ${lib.escapeShellArg stateParent} ]; then
+                  echo "Atlas refused an invalid environment state parent" >&2
+                  exit 1
+                fi
+                if [ -L ${lib.escapeShellArg runtimeRoot} ] || \
+                   { [ -e ${lib.escapeShellArg runtimeRoot} ] && [ ! -d ${lib.escapeShellArg runtimeRoot} ]; }; then
+                  echo "Atlas refused an invalid environment runtime root" >&2
+                  exit 1
+                fi
+                if [ -L ${lib.escapeShellArg runtimeReady} ] || \
+                   { [ -e ${lib.escapeShellArg runtimeReady} ] && [ ! -f ${lib.escapeShellArg runtimeReady} ]; }; then
+                  echo "Atlas refused an invalid environment readiness marker" >&2
+                  exit 1
+                fi
+                if [ "$storage_adapter" = btrfs-subvolume ]; then
+                  if [ -e ${lib.escapeShellArg runtimeRoot} ] && \
+                     ! btrfs subvolume show ${lib.escapeShellArg runtimeRoot} >/dev/null 2>&1; then
+                    echo "Atlas refused an environment root that is not a Btrfs subvolume" >&2
+                    exit 1
+                  fi
+                  if [ -L ${lib.escapeShellArg seedRoot} ] || \
+                     { [ -e ${lib.escapeShellArg seedRoot} ] && \
+                       ! btrfs subvolume show ${lib.escapeShellArg seedRoot} >/dev/null 2>&1; }; then
+                    echo "Atlas refused an invalid Btrfs seed" >&2
+                    exit 1
+                  fi
+                  if [ -L ${lib.escapeShellArg snapshotsRoot} ] || \
+                     { [ -e ${lib.escapeShellArg snapshotsRoot} ] && [ ! -d ${lib.escapeShellArg snapshotsRoot} ]; }; then
+                    echo "Atlas refused an invalid snapshots directory" >&2
+                    exit 1
+                  fi
+                  ${seedPreparers.${name}}/bin/atlas-prepare-seed-${name}
+                fi
 
                 if systemctl is-active --quiet ${lib.escapeShellArg service}; then
                   if [ ! -d ${lib.escapeShellArg runtimeRoot} ] || [ ! -f ${lib.escapeShellArg runtimeReady} ]; then
@@ -365,38 +636,42 @@ let
                     exit 1
                   fi
                 else
-                  find ${lib.escapeShellArg runtimeParent} -mindepth 1 -maxdepth 1 \
-                    -type d -name '.deleting-*' -exec rm -rf -- {} +
+                  refuse_mounts_below ${lib.escapeShellArg runtimeRoot}
+
+                  shopt -s nullglob
+                  private_paths=(
+                    ${stateParent}/.deleting-*
+                    ${stateParent}/.rootfs.*
+                    ${stateParent}/.seed.*
+                  )
+                  shopt -u nullglob
+                  for private_path in "''${private_paths[@]}"; do
+                    if [ -L "$private_path" ] || [ ! -d "$private_path" ]; then
+                      echo "Atlas refused an invalid private lifecycle path" >&2
+                      exit 1
+                    fi
+                    refuse_mounts_below "$private_path"
+                    delete_managed_tree "$private_path"
+                  done
 
                   if { [ -e ${lib.escapeShellArg runtimeRoot} ] && [ ! -f ${lib.escapeShellArg runtimeReady} ]; } || \
                      { [ ! -e ${lib.escapeShellArg runtimeRoot} ] && [ -e ${lib.escapeShellArg runtimeReady} ]; }; then
-                    rm -rf -- ${lib.escapeShellArg runtimeRoot}
+                    delete_managed_tree ${lib.escapeShellArg runtimeRoot}
                     rm -f -- ${lib.escapeShellArg runtimeReady}
                   fi
 
                   if [ ! -f ${lib.escapeShellArg runtimeReady} ]; then
-                    temporary_root="$(mktemp -d --tmpdir=${lib.escapeShellArg runtimeParent} .rootfs.XXXXXX)"
+                    if [ "$storage_adapter" = btrfs-subvolume ]; then
+                      temporary_root="$(make_private_path .rootfs)"
+                      btrfs subvolume snapshot -- ${lib.escapeShellArg seedRoot} "$temporary_root" >/dev/null
+                    else
+                      temporary_root="$(mktemp -d --tmpdir=${lib.escapeShellArg stateParent} .rootfs.XXXXXX)"
+                      bootstrap_tree "$temporary_root"
+                    fi
                     cleanup() {
-                      rm -rf -- "$temporary_root"
+                      delete_managed_tree "$temporary_root"
                     }
                     trap cleanup EXIT
-                    tar --extract --gzip --numeric-owner --file=${ubuntuRootfs} --directory="$temporary_root"
-                    install -d -m 0755 \
-                      "$temporary_root/etc/atlas" \
-                      "$temporary_root/etc/systemd/system" \
-                      "$temporary_root/home/agent" \
-                      "$temporary_root/home/agent/work" \
-                      "$temporary_root/run/atlas" \
-                      "$temporary_root/usr/lib/systemd"
-                    sed -i -E 's#^(root:[^:]*:[^:]*:[^:]*:[^:]*):/root:#\1:/home/agent:#' \
-                      "$temporary_root/etc/passwd"
-                    ln -sfn ${pkgs.systemd}/lib/systemd/systemd "$temporary_root/sbin/init"
-                    rm -rf -- "$temporary_root/usr/lib/systemd/system"
-                    install -d -m 0755 "$temporary_root/usr/lib/systemd/system"
-                    cp -a ${pkgs.systemd}/example/systemd/system/. \
-                      "$temporary_root/usr/lib/systemd/system/"
-                    ln -sfn /usr/lib/systemd/system/multi-user.target \
-                      "$temporary_root/etc/systemd/system/default.target"
                     mv -T -- "$temporary_root" ${lib.escapeShellArg runtimeRoot}
                     install -m 0600 /dev/null ${lib.escapeShellArg runtimeReady}
                     trap - EXIT
@@ -560,12 +835,21 @@ let
   invalidHomeMountTargets = unique (
     filter (path: path == "/home/agent" || hasPrefix "${path}/" "/home/agent") allMountTargets
   );
-  invalidRuntimeSizeEnvironments = filter (
-    name: builtins.match "^[1-9][0-9]*[MG]$" cfg.environments.${name}.runtimeSize == null
-  ) environmentNames;
 in
 {
   options.atlas.host = {
+    storage.adapter = mkOption {
+      default = "host-directory";
+      type = types.enum [
+        "host-directory"
+        "btrfs-subvolume"
+      ];
+      description = ''
+        Host storage mechanism for resettable environment roots and durable
+        volumes. The Btrfs adapter requires /var/lib/atlas to reside on Btrfs.
+      '';
+    };
+
     environmentLayers = mkOption {
       default = { };
       type = types.attrsOf (
@@ -664,16 +948,11 @@ in
                   };
                 }
               );
-              description = "Explicit durable-volume attachments for this disposable environment.";
+              description = "Explicit durable-volume attachments for this resettable environment.";
             };
             networkMode = mkOption {
               default = "shared-host";
               type = types.enum [ "shared-host" ];
-            };
-            runtimeSize = mkOption {
-              default = "1G";
-              type = types.str;
-              description = "Maximum size of this environment's disposable tmpfs root.";
             };
             resources = {
               cpuWeight = mkOption {
@@ -696,7 +975,7 @@ in
           };
         }
       );
-      description = "Named disposable Atlas environment instances for the nspawn adapter.";
+      description = "Named persistent, resettable Atlas environment instances for the nspawn adapter.";
     };
 
     environmentContract = mkOption {
@@ -767,10 +1046,6 @@ in
         }";
       }
       {
-        assertion = invalidRuntimeSizeEnvironments == [ ];
-        message = "Atlas environment runtimeSize values must be positive megabyte or gigabyte sizes: ${builtins.toJSON invalidRuntimeSizeEnvironments}";
-      }
-      {
         assertion = invalidVariableNames == [ ];
         message = "Atlas environment variable names are invalid: ${builtins.toJSON invalidVariableNames}";
       }
@@ -781,8 +1056,8 @@ in
     ];
 
     atlas.host.environmentContract = {
-      version = 3;
-      adapter = "nixos-nspawn-service-v0";
+      version = 5;
+      adapter = if btrfsStorage then "nixos-nspawn-btrfs-v0" else "nixos-nspawn-directory-v0";
       baseImage = baseImageRecord;
       composition = doctor.composition;
       identity = doctor.identity;
@@ -793,7 +1068,7 @@ in
     environment = {
       etc."atlas/control-contract.json".source = controlContractFile;
       shells = builtins.attrValues entryShells;
-      systemPackages = [ atlasControl ];
+      systemPackages = [ atlasControl ] ++ lib.optionals btrfsStorage [ pkgs.btrfs-progs ];
     };
 
     security.sudo.extraRules = mapAttrsToList (name: _environment: {
@@ -808,6 +1083,61 @@ in
 
     systemd = {
       services = {
+        atlas-storage-prepare = mkIf btrfsStorage {
+          description = "Prepare Atlas Btrfs storage";
+          requiredBy = [ "atlas-host.target" ];
+          before = [
+            "atlas-host-contract.service"
+            "atlas-host.target"
+          ];
+          after = [
+            "local-fs.target"
+            "systemd-tmpfiles-setup.service"
+          ];
+          unitConfig.RequiresMountsFor = [ (toString cfg.dataRoot) ];
+          path = [
+            pkgs.btrfs-progs
+            pkgs.coreutils
+          ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          script = ''
+            set -eu
+            if [ "$(stat -f -c %T ${lib.escapeShellArg (toString cfg.dataRoot)})" != btrfs ]; then
+              echo "Atlas Btrfs adapter requires ${toString cfg.dataRoot} to reside on Btrfs" >&2
+              exit 1
+            fi
+            ${concatMapStringsSep "\n" (
+              name:
+              let
+                path = volumePath cfg.volumes.${name};
+              in
+              ''
+                if [ -L ${lib.escapeShellArg path} ]; then
+                  echo "Atlas refused a symbolic link at durable volume ${name}" >&2
+                  exit 1
+                fi
+                if [ -e ${lib.escapeShellArg path} ]; then
+                  if ! btrfs subvolume show ${lib.escapeShellArg path} >/dev/null 2>&1; then
+                    echo "Atlas durable volume ${name} is not a Btrfs subvolume" >&2
+                    exit 1
+                  fi
+                else
+                  btrfs subvolume create ${lib.escapeShellArg path} >/dev/null
+                fi
+                chmod 0700 ${lib.escapeShellArg path}
+              ''
+            ) volumeNames}
+          '';
+        };
+
+        atlas-host-contract = mkIf btrfsStorage {
+          requires = [ "atlas-storage-prepare.service" ];
+          after = [ "atlas-storage-prepare.service" ];
+        };
+
         atlas-control = {
           description = "Atlas public peer-authenticated inspection service";
           after = [ "atlas-host-contract.service" ];
@@ -835,18 +1165,24 @@ in
           description = "Atlas root-only lifecycle management service";
           after = [ "atlas-host-contract.service" ];
           serviceConfig = {
-            ExecStart = "${atlasControl}/bin/atlas serve --management --systemctl ${pkgs.systemd}/bin/systemctl";
+            ExecStart = "${atlasControl}/bin/atlas serve --management --systemctl ${pkgs.systemd}/bin/systemctl --btrfs ${pkgs.btrfs-progs}/bin/btrfs";
             User = "root";
             Group = "root";
             Slice = "atlas-control.slice";
             AmbientCapabilities = [
+              "CAP_CHOWN"
               "CAP_DAC_OVERRIDE"
+              "CAP_FSETID"
               "CAP_FOWNER"
-            ];
+            ]
+            ++ lib.optional btrfsStorage "CAP_SYS_ADMIN";
             CapabilityBoundingSet = [
+              "CAP_CHOWN"
               "CAP_DAC_OVERRIDE"
+              "CAP_FSETID"
               "CAP_FOWNER"
-            ];
+            ]
+            ++ lib.optional btrfsStorage "CAP_SYS_ADMIN";
             LockPersonality = true;
             NoNewPrivileges = true;
             PrivateDevices = true;
@@ -857,12 +1193,11 @@ in
             ProtectKernelTunables = true;
             ProtectSystem = "strict";
             ReadWritePaths = [
-              "/run/atlas/environments"
+              "${toString cfg.dataRoot}/environments"
               "/run/atlas/locks"
             ];
             Restart = "on-failure";
             RestrictAddressFamilies = [ "AF_UNIX" ];
-            RestrictSUIDSGID = true;
           };
         };
       }
@@ -873,7 +1208,7 @@ in
           requires = [ "atlas-control.socket" ];
           after = [ "atlas-control.socket" ];
           restartTriggers = [ environmentConfigFiles.${name} ];
-          unitConfig.RequiresMountsFor = [ (environmentRuntimeParent environment) ];
+          unitConfig.RequiresMountsFor = [ (environmentStateParent environment) ];
           serviceConfig = {
             Type = "notify";
             NotifyAccess = "all";
@@ -915,15 +1250,6 @@ in
         };
       };
 
-      mounts = mapAttrsToList (name: environment: {
-        description = "Bounded disposable storage for Atlas environment ${name}";
-        what = "tmpfs";
-        where = environmentRuntimeParent environment;
-        type = "tmpfs";
-        options = "mode=0700,nosuid,nodev,size=${environment.runtimeSize}";
-        unitConfig.Before = [ (environmentServiceUnit name) ];
-      }) cfg.environments;
-
       slices = mapAttrs' (
         name: environment:
         nameValuePair (sliceName name) {
@@ -941,7 +1267,6 @@ in
       tmpfiles.rules = [
         "d /run/atlas 0755 root root - -"
         "d /run/atlas/entry-users 0711 root root - -"
-        "d /run/atlas/environments 0700 root root - -"
         "d /run/atlas/locks 0700 root root - -"
       ]
       ++ concatMap (
@@ -952,7 +1277,8 @@ in
         in
         [
           "d ${loginHome environment} 0700 ${user} ${user} - -"
-          "d ${environmentRuntimeParent environment} 0700 root root - -"
+          "d ${environmentStateParent environment} 0700 root root - -"
+          "d ${environmentSnapshots environment} 0700 root root - -"
         ]
       ) environmentNames
       ++ concatMap (
@@ -961,10 +1287,8 @@ in
           volume = cfg.volumes.${name};
           parent = builtins.dirOf (volumePath volume);
         in
-        [
-          "d ${parent} 0711 root root - -"
-          "d ${volumePath volume} 0700 root root - -"
-        ]
+        [ "d ${parent} 0711 root root - -" ]
+        ++ lib.optional (!btrfsStorage) "d ${volumePath volume} 0700 root root - -"
       ) volumeNames;
     };
 

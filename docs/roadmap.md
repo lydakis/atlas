@@ -18,6 +18,8 @@ independent workstreams need assignment and coordination.
   explicit boundaries for different authority, network policy, incompatible
   toolchains, reset policy, or resource limits, not a requirement per
   project or agent.
+- The human owns the box, account, and data. An agent is a program operating in
+  an environment, not a Linux identity or the owner of that environment.
 - Agent-visible files persist by default. Ordinary files, installed packages,
   `/etc`, and the environment home should survive disconnect, environment
   restart, host reboot, and supported update.
@@ -44,15 +46,21 @@ promise, not a consequence of a path happening to be on disk.
 
 ### Resettable machine state
 
-The environment root and home contain installed packages, `/etc`, ordinary home
-files, caches, and tool configuration. The product default is disk-backed and
-persistent until the operator deliberately resets or deletes the environment.
-It survives disconnect, process failure, host reboot, and supported update, but
-it is not implicitly backed up and is not protected from explicit reset.
+The environment root contains installed packages, `/etc`, caches, tool
+configuration, and any home content not placed on durable owner storage. The
+product default is disk-backed and persistent until the operator deliberately
+resets or deletes the environment. It survives disconnect, process failure,
+host reboot, and supported update, but it is not implicitly backed up and is
+not protected from explicit reset.
 
-Copy-on-write reconstruction, quota enforcement, and atomic reset are
-implementation mechanisms. Agents should not need to choose special paths merely
-to keep ordinary files across a reboot.
+The exact owner-home composition remains open. Atlas may make the entire owner
+home durable or mount selected durable directories inside a resettable home.
+Either choice must look conventional inside the environment and state clearly
+what reset removes. `/home/agent` is only the current mapped-root spike path.
+
+Copy-on-write reconstruction and atomic root replacement are now proven by the
+Btrfs adapter. Quota enforcement remains absent. Agents should not need to
+choose special paths merely to keep ordinary files across a reboot.
 
 ### Volatile execution state
 
@@ -71,7 +79,7 @@ later, but they are an opt-in policy rather than the default experience.
 
 | Order | Proof | Exit evidence | State |
 | --- | --- | --- | --- |
-| 1 | Persistent physical storage | A disk-backed resettable root and encrypted durable volume survive reboot and supported update; reset is atomic and preserves the volume; quotas prevent host exhaustion | next |
+| 1 | Persistent physical storage | An elastic disk-backed resettable root and automatically attached encrypted owner storage survive reboot and supported update; reset preserves owner data; storage layout protects host recovery capacity | in progress |
 | 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or metadata endpoints without policy; intended public egress still works | queued |
 | 3 | Private route | One explicitly selected environment port is reachable from an authorized paired device without a public listener or arbitrary upstream target | queued |
 | 4 | Authenticated browser surface | An agent operates one isolated browser identity while the operator can observe, take over, return control, and revoke access | queued |
@@ -83,12 +91,23 @@ later, but they are an opt-in policy rather than the default experience.
 
 ## Current spike gaps
 
-The validated NixOS adapter is evidence for lifecycle, identity, reset, and
-volume separation, not the target storage or network design.
+The NixOS adapter is evidence for lifecycle, identity, reset, volume separation,
+reboot-persistent machine state, and copy-on-write root recovery. The first
+physical adapter target is Btrfs, but encryption, installed-disk layout, and
+hardware recovery remain unproven.
 
-- Environment roots currently use a size-bounded tmpfs with a 1 GiB default and
-  are reconstructed after reboot. This is useful test containment but conflicts
-  with the persistent machine experience and is reported as a prototype gap.
+- Persistent development and contract-test VMs mount a dedicated Btrfs data disk
+  at `/var/lib/atlas`. Environment roots, applied seeds, named root snapshots,
+  and durable volumes are separate subvolumes with no default per-environment
+  quota.
+- The live ISO retains the directory adapter and truthfully reports snapshots
+  and rollback as unavailable.
+- The physical image remains a live ISO. `/var/lib/atlas` is not encrypted,
+  host recovery capacity is not protected, primary durable owner storage is not
+  created automatically, and power-loss and recovery behavior are untested.
+- `/home/agent` remains a spike convention for mapped root, not the product
+  identity. The owner account, conventional home layout, and environment-local
+  elevation contract remain open.
 - Environments currently share host networking. Isolation and duplicate port
   use are not yet provided by the Environment Entry adapter.
 - The read-only host Nix store remains visible inside environments for declared
@@ -98,8 +117,11 @@ volume separation, not the target storage or network design.
 
 ## Product questions still open
 
-- Which disk and copy-on-write mechanism best implements persistent-until-reset
-  roots across supported hardware?
+- Which encrypted installed-disk layout best protects host recovery capacity
+  when the elastic Btrfs data filesystem is full, and which optional quota
+  policy is acceptable for additional environments?
+- How should the human owner account, conventional home, and environment-local
+  elevation work without turning agents into identities?
 - Which environment backend is sufficient for the first trust model, and when
   does a higher-risk environment require a microVM?
 - Which browser automation capability can preserve the stated cookie and

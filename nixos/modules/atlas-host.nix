@@ -142,6 +142,19 @@ in
       '';
     };
 
+    dataRootPersistence = mkOption {
+      type = types.enum [
+        "reboot-persistent"
+        "volatile-live-image"
+      ];
+      default = "reboot-persistent";
+      description = ''
+        Deployment fact describing whether /var/lib/atlas survives host reboot.
+        Live artifacts must report volatile storage rather than inheriting the
+        installed-host persistence guarantee.
+      '';
+    };
+
     tailscale.enable = mkEnableOption "the Tailscale connectivity adapter";
 
     tailscale.authKeyFile = mkOption {
@@ -191,7 +204,7 @@ in
     ];
 
     atlas.host.contract = {
-      version = 5;
+      version = 7;
       intent.primitives = intendedPrimitives;
       implementation.primitives = [
         "host"
@@ -200,6 +213,8 @@ in
       ];
       state = {
         root = dataRoot;
+        persistence = cfg.dataRootPersistence;
+        storageAdapter = cfg.storage.adapter;
         rootMode = stateRoot.mode;
         rootOwner = stateRoot.owner;
         rootGroup = stateRoot.group;

@@ -57,19 +57,26 @@ includes:
   named environment definitions
 - fixed environment login targets that enter persistent, user-namespaced Ubuntu
   Noble compartments supervised by systemd
-- resettable environment roots and homes, plus explicit durable volumes that
-  may be shared across selected environments
+- resettable environment roots, with explicit durable volumes composed inside
+  their ordinary Linux view and shareable across selected environments
+- elastic Btrfs environment roots under `/var/lib/atlas` that preserve ordinary
+  machine state across reboot without an arbitrary default quota
+- read-only applied seeds plus root snapshot, restore, and delete operations;
+  durable volumes remain outside root snapshots
 - mapped root inside an environment, so agents can install ordinary Debian
   packages and mutate their OS without receiving host root
 - a peer-authenticated read-only control socket for doctor, list, and inspect,
-  plus a separate root-only lifecycle socket for environment reset
+  plus a separate root-only lifecycle socket for environment reset and root
+  snapshots
 - a Tailscale enrollment helper that enables tailnet-private SSH
 - no publicly exposed OpenSSH service
 - two development environments with different Git identities plus one minimal
   environment without Git on its declared PATH
 - a QEMU integration test covering persistent and concurrent entry,
-  composition, shared-volume access, package installation, active-workload
-  reset, identity, isolation, update, rollback, and durable-volume preservation
+  composition, shared-volume access, package installation, host reboot,
+  elastic Btrfs storage, root snapshot restore, volatile-state reconstruction,
+  active-workload reset, identity, isolation, update, rollback, and
+  durable-volume preservation
 - an earlier live-tailnet dogfood run using ordinary Tailscale SSH and Herdr's
   remote thin client against the preceding fixed-login adapter
 
@@ -95,11 +102,15 @@ physical-hardware validation remain future work.
 Each environment now has one persistent nspawn service. Entries join that
 service through Linux namespaces and a delegated session cgroup, so concurrent
 clients see one instance and reset can terminate the complete workload tree.
-The spike's resettable roots live on size-bounded tmpfs storage, default to
-1 GiB, and are reconstructed after reset or reboot. This does not yet satisfy
-the product target of disk-backed machine state that persists until explicit
-reset. Networking is shared with the host, and the read-only Nix store is
-visible for declared tools. These gaps are reported rather than hidden.
+The persistent VM now mounts a dedicated Btrfs disk at `/var/lib/atlas`.
+Resettable roots and durable volumes are separate subvolumes; roots persist
+across reboot, reset cheaply from read-only applied seeds, and support named
+snapshots and restore. The primary environment is not artificially capped. A
+protected host recovery reserve, optional quotas for additional environments,
+durable-volume snapshots and backup, at-rest encryption, power-loss recovery,
+and physical-hardware validation remain incomplete.
+Networking is shared with the host, and the read-only Nix store is visible for
+declared tools. These gaps are reported rather than hidden.
 
 In short, this repository proves parts of the host substrate. It does not yet
 deliver the agent-computer experience described by the thesis.
@@ -136,9 +147,11 @@ Replace `aarch64-linux` with `x86_64-linux` for an x86 output.
 - **Existing-client first:** an Atlas environment should look like a normal remote Linux target.
 - **Headless, not blind:** a person can inspect, approve, observe, take over, and recover work.
 - **Persistent by default, durable by declaration:** ordinary environment files
-  survive reboot and update in the product target; explicit resettable machine
-  state may be discarded; declared volumes survive environment reset; live
-  process memory and connections do not survive reboot.
+  survive reboot and update; explicit resettable machine state may be
+  discarded; declared volumes survive environment reset; live process memory
+  and connections do not survive reboot.
+- **Agents are processes, not identities:** humans own environments and durable
+  data; several agents may concurrently use the same environment.
 - **Scoped authority:** environments receive explicit grants, not ambient host secrets or root-equivalent build access.
 - **Private by default:** network reachability and port discovery do not publish a service.
 - **Local-first:** the core machine remains useful without an Atlas-operated cloud.
@@ -147,17 +160,20 @@ Replace `aarch64-linux` with `x86_64-linux` for an x86 output.
 ## Architecture decision still open
 
 NixOS is the current prototype vehicle, not a commitment. The next product
-proof adds persistent disk-backed resettable roots and private environment
-networking on physical hardware. Authenticated Surface v0 then supplies the
-browser and takeover security boundary, capability reporting, and one private
-route. A bootc/OCI comparison follows once that behavior is concrete enough to
-port and compare honestly.
+proof completes encrypted persistent storage, a protected host recovery
+reserve, automatic durable storage for the default environment, and the proven
+Btrfs lifecycle on physical hardware, followed by private environment
+networking. Authenticated Surface v0 then supplies the browser and takeover
+security boundary, capability reporting, and one private route. A bootc/OCI
+comparison follows once that behavior is concrete enough to port and compare
+honestly.
 
 ## Documentation
 
 - [Product thesis](docs/product-thesis.md)
 - [Roadmap](docs/roadmap.md)
 - [Environment Entry v0](docs/environment-entry-v0.md)
+- [Persistent Storage v0](docs/persistent-storage-v0.md)
 - [Authenticated Surface v0](docs/authenticated-surface-v0.md)
 - [Interop contract](docs/interop-contract.md)
 - [Threat model](docs/threat-model.md)
