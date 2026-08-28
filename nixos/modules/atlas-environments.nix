@@ -290,7 +290,8 @@ let
     name = "atlas";
     runtimeInputs = [ pkgs.python3 ];
     text = ''
-      exec python3 ${../../src/atlas_control.py} "$@"
+      export PYTHONPATH=${../../src}
+      exec python3 -P -m atlas "$@"
     '';
   };
 

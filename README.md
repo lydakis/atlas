@@ -159,17 +159,14 @@ Replace `aarch64-linux` with `x86_64-linux` for an x86 output.
 
 ## Architecture decision still open
 
-NixOS is the current prototype vehicle, not a commitment. The next product
-proof completes encrypted persistent storage, a protected host recovery
-reserve, automatic durable storage for the default environment, and the proven
-Btrfs lifecycle on physical hardware, followed by private environment
-networking. Authenticated Surface v0 then supplies the browser and takeover
-security boundary, capability reporting, and one private route. A bootc/OCI
-comparison follows once that behavior is concrete enough to port and compare
-honestly.
+NixOS is the current prototype vehicle, not a commitment. The
+[roadmap](docs/roadmap.md) records the current proof sequence and status. A
+bootc/OCI comparison waits until the required product behavior is concrete
+enough to port and compare honestly.
 
 ## Documentation
 
+- [Documentation map](docs/README.md)
 - [Product thesis](docs/product-thesis.md)
 - [Roadmap](docs/roadmap.md)
 - [Environment Entry v0](docs/environment-entry-v0.md)

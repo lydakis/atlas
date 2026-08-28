@@ -186,6 +186,12 @@ pkgs.testers.runNixOSTest {
         "mode": "none",
         "status": "degraded",
     }
+    machine.succeed(
+        "mkdir -p /tmp/atlas-shadow; "
+        "printf '%s\\n' 'from pathlib import Path' 'Path(\"/tmp/atlas-shadow-executed\").touch()' > /tmp/atlas-shadow/atlas.py; "
+        "cd /tmp/atlas-shadow; atlas doctor --json >/dev/null; "
+        "test ! -e /tmp/atlas-shadow-executed"
+    )
     listed = json.loads(machine.succeed("atlas environment list --json"))
     assert [item["name"] for item in listed["result"]] == ["personal-dev", "restricted", "shared-dev"]
     machine.fail("atlas environment inspect self --json")

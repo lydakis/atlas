@@ -103,7 +103,7 @@
               }
               ''
                 mkdir -p work/src work/tests
-                cp ${./src/atlas_control.py} work/src/atlas_control.py
+                cp -r ${./src/atlas} work/src/atlas
                 cp ${./tests/test_atlas_control.py} work/tests/test_atlas_control.py
                 cd work
                 python3 -m unittest discover -s tests -v

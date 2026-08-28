@@ -1,3 +1,4 @@
+import io
 import socket
 import shutil
 import subprocess
@@ -10,13 +11,13 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from atlas_control import (  # noqa: E402
+from atlas.control import _read_request, handle_request  # noqa: E402
+from atlas.lifecycle import _pause_environment, _reset_environment  # noqa: E402
+from atlas.storage import (  # noqa: E402
+    MAX_BTRFS_DIAGNOSTIC_BYTES,
     _delete_managed_tree,
-    _pause_environment,
-    _read_request,
     _replace_btrfs_root,
-    _reset_environment,
-    handle_request,
+    _run_btrfs,
 )
 
 
@@ -81,10 +82,32 @@ CONTRACT = {
 }
 
 
-class AtlasControlProtocolTests(unittest.TestCase):
-    def setUp(self):
+class RecordingLifecycle:
+    snapshots_enabled = True
+
+    def __init__(self):
         self.reset_names = []
         self.snapshot_calls = []
+
+    def reset(self, environment):
+        self.reset_names.append(environment["name"])
+
+    def create_snapshot(self, environment, snapshot):
+        self.snapshot_calls.append(("create", environment["name"], snapshot))
+
+    def list_snapshots(self, _environment):
+        return ["baseline", "working"]
+
+    def restore_snapshot(self, environment, snapshot):
+        self.snapshot_calls.append(("restore", environment["name"], snapshot))
+
+    def delete_snapshot(self, environment, snapshot):
+        self.snapshot_calls.append(("delete", environment["name"], snapshot))
+
+
+class AtlasControlProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.lifecycle = RecordingLifecycle()
 
     def request(self, peer_uid, payload, peer_cgroup="", allow_management=True):
         return handle_request(
@@ -92,37 +115,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
             peer_cgroup=peer_cgroup,
             request=payload,
             contract=CONTRACT,
-            reset_environment=(
-                lambda environment: self.reset_names.append(environment["name"])
-            )
-            if allow_management
-            else None,
-            create_snapshot=(
-                lambda environment, snapshot: self.snapshot_calls.append(
-                    ("create", environment["name"], snapshot)
-                )
-            )
-            if allow_management
-            else None,
-            list_snapshots=(
-                lambda environment: ["baseline", "working"]
-            )
-            if allow_management
-            else None,
-            restore_snapshot=(
-                lambda environment, snapshot: self.snapshot_calls.append(
-                    ("restore", environment["name"], snapshot)
-                )
-            )
-            if allow_management
-            else None,
-            delete_snapshot=(
-                lambda environment, snapshot: self.snapshot_calls.append(
-                    ("delete", environment["name"], snapshot)
-                )
-            )
-            if allow_management
-            else None,
+            lifecycle=self.lifecycle if allow_management else None,
         )
 
     def test_inspect_self_derives_environment_from_peer_uid(self):
@@ -218,7 +211,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["result"]["name"], "shared-dev")
         self.assertEqual(response["result"]["preservedVolumes"], ["projects"])
-        self.assertEqual(self.reset_names, ["shared-dev"])
+        self.assertEqual(self.lifecycle.reset_names, ["shared-dev"])
 
     def test_public_surface_does_not_expose_reset_even_to_root(self):
         response = self.request(
@@ -236,7 +229,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
         )
         self.assertFalse(response["ok"])
         self.assertEqual(response["error"]["code"], "forbidden")
-        self.assertEqual(self.reset_names, [])
+        self.assertEqual(self.lifecycle.reset_names, [])
 
     def test_root_operator_can_manage_environment_snapshots(self):
         cases = [
@@ -265,7 +258,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
             with self.subTest(operation=request["operation"]):
                 response = self.request(0, request)
                 self.assertEqual(response, {"ok": True, "result": expected})
-                self.assertEqual(self.snapshot_calls[-1], call)
+                self.assertEqual(self.lifecycle.snapshot_calls[-1], call)
 
         listed = self.request(
             0,
@@ -309,6 +302,25 @@ class AtlasControlProtocolTests(unittest.TestCase):
                 )
                 self.assertEqual(response["error"]["code"], "invalid_request")
 
+
+    def test_partial_request_expires_on_total_deadline(self):
+        server, client = socket.socketpair()
+        self.addCleanup(server.close)
+        self.addCleanup(client.close)
+        client.sendall(b"{")
+        with self.assertRaisesRegex(ValueError, "deadline"):
+            _read_request(server, timeout_seconds=0.01)
+
+    def test_wrong_protocol_version_is_rejected(self):
+        response = self.request(
+            23001,
+            {"version": 2, "operation": "environment.inspect-self"},
+        )
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], "unsupported_version")
+
+
+class EnvironmentLifecycleTests(unittest.TestCase):
     def _runtime_fixture(self, temporary_directory):
         runtime_root = Path(temporary_directory) / "environments"
         runtime_parent = runtime_root / ENVIRONMENTS["shared-dev"]["id"]
@@ -365,7 +377,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
             empty_mountinfo = Path(temporary_directory) / "empty-mountinfo"
             empty_mountinfo.touch()
 
-            with mock.patch("atlas_control.subprocess.run", side_effect=completed) as run:
+            with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed) as run:
                 _reset_environment(
                     environment,
                     runtime_root=str(runtime_root),
@@ -414,9 +426,9 @@ class AtlasControlProtocolTests(unittest.TestCase):
                 shutil.rmtree(path)
 
             with (
-                mock.patch("atlas_control._require_btrfs_subvolume"),
-                mock.patch("atlas_control._btrfs_snapshot", side_effect=create_snapshot),
-                mock.patch("atlas_control._delete_managed_tree", side_effect=delete_tree),
+                mock.patch("atlas.storage._require_btrfs_subvolume"),
+                mock.patch("atlas.storage._btrfs_snapshot", side_effect=create_snapshot),
+                mock.patch("atlas.storage._delete_managed_tree", side_effect=delete_tree),
             ):
                 _replace_btrfs_root(
                     source=source,
@@ -436,8 +448,8 @@ class AtlasControlProtocolTests(unittest.TestCase):
             root = Path(temporary_directory) / "rootfs"
             root.mkdir()
             with (
-                mock.patch("atlas_control._is_btrfs_subvolume", return_value=True),
-                mock.patch("atlas_control._run_btrfs") as run_btrfs,
+                mock.patch("atlas.storage._is_btrfs_subvolume", return_value=True),
+                mock.patch("atlas.storage._run_btrfs") as run_btrfs,
             ):
                 _delete_managed_tree(root, "btrfs-subvolume", "/bin/btrfs")
 
@@ -450,6 +462,29 @@ class AtlasControlProtocolTests(unittest.TestCase):
                 "--",
                 str(root),
             )
+
+    def test_btrfs_failure_logs_bounded_stderr_without_exposing_it(self):
+        diagnostic = b"filesystem full\n" + b"x" * (
+            MAX_BTRFS_DIAGNOSTIC_BYTES + 128
+        )
+        completed = subprocess.CompletedProcess(
+            ["/bin/btrfs", "subvolume", "delete"],
+            28,
+            stderr=diagnostic,
+        )
+        stderr = io.StringIO()
+
+        with (
+            mock.patch("atlas.storage.subprocess.run", return_value=completed),
+            mock.patch("sys.stderr", stderr),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            _run_btrfs("/bin/btrfs", "subvolume", "delete", "--", "/managed")
+
+        self.assertIsNone(raised.exception.stderr)
+        self.assertIn("filesystem full", stderr.getvalue())
+        self.assertIn("[truncated]", stderr.getvalue())
+        self.assertLess(len(stderr.getvalue()), MAX_BTRFS_DIAGNOSTIC_BYTES + 256)
 
     def test_pause_quiesces_an_activating_environment(self):
         states = iter(["activating", "inactive"])
@@ -469,7 +504,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0)
             raise AssertionError(f"unexpected command: {command}")
 
-        with mock.patch("atlas_control.subprocess.run", side_effect=run):
+        with mock.patch("atlas.lifecycle.subprocess.run", side_effect=run):
             should_resume = _pause_environment(
                 "/bin/systemctl",
                 "atlas-environment-shared\\x2ddev.service",
@@ -504,9 +539,9 @@ class AtlasControlProtocolTests(unittest.TestCase):
             ]
 
             with (
-                mock.patch("atlas_control.subprocess.run", side_effect=completed) as run,
-                mock.patch("atlas_control._require_btrfs_subvolume"),
-                mock.patch("atlas_control._replace_btrfs_root") as replace,
+                mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed) as run,
+                mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
+                mock.patch("atlas.lifecycle._replace_btrfs_root") as replace,
             ):
                 _reset_environment(
                     environment,
@@ -547,9 +582,9 @@ class AtlasControlProtocolTests(unittest.TestCase):
             ]
 
             with (
-                mock.patch("atlas_control.subprocess.run", side_effect=completed),
-                mock.patch("atlas_control._require_btrfs_subvolume"),
-                mock.patch("atlas_control._replace_btrfs_root") as replace,
+                mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed),
+                mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
+                mock.patch("atlas.lifecycle._replace_btrfs_root") as replace,
             ):
                 _reset_environment(
                     environment,
@@ -588,9 +623,9 @@ class AtlasControlProtocolTests(unittest.TestCase):
             ]
 
             with (
-                mock.patch("atlas_control.subprocess.run", side_effect=completed),
-                mock.patch("atlas_control._require_btrfs_subvolume"),
-                mock.patch("atlas_control._replace_btrfs_root") as replace,
+                mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed),
+                mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
+                mock.patch("atlas.lifecycle._replace_btrfs_root") as replace,
             ):
                 _reset_environment(
                     environment,
@@ -638,9 +673,9 @@ class AtlasControlProtocolTests(unittest.TestCase):
             ]
 
             with (
-                mock.patch("atlas_control.subprocess.run", side_effect=completed),
-                mock.patch("atlas_control._require_btrfs_subvolume"),
-                mock.patch("atlas_control._replace_btrfs_root") as replace,
+                mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed),
+                mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
+                mock.patch("atlas.lifecycle._replace_btrfs_root") as replace,
             ):
                 with self.assertRaisesRegex(RuntimeError, "expected applied seed"):
                     _reset_environment(
@@ -673,7 +708,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
             empty_mountinfo = Path(temporary_directory) / "empty-mountinfo"
             empty_mountinfo.touch()
 
-            with mock.patch("atlas_control.subprocess.run", side_effect=completed):
+            with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed):
                 _reset_environment(
                     environment,
                     runtime_root=str(runtime_root),
@@ -737,7 +772,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
                 subprocess.CompletedProcess([], 3),
             ]
 
-            with mock.patch("atlas_control.subprocess.run", side_effect=completed):
+            with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed):
                 with self.assertRaisesRegex(RuntimeError, "inspect mount state"):
                     _reset_environment(
                         environment,
@@ -757,7 +792,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
                 temporary_directory
             )
             with mock.patch(
-                "atlas_control.subprocess.run",
+                "atlas.lifecycle.subprocess.run",
                 side_effect=subprocess.CalledProcessError(1, ["systemctl", "stop"]),
             ):
                 with self.assertRaises(subprocess.CalledProcessError):
@@ -779,7 +814,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
                 subprocess.CompletedProcess([], 0),
                 subprocess.CompletedProcess([], 0),
             ]
-            with mock.patch("atlas_control.subprocess.run", side_effect=completed):
+            with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed):
                 with self.assertRaisesRegex(RuntimeError, "remains active"):
                     _reset_environment(
                         environment,
@@ -804,7 +839,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
                 subprocess.CompletedProcess([], 0),
                 subprocess.CompletedProcess([], 3),
             ]
-            with mock.patch("atlas_control.subprocess.run", side_effect=completed):
+            with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed):
                 with self.assertRaisesRegex(RuntimeError, "mounts remain"):
                     _reset_environment(
                         environment,
@@ -836,23 +871,6 @@ class AtlasControlProtocolTests(unittest.TestCase):
                     systemctl="/bin/systemctl",
                 )
             self.assertTrue(outside.exists())
-
-    def test_partial_request_expires_on_total_deadline(self):
-        server, client = socket.socketpair()
-        self.addCleanup(server.close)
-        self.addCleanup(client.close)
-        client.sendall(b"{")
-        with self.assertRaisesRegex(ValueError, "deadline"):
-            _read_request(server, timeout_seconds=0.01)
-
-    def test_wrong_protocol_version_is_rejected(self):
-        response = self.request(
-            23001,
-            {"version": 2, "operation": "environment.inspect-self"},
-        )
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error"]["code"], "unsupported_version")
-
 
 if __name__ == "__main__":
     unittest.main()

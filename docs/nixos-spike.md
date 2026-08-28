@@ -52,6 +52,13 @@ The reusable `atlas.host` module currently declares:
 - `environments`
 - the read-only machine contract
 
+The module serializes that declaration into the versioned host contract. The
+Python package under `src/atlas` consumes the contract through three internal
+seams: `control` owns the local protocol and peer-derived authorization,
+`lifecycle` owns reset and snapshot orchestration, and `storage` owns directory
+and Btrfs mechanics. This is an implementation boundary, not a new product
+primitive or a remote-management protocol.
+
 Contract version 7 separates three kinds of fact:
 
 - `intent.primitives` names the six product primitives: host, environment,
@@ -344,26 +351,12 @@ docker volume create atlas-nix-store
 For the physical live-image flow and its security limits, see
 [Physical host v0](physical-host-v0.md).
 
-## Architecture decision sequence
+## Architecture decision boundary
 
-NixOS is now used as a provisional vehicle to answer the product question. The
-next gates are:
+The [roadmap](roadmap.md) is the sole authority for future implementation order.
+This report records NixOS-adapter evidence and the unproven gaps above rather
+than maintaining a second sequence.
 
-1. Boot the live image on one representative x86 computer and validate entry
-   to `atlas-shared-dev` through interactive Tailscale SSH and one existing
-   client such as Herdr, without a public listener.
-2. Put the persistent root behavior on physical encrypted storage with one
-   declared automatic or operator-assisted unlock mode, a protected host
-   recovery reserve, automatic primary durable owner storage, recovery
-   behavior, and optional quotas for additional environments.
-3. Replace declarative-only environment creation with a small runtime manager
-   that preserves the same entry and peer-derived identity interface.
-4. Implement the [Authenticated Surface v0](authenticated-surface-v0.md)
-   contract, add one tailnet-private route, and prove a second environment
-   cannot cross those boundaries.
-5. Port that concrete behavior to a bootc/OCI spike and compare host definition,
-   installation, updates, rollback, recovery, toolchain delivery, and operator
-   complexity.
-
-The base should be selected from equivalent product behavior, not before that
-behavior exists.
+NixOS remains a provisional vehicle. Compare it with a bootc/OCI host only after
+the required product behavior is concrete enough to port and measure on both
+adapters.

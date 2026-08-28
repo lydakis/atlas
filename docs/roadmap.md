@@ -75,19 +75,32 @@ discoverable policy. Atlas must not silently classify ordinary home or root
 filesystem contents as volatile. Deliberately ephemeral environments may exist
 later, but they are an opt-in policy rather than the default experience.
 
-## Ordered product proofs
+## Product proof critical path
+
+The table records the dependency-shaped path through the next product proofs.
+Work may overlap when interfaces are stable, but Atlas does not claim a later
+proof until its prerequisites have been demonstrated.
 
 | Order | Proof | Exit evidence | State |
 | --- | --- | --- | --- |
-| 1 | Persistent physical storage | An elastic disk-backed resettable root and automatically attached encrypted owner storage survive reboot and supported update; reset preserves owner data; storage layout protects host recovery capacity | in progress |
+| 1 | Physical alpha | A selected x86 machine installs encrypted persistent Atlas state with one declared unlock mode and protected host recovery capacity, enrolls privately, exposes automatic durable owner storage to the default environment, and survives reboot and reset without losing owner data | in progress |
 | 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or metadata endpoints without policy; intended public egress still works | queued |
-| 3 | Private route | One explicitly selected environment port is reachable from an authorized paired device without a public listener or arbitrary upstream target | queued |
-| 4 | Authenticated browser surface | An agent operates one isolated browser identity while the operator can observe, take over, return control, and revoke access | queued |
-| 5 | Narrow grant | One source credential remains outside the environment while a broker performs a bounded operation or issues a short-lived derivative | queued |
-| 6 | Existing-client dogfood | Herdr or Codex uses the complete flow on representative physical hardware without adopting an Atlas project, task, or conversation model | queued |
-| 7 | Runtime environment definitions | The control plane creates, inspects, resets, and deletes definitions and instances without weakening peer-derived identity or storage guarantees | later |
-| 8 | Portable environment declaration | A backend-independent, non-secret seed maps to the definition model; import requires explicit operator or client action and has no imperative setup hook | later |
-| 9 | Host-base comparison | The same proven behavior is ported to a bootc/OCI host and compared with the NixOS adapter on installation, update, rollback, recovery, and complexity | later |
+| 3 | Paired operator control | A controller device is explicitly paired, receives a revocable identity, and can inspect, reset, and snapshot environments over a private transport; tailnet membership alone grants no Atlas authority | queued |
+| 4 | Private route | One explicitly selected environment port is reachable from an authorized paired device without a public listener or arbitrary upstream target | queued |
+| 5 | Authenticated browser surface | An agent operates one isolated browser identity while the operator can observe, take over, return control, and revoke access | queued |
+| 6 | Narrow grant | One source credential remains outside the environment while a broker performs a bounded operation or issues a short-lived derivative | queued |
+| 7 | Existing-client dogfood | Herdr or Codex uses the complete flow on representative physical hardware without adopting an Atlas project, task, or conversation model | queued |
+| 8 | Runtime environment definitions | The control plane creates, inspects, resets, and deletes definitions and instances without weakening peer-derived identity or storage guarantees | later |
+| 9 | Portable environment declaration | A backend-independent, non-secret seed maps to the definition model; import requires explicit operator or client action and has no imperative setup hook | later |
+| 10 | Host-base comparison | The same proven behavior is ported to a bootc/OCI host and compared with the NixOS adapter on installation, update, rollback, recovery, and complexity | later |
+
+### Parallel storage hardening
+
+After the physical alpha establishes the installed storage layout, harden it in
+parallel with proofs 2–5. Supported update and recovery, power-loss and
+metadata-exhaustion testing, and backup and restore are required before Atlas is
+treated as broadly operable. Optional quotas for additional environments are a
+later policy unless real multi-environment use makes them necessary sooner.
 
 ## Current spike gaps
 
@@ -113,7 +126,7 @@ hardware recovery remain unproven.
 - The read-only host Nix store remains visible inside environments for declared
   tools.
 - There is no route proxy, browser service, grant broker, persistent installer,
-  or encrypted recovery path yet.
+  paired-device authority, or encrypted recovery path yet.
 
 ## Product questions still open
 

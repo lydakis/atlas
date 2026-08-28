@@ -689,22 +689,16 @@ product behavior rather than choose a base from image mechanics alone.
 
 ## Delivery sequence
 
-1. **Physical host:** persistent installation, private enrollment, SSH,
-   encrypted state with a declared unlock mode, update, and recovery.
-2. **Environment:** one resettable Linux compartment that an existing agent
-   client can use as a normal remote target and mutate as root without gaining
-   host root.
-3. **Volume:** durable project data that survives environment reset, reboot,
-   update, and recovery according to declared policy.
-4. **Surface:** one isolated browser profile with observation, recording, and
-   exclusive takeover.
-5. **Grant:** authenticate one low-risk browser identity, then add one narrow
-   brokered service credential.
-6. **Route:** expose one environment service privately through the tailnet.
-7. **Isolation proof:** demonstrate that a second environment cannot cross any
-   unmounted volume, process, profile, grant, surface, route, or resource
-   boundary.
-8. **Reconstruction:** reboot and update without losing state declared durable.
+The [roadmap](roadmap.md) is the sole authority for implementation order and
+current status. This thesis defines the end-to-end product outcome rather than
+duplicating that sequence.
+
+The end-to-end proof still composes the same primitives: a physical host, one
+ordinary resettable environment, durable owner storage, a private route, an
+isolated browser surface, and narrowly brokered authority. It must demonstrate
+that a second environment cannot cross any unmounted volume, process, profile,
+grant, surface, route, or resource boundary, and that reboot and supported
+update preserve every state class Atlas declares durable.
 
 The [Authenticated Surface v0](authenticated-surface-v0.md) contract supplies
 the security boundary for the environment, surface, and browser-grant steps
