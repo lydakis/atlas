@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Sync the working tree (including uncommitted changes) to a Linux host that
+# has Nix and /dev/kvm, then run Nix commands there. KVM-accelerated VM tests
+# run several times faster than the software-emulated QEMU path available
+# inside Docker on Apple Silicon.
+#
+# Usage:
+#   scripts/remote-check                    # nix flake check on the remote host
+#   scripts/remote-check build .#checks.x86_64-linux.host-contract
+#   scripts/remote-check build .#checks.x86_64-linux.installed-host --no-link
+#
+# Configuration:
+#   ATLAS_BUILD_HOST  ssh destination for the build host (default: cabal)
+#   ATLAS_BUILD_DIR   remote temporary-workspace parent (default: ~/atlas-remote-check)
+set -euo pipefail
+
+host="${ATLAS_BUILD_HOST:-cabal}"
+remote_dir="${ATLAS_BUILD_DIR:-atlas-remote-check}"
+workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ ! "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._@:-]*$ ]]; then
+  echo "ATLAS_BUILD_HOST must be a simple SSH destination" >&2
+  exit 2
+fi
+
+# Temporary workspaces are intentionally confined to one child of the remote
+# user's home. Never allow ATLAS_BUILD_DIR to select '.', '..', an absolute
+# path, or a nested path.
+if [[ ! "$remote_dir" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+  [[ "$remote_dir" == "." || "$remote_dir" == ".." ]]; then
+  echo "ATLAS_BUILD_DIR must be one safe directory name under the remote home" >&2
+  exit 2
+fi
+
+remote_workspace="$(
+  ssh "$host" "mkdir -p '$remote_dir' && mktemp -d '$remote_dir/worktree.XXXXXXXX'"
+)"
+if [[ ! "$remote_workspace" =~ ^${remote_dir}/worktree\.[A-Za-z0-9]+$ ]]; then
+  echo "Remote host returned an unsafe temporary workspace path" >&2
+  exit 1
+fi
+
+cleanup() {
+  ssh "$host" "rm -rf -- '$remote_workspace'; rmdir '$remote_dir' 2>/dev/null || true" \
+    >/dev/null 2>&1 || true
+}
+trap cleanup EXIT HUP INT TERM
+
+# Build the transfer from Git's view of the working tree. This includes tracked
+# files plus non-ignored untracked files, including the exact uncommitted slice,
+# without copying ignored credentials, caches, logs, or destination metadata.
+git -C "$workspace_root" ls-files -z --cached --others --exclude-standard |
+  while IFS= read -r -d '' path; do
+    # A cached path may have been deleted in the working tree. The fresh remote
+    # workspace already represents that deletion, so omit the absent source.
+    if [[ -e "$workspace_root/$path" || -L "$workspace_root/$path" ]]; then
+      printf '%s\0' "$path"
+    fi
+  done |
+  rsync -a --from0 --files-from=- \
+    "${workspace_root}/" "${host}:${remote_workspace}/"
+
+if [ "$#" -eq 0 ]; then
+  set -- flake check path:.
+else
+  remote_arguments=()
+  for argument in "$@"; do
+    case "$argument" in
+      .)
+        remote_arguments+=("path:.")
+        ;;
+      .\#*)
+        remote_arguments+=("path:$argument")
+        ;;
+      *)
+        remote_arguments+=("$argument")
+        ;;
+    esac
+  done
+  set -- "${remote_arguments[@]}"
+fi
+
+ssh "${host}" "cd '${remote_workspace}' && nix --extra-experimental-features 'nix-command flakes' $(printf '%q ' "$@")"

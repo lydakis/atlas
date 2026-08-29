@@ -105,6 +105,7 @@ nix flake check --all-systems --no-build
 nix build .#checks.aarch64-linux.control-unit
 nix build .#checks.aarch64-linux.module-evaluation
 nix build .#checks.aarch64-linux.host-contract
+nix build .#checks.x86_64-linux.installed-host
 nix fmt -- --check
 ```
 

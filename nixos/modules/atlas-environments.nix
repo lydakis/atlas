@@ -252,12 +252,12 @@ let
       copyOnWrite = btrfsStorage;
       snapshots = btrfsStorage;
       rollback = btrfsStorage;
-      hostRecoveryReserve = false;
+      hostRecoveryReserve = cfg.storage.hostRecoveryReserve;
       rootPersistsAcrossReboot = dataRootPersistent;
       resettable = true;
       atRestEncryption = {
-        mode = "none";
-        status = "degraded";
+        mode = cfg.storage.atRestEncryption;
+        status = if cfg.storage.atRestEncryption == "none" then "degraded" else "experimental";
       };
     };
     networkIsolation = {
@@ -848,6 +848,27 @@ in
       description = ''
         Host storage mechanism for resettable environment roots and durable
         volumes. The Btrfs adapter requires /var/lib/atlas to reside on Btrfs.
+      '';
+    };
+
+    storage.atRestEncryption = mkOption {
+      default = "none";
+      type = types.enum [
+        "none"
+        "luks2-operator-passphrase"
+      ];
+      description = ''
+        Deployment fact describing encryption for persistent Atlas state. This
+        reports a configured mechanism; runtime tests must establish evidence.
+      '';
+    };
+
+    storage.hostRecoveryReserve = mkOption {
+      default = false;
+      type = types.bool;
+      description = ''
+        Whether the deployment places Atlas data on a capacity boundary that
+        cannot consume the host filesystem's recovery space.
       '';
     };
 

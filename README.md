@@ -46,6 +46,9 @@ includes:
 
 - a pinned NixOS 26.05 configuration for `aarch64-linux` and `x86_64-linux`
 - buildable headless QEMU VM and physical live-ISO outputs
+- a parameterized x86 installed-storage module requiring installer-generated
+  device UUIDs, with UEFI boot, one LUKS2 container, and separate fixed host
+  and elastic Btrfs data logical volumes
 - a reusable `atlas.host` NixOS module
 - a versioned static host contract at `/etc/atlas/host-contract.json` that
   separates product intent, implemented primitives, and configured mechanisms
@@ -77,6 +80,9 @@ includes:
   elastic Btrfs storage, root snapshot restore, volatile-state reconstruction,
   active-workload reset, identity, isolation, update, rollback, and
   durable-volume preservation
+- an x86 KVM installed-disk acceptance test covering offline installation,
+  encrypted boot, storage-capacity separation, reboot, reset, and declared
+  durable-volume preservation
 - an earlier live-tailnet dogfood run using ordinary Tailscale SSH and Herdr's
   remote thin client against the preceding fixed-login adapter
 
@@ -95,9 +101,10 @@ create environment definitions or volumes at runtime. There is no operator
 console, browser service, grant broker, route proxy, audit service, or update
 controller.
 The ISO can exercise interactive Tailscale enrollment on hardware, but it is a
-live boot artifact rather than a persistent installer or production image. Disk
-encryption, Secure Boot, signed releases, automatic failed-update recovery, and
-physical-hardware validation remain future work.
+live boot artifact rather than a persistent installer or production image. An
+encrypted installed-disk layout now passes in x86 KVM using a test-only initrd
+key; the real operator passphrase ceremony, physical hardware, Secure Boot,
+signed releases, and automatic failed-update recovery remain unproven.
 
 Each environment now has one persistent nspawn service. Entries join that
 service through Linux namespaces and a delegated session cgroup, so concurrent
@@ -124,6 +131,7 @@ nix flake check --all-systems --no-build
 nix build .#checks.aarch64-linux.control-unit
 nix build .#checks.aarch64-linux.module-evaluation
 nix build .#checks.aarch64-linux.host-contract
+nix build .#checks.x86_64-linux.installed-host
 nix build .#packages.aarch64-linux.vm
 nix build .#packages.aarch64-linux.physical-iso
 ```
@@ -141,6 +149,19 @@ docker volume create atlas-nix-store
 ```
 
 Replace `aarch64-linux` with `x86_64-linux` for an x86 output.
+
+The Docker path on Apple Silicon runs the VM tests under software-emulated
+QEMU with no KVM. If a Linux machine with Nix and `/dev/kvm` is reachable over
+SSH, `scripts/remote-check` syncs the working tree there and runs checks with
+hardware acceleration instead:
+
+```bash
+scripts/remote-check                                        # nix flake check
+scripts/remote-check build .#checks.x86_64-linux.host-contract
+scripts/remote-check build .#checks.x86_64-linux.installed-host --no-link
+```
+
+Set `ATLAS_BUILD_HOST` to choose the ssh destination.
 
 ## Design principles
 

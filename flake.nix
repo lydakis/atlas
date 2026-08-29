@@ -12,6 +12,13 @@
       ];
 
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      installedTestUnlockKey = "atlas-test-only-passphrase";
+      installedTestStorageIds = {
+        luksUuid = "11111111-2222-4333-8444-555555555555";
+        bootUuid = "A71A-5001";
+        hostUuid = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        dataUuid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+      };
 
       mkHost =
         system: extraModules:
@@ -45,9 +52,33 @@
             services.getty.autologinUser = "atlas-operator";
           }
         ];
+
+      mkInstalledTestHost =
+        system:
+        mkHost system [
+          ./nixos/configurations/installed-host-storage.nix
+          "${nixpkgs}/nixos/modules/testing/test-instrumentation.nix"
+          (
+            { pkgs, ... }:
+            let
+              keyFile = pkgs.writeText "atlas-installed-test-luks-key" installedTestUnlockKey;
+            in
+            {
+              atlas.host.installedStorage = installedTestStorageIds;
+
+              # Automated VM boot uses a test-only initrd key. The reusable
+              # installed-storage module remains operator-passphrase only.
+              boot.initrd = {
+                luks.devices.atlas-crypt.keyFile = "/atlas-installed-test-luks-key";
+                secrets."/atlas-installed-test-luks-key" = keyFile;
+              };
+            }
+          )
+        ];
     in
     {
       nixosModules.default = import ./nixos/modules/atlas-host.nix;
+      nixosModules.installed-storage = import ./nixos/configurations/installed-host-storage.nix;
 
       nixosConfigurations = {
         atlas-spike-aarch64 = mkVMHost "aarch64-linux";
@@ -99,12 +130,18 @@
           control-unit =
             pkgs.runCommand "atlas-control-unit"
               {
-                nativeBuildInputs = [ pkgs.python3 ];
+                nativeBuildInputs = [
+                  pkgs.bash
+                  pkgs.git
+                  pkgs.python3
+                ];
               }
               ''
-                mkdir -p work/src work/tests
+                mkdir -p work/scripts work/src work/tests
                 cp -r ${./src/atlas} work/src/atlas
                 cp ${./tests/test_atlas_control.py} work/tests/test_atlas_control.py
+                cp ${./tests/test_remote_check.py} work/tests/test_remote_check.py
+                install -m 0755 ${./scripts/remote-check} work/scripts/remote-check
                 cd work
                 python3 -m unittest discover -s tests -v
                 touch "$out"
@@ -113,10 +150,24 @@
             inherit pkgs;
             inherit (nixpkgs) lib;
             atlasModule = self.nixosModules.default;
+            installedStorageModule = self.nixosModules.installed-storage;
           };
           host-contract = import ./nixos/tests/host-contract.nix {
             inherit pkgs;
             atlasModule = self.nixosModules.default;
+          };
+        }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          # The physical alpha targets generic x86 hardware. Keep this slow
+          # installed-disk acceptance proof off unrelated architectures.
+          installed-host = import ./nixos/tests/installed-host.nix {
+            inherit
+              nixpkgs
+              pkgs
+              installedTestStorageIds
+              installedTestUnlockKey
+              ;
+            installedSystem = (mkInstalledTestHost system).config.system.build.toplevel;
           };
         }
       );

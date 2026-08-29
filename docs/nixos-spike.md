@@ -1,7 +1,7 @@
 # NixOS host architecture spike
 
-Status: elastic Btrfs-backed Environment Entry v0 with root snapshots validated
-in QEMU, encrypted physical storage pending
+Status: elastic Btrfs-backed Environment Entry v0 plus encrypted installed-disk
+layout validated in QEMU; physical hardware pending
 
 ## Outcome
 
@@ -225,11 +225,31 @@ dedicated Btrfs data disk and has validated:
 - resettable root and durable-volume state surviving generation switch and
   rollback
 
-The adapter reports shared-host networking, encryption, and storage-reserve
-policy as degraded. Resettable roots and named volumes live on the dedicated
-Btrfs data filesystem, but it is not yet encrypted, full-filesystem recovery is
-untested, Atlas does not yet claim protected recovery capacity, and optional
-multi-environment quotas are absent.
+The development adapter reports shared-host networking, encryption, and
+storage-reserve policy as degraded. Its resettable roots and named volumes live
+on a dedicated but unencrypted Btrfs data filesystem.
+
+The parameterized x86 installed-storage module is a separate physical-alpha
+proof. On August 29, 2026, one fully instantiated KVM acceptance test passed
+after it:
+
+- partitioned a disposable 12 GiB GPT disk and installed the declared system
+  offline
+- booted through UEFI from a LUKS2 container
+- resolved the LUKS container and all filesystems through test-installation
+  UUIDs rather than reusable labels
+- exposed a fixed 6 GiB ext4 host logical volume and used the remaining LVM
+  capacity for the Btrfs Atlas data filesystem
+- verified the active dm-crypt mapping, distinct mount sources, and reported
+  encryption and host-recovery-reserve mechanisms
+- preserved resettable environment state and durable owner data across reboot
+- reset the environment root while preserving the declared work volume
+
+The automated guest uses a harmless test-only initrd key so the test driver can
+boot without a human. The reusable installed-storage module embeds no key and
+declares operator-passphrase unlock; the KVM instantiation adds only the test
+key. Therefore the test proves the encrypted layout and lifecycle, not the
+physical prompt or recovery ceremony.
 
 Tool isolation is also reported as degraded. The environment has an ordinary
 Ubuntu filesystem and package manager, while declared Nix tools are available
@@ -297,11 +317,14 @@ policy must treat it accordingly.
 - Tailnet policy revocation, long-lived SSH reconnection, and network-change
   behavior have not yet been tested.
 - No physical hardware has booted the revised image.
-- `/var/lib/atlas` is not a dedicated encrypted partition with unlock, backup,
-  and recovery behavior.
-- Resettable roots and durable volumes share the Atlas data filesystem. Atlas
-  does not yet protect host recovery capacity or offer optional quotas for
-  additional environments, volumes, logs, recordings, and caches.
+- The installed-host layout has not been exercised through a user-facing
+  installer, human passphrase prompt, recovery key, backup, power-loss, or
+  metadata-exhaustion flow.
+- Resettable roots and durable volumes share the Atlas data filesystem. The
+  fixed host logical volume protects capacity structurally in KVM, but recovery
+  under real full-disk pressure and optional quotas remain unproven.
+- The spike still requires a declared volume; automatic per-owner durable
+  storage is not implemented.
 - `/home/agent` is still a prototype path for mapped root. The human owner
   account, conventional home layout, and environment-local elevation contract
   remain undecided.
@@ -331,6 +354,7 @@ nix flake check --all-systems --no-build
 nix build .#checks.aarch64-linux.control-unit
 nix build .#checks.aarch64-linux.module-evaluation
 nix build .#checks.aarch64-linux.host-contract
+nix build .#checks.x86_64-linux.installed-host
 nix build .#packages.aarch64-linux.vm
 nix build .#packages.aarch64-linux.physical-iso
 ```

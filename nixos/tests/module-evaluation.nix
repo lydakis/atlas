@@ -1,5 +1,6 @@
 {
   atlasModule,
+  installedStorageModule,
   lib,
   pkgs,
 }:
@@ -34,6 +35,29 @@ let
   volatileStateHost = mkHost {
     atlas.host.dataRootPersistence = "volatile-live-image";
     atlas.host.storage.adapter = lib.mkForce "host-directory";
+  };
+
+  encryptedStorageHost = mkHost {
+    atlas.host.storage = {
+      atRestEncryption = "luks2-operator-passphrase";
+      hostRecoveryReserve = true;
+    };
+  };
+
+  installedStorageIds = {
+    luksUuid = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
+    bootUuid = "a71a-5001";
+    hostUuid = "BBBBBBBB-CCCC-4DDD-8EEE-FFFFFFFFFFFF";
+    dataUuid = "CCCCCCCC-DDDD-4EEE-8FFF-AAAAAAAAAAAA";
+  };
+  installedStorageHost = lib.nixosSystem {
+    system = pkgs.stdenv.hostPlatform.system;
+    modules = [
+      atlasModule
+      installedStorageModule
+      ../configurations/spike-host.nix
+      { atlas.host.installedStorage = installedStorageIds; }
+    ];
   };
 
   packageCompositionHost = mkHost {
@@ -346,6 +370,23 @@ assert hasFailedMessage "RFC 4122 UUIDs" {
 assert disabledContract.configuration.connectivity.tailscale.adapterEnabled == false;
 assert disabledContract.configuration.connectivity.tailscale.sshRequested == false;
 assert disabledContract.configuration.connectivity.tailscale.enrollmentMode == "disabled";
+assert defaultHost.config.atlas.host.storage.hostRecoveryReserve == false;
+assert defaultHost.config.atlas.host.storage.atRestEncryption == "none";
+assert encryptedStorageHost.config.atlas.host.storage.hostRecoveryReserve;
+assert
+  encryptedStorageHost.config.atlas.host.storage.atRestEncryption == "luks2-operator-passphrase";
+assert
+  installedStorageHost.config.boot.initrd.luks.devices.atlas-crypt.device
+  == "/dev/disk/by-uuid/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+assert
+  installedStorageHost.config.fileSystems."/".device
+  == "/dev/disk/by-uuid/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+assert
+  installedStorageHost.config.fileSystems."/boot".device
+  == "/dev/disk/by-uuid/A71A-5001";
+assert
+  installedStorageHost.config.fileSystems."/var/lib/atlas".device
+  == "/dev/disk/by-uuid/cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa";
 assert volatileContract.state.persistence == "volatile-live-image";
 assert volatileContract.state.storageAdapter == "host-directory";
 assert volatileContract.configuration.environmentEntry.adapter == "nixos-nspawn-directory-v0";

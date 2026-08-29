@@ -105,9 +105,9 @@ later policy unless real multi-environment use makes them necessary sooner.
 ## Current spike gaps
 
 The NixOS adapter is evidence for lifecycle, identity, reset, volume separation,
-reboot-persistent machine state, and copy-on-write root recovery. The first
-physical adapter target is Btrfs, but encryption, installed-disk layout, and
-hardware recovery remain unproven.
+reboot-persistent machine state, copy-on-write root recovery, and an x86
+KVM-installed encrypted storage layout. Physical installation, the human unlock
+ceremony, and hardware recovery remain unproven.
 
 - Persistent development and contract-test VMs mount a dedicated Btrfs data disk
   at `/var/lib/atlas`. Environment roots, applied seeds, named root snapshots,
@@ -115,9 +115,15 @@ hardware recovery remain unproven.
   quota.
 - The live ISO retains the directory adapter and truthfully reports snapshots
   and rollback as unavailable.
-- The physical image remains a live ISO. `/var/lib/atlas` is not encrypted,
-  host recovery capacity is not protected, primary durable owner storage is not
-  created automatically, and power-loss and recovery behavior are untested.
+- The parameterized installed-storage module places the host and Atlas data in
+  one LUKS2 container, with a fixed host logical volume and an elastic Btrfs data
+  logical volume. It requires installer-generated device UUIDs rather than
+  trusting reusable labels. KVM proves one fully instantiated installation,
+  unattended test-key boot, reboot, reset, and durable-volume survival. The live
+  ISO still does not install this layout, and the operator-passphrase ceremony,
+  physical hardware, power-loss, recovery, and metadata-exhaustion behavior are
+  untested. The test preserves a declared work volume; automatic per-owner
+  durable storage is still absent.
 - `/home/agent` remains a spike convention for mapped root, not the product
   identity. The owner account, conventional home layout, and environment-local
   elevation contract remain open.
@@ -130,9 +136,9 @@ hardware recovery remain unproven.
 
 ## Product questions still open
 
-- Which encrypted installed-disk layout best protects host recovery capacity
-  when the elastic Btrfs data filesystem is full, and which optional quota
-  policy is acceptable for additional environments?
+- How much fixed host capacity should the first hardware profile reserve, how
+  should it recover when the elastic Btrfs data filesystem is full, and which
+  optional quota policy is acceptable for additional environments?
 - How should the human owner account, conventional home, and environment-local
   elevation work without turning agents into identities?
 - Which environment backend is sufficient for the first trust model, and when

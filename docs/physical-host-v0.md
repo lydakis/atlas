@@ -1,6 +1,6 @@
 # Physical host v0
 
-Status: live-image dogfood path, August 2026
+Status: live-image dogfood path plus installed-layout KVM proof, August 2026
 
 Atlas targets a physical computer dedicated primarily to agents. The current
 artifact is deliberately smaller than that product: it is a non-persistent live
@@ -9,6 +9,33 @@ host policy, and two isolated demonstration environments on representative
 hardware.
 
 It does not install Atlas to disk or preserve state across a power cycle.
+
+## Installed-layout proof
+
+The repository exposes a parameterized installed-storage module and tests one
+fully instantiated disk layout in an x86 KVM guest. The acceptance test creates
+a GPT disk, generates the test installation's device identities, installs NixOS
+offline, and boots from:
+
+```text
+UEFI system partition
+LUKS2 atlas-crypt
+├── fixed ext4 host logical volume
+└── remaining-space Btrfs Atlas data logical volume
+```
+
+It verifies that encryption is active, every mount resolves through the exact
+UUID supplied by the installation, the host and Atlas data mounts have different
+backing logical volumes, resettable and durable state survive reboot, and
+environment reset removes root drift while preserving the declared durable work
+volume that Atlas mounts. The automated guest uses a test-only key embedded in
+its initrd. The reusable module embeds no key and declares operator-passphrase
+unlock.
+
+This is evidence for the layout and lifecycle, not a user-facing installer or
+physical-hardware result. The operator prompt, recovery key flow, full-disk and
+metadata exhaustion, power loss, Secure Boot, and hardware compatibility remain
+untested. Automatic per-owner durable storage is also not implemented.
 
 ## Build the image
 
@@ -108,7 +135,8 @@ The next artifact must install to an explicitly selected disk and define:
 - preservation of environments, browser profiles, grants, routes, and records
 - a factory-reset operation that is explicit and recoverable where possible
 
-Disk installation is intentionally not automated until those choices are made.
-An installed, encrypted state boundary with one declared and tested unlock and
-recovery mode is a prerequisite for the
+Disk installation exists only inside the destructive, disposable VM acceptance
+test. It is not yet exposed as a user-facing installer. A physical installed,
+encrypted state boundary with one tested operator unlock and recovery mode is a
+prerequisite for the
 [Authenticated Surface v0](authenticated-surface-v0.md) milestone.
