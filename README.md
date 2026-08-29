@@ -62,12 +62,15 @@ includes:
   Noble compartments supervised by systemd
 - resettable environment roots, with explicit durable volumes composed inside
   their ordinary Linux view and shareable across selected environments
+- a configurable human-owner account at `/home/<owner>`, with one automatic
+  durable home volume and resettable `~/.config`, `~/.cache`, `~/.local/bin`,
+  and `~/.local/state` views per environment
 - elastic Btrfs environment roots under `/var/lib/atlas` that preserve ordinary
   machine state across reboot without an arbitrary default quota
 - read-only applied seeds plus root snapshot, restore, and delete operations;
   durable volumes remain outside root snapshots
-- mapped root inside an environment, so agents can install ordinary Debian
-  packages and mutate their OS without receiving host root
+- passwordless `sudo` for the human-owner account inside an environment, so
+  agents can administer ordinary Ubuntu without receiving Atlas-host root
 - a peer-authenticated read-only control socket for doctor, list, and inspect,
   plus a separate root-only lifecycle socket for environment reset and root
   snapshots
@@ -78,11 +81,12 @@ includes:
 - a QEMU integration test covering persistent and concurrent entry,
   composition, shared-volume access, package installation, host reboot,
   elastic Btrfs storage, root snapshot restore, volatile-state reconstruction,
-  active-workload reset, identity, isolation, update, rollback, and
-  durable-volume preservation
+  active-workload reset, normal-owner identity and environment-local sudo,
+  durable-home composition, isolation, update, rollback, and durable-volume
+  preservation
 - an x86 KVM installed-disk acceptance test covering offline installation,
-  encrypted boot, storage-capacity separation, reboot, reset, and declared
-  durable-volume preservation
+  encrypted boot, storage-capacity separation, reboot, reset, automatic owner
+  home preservation, and declared durable-volume preservation
 - an earlier live-tailnet dogfood run using ordinary Tailscale SSH and Herdr's
   remote thin client against the preceding fixed-login adapter
 
@@ -151,17 +155,19 @@ docker volume create atlas-nix-store
 Replace `aarch64-linux` with `x86_64-linux` for an x86 output.
 
 The Docker path on Apple Silicon runs the VM tests under software-emulated
-QEMU with no KVM. If a Linux machine with Nix and `/dev/kvm` is reachable over
-SSH, `scripts/remote-check` syncs the working tree there and runs checks with
-hardware acceleration instead:
+QEMU with no KVM. When Errand can reach a Linux machine with Nix and `/dev/kvm`,
+`scripts/remote-check` safely snapshots the Git working tree, streams the
+remote logs, and verifies job cleanup. Build outputs remain remote, so use
+`--no-link` for build checks:
 
 ```bash
 scripts/remote-check                                        # nix flake check
-scripts/remote-check build .#checks.x86_64-linux.host-contract
+scripts/remote-check build .#checks.x86_64-linux.host-contract --no-link
 scripts/remote-check build .#checks.x86_64-linux.installed-host --no-link
 ```
 
-Set `ATLAS_BUILD_HOST` to choose the ssh destination.
+The default Errand destination is `cabal`. Set `ATLAS_ERRAND_HOST` to choose a
+different destination.
 
 ## Design principles
 

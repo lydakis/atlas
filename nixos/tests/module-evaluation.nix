@@ -44,6 +44,14 @@ let
     };
   };
 
+  alternateOwnerHomeHost = mkHost {
+    atlas.host.owner.homeVolumeId = lib.mkForce "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  };
+
+  sharedWithoutOwnerHomeHost = mkHost {
+    atlas.host.environments.shared-dev.ownerHome = lib.mkForce false;
+  };
+
   installedStorageIds = {
     luksUuid = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE";
     bootUuid = "a71a-5001";
@@ -190,7 +198,7 @@ assert defaultContract.configuration.connectivity.openSshConfigured == false;
 assert defaultContract.configuration.connectivity.tailscale.adapterEnabled == true;
 assert defaultContract.configuration.connectivity.tailscale.sshRequested == true;
 assert defaultContract.configuration.connectivity.tailscale.enrollmentMode == "interactive";
-assert defaultContract.configuration.environmentEntry.version == 5;
+assert defaultContract.configuration.environmentEntry.version == 6;
 assert defaultContract.configuration.environmentEntry.adapter == "nixos-nspawn-btrfs-v0";
 assert defaultContract.configuration.environmentEntry.composition.declarative == true;
 assert defaultContract.configuration.environmentEntry.composition.runtimeCreation == false;
@@ -200,13 +208,25 @@ assert defaultContract.configuration.environmentEntry.composition.rebootPersiste
 assert defaultContract.configuration.environmentEntry.composition.durableVolumes == true;
 assert defaultContract.configuration.environmentEntry.composition.persistentInstances == true;
 assert defaultContract.configuration.environmentEntry.composition.concurrentEntry == true;
+assert defaultContract.configuration.environmentEntry.composition.durableOwnerHome == true;
+assert defaultContract.configuration.environmentEntry.composition.resettableHomePaths == true;
+assert
+  defaultContract.configuration.environmentEntry.owner == {
+    home = "/home/owner";
+    homeStorage = {
+      durability = "host-durable";
+      hostPath = "/var/lib/atlas/volumes/dddddddd-dddd-4ddd-8ddd-dddddddddddd/data";
+      id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    };
+    name = "owner";
+    uid = 1000;
+  };
 assert
   defaultContract.configuration.environmentEntry.volumes.projects == {
     durability = "host-durable";
     hostPath = "/var/lib/atlas/volumes/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/data";
     id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     name = "projects";
-    owner = "operator";
   };
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.variables == {
@@ -234,18 +254,56 @@ assert
   defaultContract.configuration.environmentEntry.environments.personal-dev.git.config.user.email
   == "george@lydakis.me";
 assert defaultContract.configuration.environmentEntry.environments.restricted.packages == { };
+assert defaultContract.configuration.environmentEntry.environments.shared-dev.home == "/home/owner";
+assert
+  defaultContract.configuration.environmentEntry.environments.shared-dev.homeComposition == {
+    durable = true;
+    durableHostPath = "/var/lib/atlas/volumes/dddddddd-dddd-4ddd-8ddd-dddddddddddd/data";
+    resettablePaths = [
+      ".cache"
+      ".config"
+      ".local/bin"
+      ".local/state"
+    ];
+  };
+assert
+  defaultContract.configuration.environmentEntry.environments.shared-dev.user == {
+    elevation = "passwordless-environment-sudo";
+    name = "owner";
+    uid = 1000;
+  };
+assert
+  defaultContract.configuration.environmentEntry.environments.restricted.homeComposition == {
+    durable = false;
+    resettablePaths = [ ];
+  };
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.volumes == [
     {
       access = "read-write";
       id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
       name = "projects";
-      target = "/home/agent/work";
+      target = "/home/owner/Projects";
     }
   ];
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.lifecycle
   == "resettable";
+assert
+  builtins.match "[0-9a-f]{64}" defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.ownerLayoutId
+  != null;
+assert
+  defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.ownerLayoutId
+  != defaultContract.configuration.environmentEntry.environments.restricted.runtime.ownerLayoutId;
+assert
+  alternateOwnerHomeHost.config.atlas.host.environmentContract.environments.shared-dev.runtime.ownerLayoutId
+  != defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.ownerLayoutId;
+assert
+  alternateOwnerHomeHost.config.atlas.host.environmentContract.environments.restricted.runtime.ownerLayoutId
+  == defaultContract.configuration.environmentEntry.environments.restricted.runtime.ownerLayoutId;
+assert
+  sharedWithoutOwnerHomeHost.config.atlas.host.environmentContract.environments.shared-dev.runtime.ownerLayoutId
+  == defaultContract.configuration.environmentEntry.environments.restricted.runtime.ownerLayoutId;
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.persistence
   == "until-explicit-reset";
@@ -293,6 +351,8 @@ assert defaultHost.config.systemd.sockets.atlas-manage.socketConfig.SocketMode =
 assert
   defaultHost.config.systemd.services."atlas-environment-shared\\x2ddev".serviceConfig.Type
   == "notify";
+assert lib.hasPrefix "/nix/store/"
+  defaultHost.config.systemd.services."atlas-environment-shared\\x2ddev".serviceConfig.ExecCondition;
 assert defaultHost.config.systemd.services.atlas-storage-prepare.serviceConfig.Type == "oneshot";
 assert builtins.elem "CAP_SYS_ADMIN"
   defaultHost.config.systemd.services.atlas-manage.serviceConfig.CapabilityBoundingSet;
@@ -328,11 +388,11 @@ assert hasFailedMessage "UIDs must be unique" {
   atlas.host.environments.restricted.uid = lib.mkForce 23001;
 };
 assert hasFailedMessage "unknown volumes" {
-  atlas.host.environments.shared-dev.volumeMounts.missing.target = "/home/agent/missing";
+  atlas.host.environments.shared-dev.volumeMounts.missing.target = "/home/owner/missing";
 };
 assert hasFailedMessage "canonical absolute paths" {
   atlas.host.environments.shared-dev.volumeMounts.projects.target =
-    lib.mkForce "/home/agent/../escape";
+    lib.mkForce "/home/owner/../escape";
 };
 assert hasFailedMessage "runtime-managed paths" {
   atlas.host.environments.shared-dev.volumeMounts.projects.target = lib.mkForce "/run/atlas";
@@ -340,8 +400,21 @@ assert hasFailedMessage "runtime-managed paths" {
 assert hasFailedMessage "overlapping volume mount targets" {
   atlas.host = {
     volumes.second.id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    environments.shared-dev.volumeMounts.second.target = "/home/agent/work/nested";
+    environments.shared-dev.volumeMounts.second.target = "/home/owner/Projects/nested";
   };
+};
+assert hasFailedMessage "owner home volume ID" {
+  atlas.host.owner.homeVolumeId = lib.mkForce "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+};
+assert hasFailedMessage "owner name" {
+  atlas.host.owner.name = lib.mkForce "Agent Owner";
+};
+assert hasFailedMessage "owner name" {
+  atlas.host.owner.name = lib.mkForce "root";
+};
+assert hasFailedMessage "runtime-managed paths" {
+  atlas.host.environments.shared-dev.volumeMounts.projects.target =
+    lib.mkForce "/home/owner/.config/tool";
 };
 assert hasFailedMessage "volume IDs must be unique" {
   atlas.host.volumes.second.id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -381,9 +454,7 @@ assert
 assert
   installedStorageHost.config.fileSystems."/".device
   == "/dev/disk/by-uuid/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
-assert
-  installedStorageHost.config.fileSystems."/boot".device
-  == "/dev/disk/by-uuid/A71A-5001";
+assert installedStorageHost.config.fileSystems."/boot".device == "/dev/disk/by-uuid/A71A-5001";
 assert
   installedStorageHost.config.fileSystems."/var/lib/atlas".device
   == "/dev/disk/by-uuid/cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa";

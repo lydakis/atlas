@@ -102,7 +102,9 @@ pkgs.testers.runNixOSTest {
             "vgcreate atlas /dev/mapper/atlas-crypt",
             "lvcreate --size 6G --name host atlas",
             "lvcreate --extents 100%FREE --name data atlas",
-            "mkfs.vfat -F 32 -i ${builtins.replaceStrings [ "-" ] [ "" ] installedTestStorageIds.bootUuid} -n ATLAS-BOOT /dev/vda1",
+            "mkfs.vfat -F 32 -i ${
+              builtins.replaceStrings [ "-" ] [ "" ] installedTestStorageIds.bootUuid
+            } -n ATLAS-BOOT /dev/vda1",
             "mkfs.ext4 -F -U ${installedTestStorageIds.hostUuid} -L ATLAS-HOST /dev/atlas/host",
             "mkfs.btrfs -f -U ${installedTestStorageIds.dataUuid} -L ATLAS-DATA /dev/atlas/data",
             "udevadm settle",
@@ -162,15 +164,28 @@ pkgs.testers.runNixOSTest {
         }
 
     with subtest("Persist resettable and durable state across reboot"):
-        entry("atlas-shared-dev", "echo installed-root > /etc/atlas-installed-root")
-        entry("atlas-shared-dev", "echo owner-data > work/atlas-installed-owner-data")
+        entry(
+            "atlas-shared-dev",
+            "sudo -n sh -c 'echo installed-root > /etc/atlas-installed-root'",
+        )
+        entry(
+            "atlas-shared-dev",
+            "mkdir -p Documents; echo owner-home > Documents/atlas-installed-owner-home",
+        )
+        entry(
+            "atlas-shared-dev",
+            "echo owner-data > Projects/atlas-installed-owner-data",
+        )
         target.shutdown()
         unlock_and_wait()
         assert entry(
             "atlas-shared-dev", "cat /etc/atlas-installed-root"
         ).strip() == "installed-root"
         assert entry(
-            "atlas-shared-dev", "cat work/atlas-installed-owner-data"
+            "atlas-shared-dev", "cat Documents/atlas-installed-owner-home"
+        ).strip() == "owner-home"
+        assert entry(
+            "atlas-shared-dev", "cat Projects/atlas-installed-owner-data"
         ).strip() == "owner-data"
 
     with subtest("Reset preserves the declared durable work volume"):
@@ -178,9 +193,13 @@ pkgs.testers.runNixOSTest {
             target.succeed("atlas environment reset shared-dev --json")
         )
         assert reset["ok"] is True
+        assert reset["result"]["preservedOwnerHome"] is True
         entry("atlas-shared-dev", "test -e /etc/atlas-installed-root", succeed=False)
         assert entry(
-            "atlas-shared-dev", "cat work/atlas-installed-owner-data"
+            "atlas-shared-dev", "cat Documents/atlas-installed-owner-home"
+        ).strip() == "owner-home"
+        assert entry(
+            "atlas-shared-dev", "cat Projects/atlas-installed-owner-data"
         ).strip() == "owner-data"
 
     target.shutdown()

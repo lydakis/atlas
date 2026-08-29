@@ -99,6 +99,7 @@ def _replace_btrfs_root(
     source: Path,
     root: Path,
     ready: Path,
+    ready_value: str,
     btrfs: str,
 ) -> None:
     _require_btrfs_subvolume(source, btrfs, "snapshot source")
@@ -107,22 +108,28 @@ def _replace_btrfs_root(
 
     candidate = root.parent / f".rootfs.{uuid.uuid4()}"
     tombstone = root.parent / f".deleting-{uuid.uuid4()}"
-    _btrfs_snapshot(source, candidate, btrfs, readonly=False)
+    ready_candidate = root.parent / f".rootfs-ready.{uuid.uuid4()}"
     moved_root = False
+    installed_candidate = False
     try:
+        _btrfs_snapshot(source, candidate, btrfs, readonly=False)
+        ready_candidate.write_text(f"{ready_value}\n", encoding="utf-8")
+        os.chmod(ready_candidate, 0o600)
         if root.exists():
             root.rename(tombstone)
             moved_root = True
         candidate.rename(root)
+        installed_candidate = True
+        ready_candidate.replace(ready)
     except Exception:
+        if installed_candidate and root.exists():
+            root.rename(candidate)
         if moved_root and not root.exists() and tombstone.exists():
             tombstone.rename(root)
         if candidate.exists():
             _delete_managed_tree(candidate, "btrfs-subvolume", btrfs)
+        ready_candidate.unlink(missing_ok=True)
         raise
-
-    ready.touch(mode=0o600, exist_ok=True)
-    os.chmod(ready, 0o600)
     if tombstone.exists():
         try:
             _delete_managed_tree(tombstone, "btrfs-subvolume", btrfs)

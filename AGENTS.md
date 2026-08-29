@@ -92,6 +92,10 @@ remote transport abstraction until a real second transport exists.
 - Work test-first for behavior changes and security fixes when practical.
 - Keep credentials out of source, Nix store paths, logs, tests, and portable
   declarations.
+- On macOS, prefer `./scripts/remote-check` for Linux/Nix and x86 KVM checks.
+  It snapshots the Git working tree through Errand to Cabal. Do not add an ad
+  hoc SSH/rsync transfer path or invoke remote Nix directly unless diagnosing
+  Errand itself.
 - Do not weaken kernel-derived identity, root-only lifecycle authority, managed
   path validation, lifecycle locking, or fail-closed behavior.
 - Use `rg` for search and `apply_patch` for manual edits.
@@ -109,5 +113,6 @@ nix build .#checks.x86_64-linux.installed-host
 nix fmt -- --check
 ```
 
-Without native Nix, use the corresponding `./scripts/nix-container` commands
-documented in the root README.
+Without native Nix, prefer the corresponding `./scripts/remote-check` commands
+through Errand and Cabal. Use `./scripts/nix-container` when Errand is
+unavailable or when container-specific parity is the subject of the check.

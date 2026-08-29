@@ -169,7 +169,9 @@ Atlas host
 ├── durable human-owned volumes
 └── one or more Ubuntu environments
     ├── resettable mutable root
-    ├── explicitly attached owner data
+    ├── conventional durable owner home
+    │   └── environment-local config and cache mounts
+    ├── other explicitly attached owner data
     └── any number of agent applications and human-operated clients
 ```
 
@@ -464,16 +466,16 @@ path.
 
 A named, reusable execution and trust context realized as a Linux compartment.
 It is the target an existing agent tool selects or enters before work begins.
-An environment owns an enforceable OS principal, resettable root filesystem and
-home, process and resource boundaries, network context, and non-secret
-configuration. Atlas binds grants, surfaces, routes, and activity to the
-environment's opaque identity.
+An environment owns an enforceable OS principal, resettable root filesystem,
+environment-local home paths, process and resource boundaries, network context,
+and non-secret configuration. Atlas binds grants, surfaces, routes, and activity
+to the environment's opaque identity.
 
 An environment instance is mutable, persistent, and resettable. Tools installed
-by an agent, caches, ordinary files, and changes under its root or home should
+by an agent, caches, and changes under its root or environment-local home paths
 survive re-entry, environment restart, host reboot, and supported update. An
-explicit reset reconstructs that machine state from its declared seed. Resetting
-the instance must not destroy an attached durable volume.
+explicit reset reconstructs that machine state from its declared seed. Ordinary
+files in the durable owner home and other attached volumes survive the reset.
 
 Volatile execution state is narrower: process memory, open connections, sockets,
 locks, PID files, `/run`, and connection-local terminal state do not survive a
@@ -513,11 +515,13 @@ Durable operator-owned data attached explicitly to one or more environments at
 a declared path and access mode. Repositories, worktrees, datasets, artifacts,
 and other files that must outlive an environment instance belong on volumes.
 
-A volume is not a container home and does not inherit an environment's
-lifecycle. Resetting or replacing an environment leaves its attached volumes
-intact. Multiple cooperating environments may mount one volume read-write; an
-inspection environment may receive it read-only. Copy-on-write forks and
-per-human ownership are later lifecycle and policy features of the same
+A volume does not inherit an environment's lifecycle. Resetting or replacing an
+environment leaves its attached volumes intact. In the single-owner product,
+Atlas automatically manages one volume as the conventional owner home and
+selectively composes it into environments. Multiple cooperating environments
+may mount that home or another volume read-write; an inspection environment may
+omit it or receive a different volume read-only. Copy-on-write forks and
+multi-human ownership are later lifecycle and policy features of the same
 primitive.
 
 ### Grant

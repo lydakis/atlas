@@ -9,6 +9,12 @@
     tailscale.enable = true;
     storage.adapter = "btrfs-subvolume";
 
+    owner = {
+      name = "owner";
+      uid = 1000;
+      homeVolumeId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    };
+
     environmentLayers = {
       base.variables = {
         DEMO_BASE = "base";
@@ -37,13 +43,13 @@
 
     volumes.projects = {
       id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-      owner = "operator";
     };
 
     environments = {
       shared-dev = {
         id = "11111111-1111-4111-8111-111111111111";
         uid = 23001;
+        ownerHome = true;
         layers = [
           "base"
           "dev-tools"
@@ -56,18 +62,19 @@
           DEMO_GENERATION = "baseline";
           DEMO_OVERRIDE = "instance";
         };
-        volumeMounts.projects.target = "/home/agent/work";
+        volumeMounts.projects.target = "/home/owner/Projects";
       };
 
       personal-dev = {
         id = "33333333-3333-4333-8333-333333333333";
         uid = 23003;
+        ownerHome = true;
         layers = [
           "base"
           "dev-tools"
           "personal-git"
         ];
-        volumeMounts.projects.target = "/home/agent/work";
+        volumeMounts.projects.target = "/home/owner/Projects";
       };
 
       restricted = {

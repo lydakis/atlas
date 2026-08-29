@@ -6,6 +6,7 @@ import fcntl
 import os
 import re
 import shutil
+import stat
 import subprocess
 import uuid
 from contextlib import contextmanager
@@ -72,6 +73,11 @@ def _managed_environment_state(
         runtime.get("readyHostPath", "")
     ):
         raise ValueError("environment runtime root is outside the managed boundary")
+    owner_layout_id = runtime.get("ownerLayoutId")
+    if not isinstance(owner_layout_id, str) or re.fullmatch(
+        r"[0-9a-f]{64}", owner_layout_id
+    ) is None:
+        raise ValueError("environment owner layout identity is invalid")
 
     service = environment.get("process", {}).get("serviceUnit")
     if not isinstance(service, str) or re.fullmatch(
@@ -88,6 +94,7 @@ def _managed_environment_state(
         "adapter": adapter,
         "environment_id": environment_id,
         "parent": parent,
+        "owner_layout_id": owner_layout_id,
         "ready": ready,
         "root": root,
         "service": service,
@@ -120,6 +127,32 @@ def _managed_environment_state(
     return state
 
 
+def _owner_home_fingerprint(
+    environment: dict[str, Any],
+) -> tuple[Path, int, int] | None:
+    composition = environment.get("homeComposition", {})
+    if not isinstance(composition, dict) or not composition.get("durable", False):
+        return None
+    raw_path = composition.get("durableHostPath")
+    if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+        raise ValueError("durable owner home path is invalid")
+    path = Path(raw_path)
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError("Atlas could not verify the durable owner home")
+    metadata = path.stat(follow_symlinks=False)
+    return path, metadata.st_dev, metadata.st_ino
+
+
+def _require_preserved_owner_home(
+    environment: dict[str, Any],
+    before: tuple[Path, int, int] | None,
+) -> bool:
+    after = _owner_home_fingerprint(environment)
+    if before != after:
+        raise RuntimeError("Atlas durable owner home changed during the lifecycle operation")
+    return before is not None
+
+
 @contextmanager
 def _lifecycle_lock(environment_id: str, lock_root: str):
     locks = Path(lock_root)
@@ -148,6 +181,53 @@ def _require_managed_reset_paths(root: Path, ready: Path) -> None:
         raise ValueError("environment readiness marker must be a regular file")
 
 
+def _require_current_owner_layout(state: dict[str, Any]) -> None:
+    try:
+        actual_layout_id = state["ready"].read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise RuntimeError("Atlas could not read the host-owned owner layout marker") from error
+    if actual_layout_id != state["owner_layout_id"]:
+        raise ControlOperationError(
+            "reset_required",
+            "environment requires an explicit reset for the current owner layout",
+        )
+
+
+def _require_snapshot_owner_layout(source: Path, expected_layout_id: str) -> None:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        current_fd = os.open(source, directory_flags)
+        try:
+            for component in ("etc", "atlas"):
+                child_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = child_fd
+            marker_fd = os.open(
+                "owner-layout-id",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current_fd,
+            )
+            try:
+                if not stat.S_ISREG(os.fstat(marker_fd).st_mode):
+                    raise OSError("owner layout marker is not a regular file")
+                marker_bytes = os.read(marker_fd, 66)
+            finally:
+                os.close(marker_fd)
+        finally:
+            os.close(current_fd)
+    except OSError as error:
+        raise ControlOperationError(
+            "reset_required",
+            "snapshot predates the current owner layout and cannot be restored",
+        ) from error
+    expected = expected_layout_id.encode("ascii")
+    if marker_bytes not in {expected, expected + b"\n"}:
+        raise ControlOperationError(
+            "reset_required",
+            "snapshot predates the current owner layout and cannot be restored",
+        )
+
+
 def _remove_abandoned_roots(
     parent: Path,
     mountinfo_path: str,
@@ -155,6 +235,17 @@ def _remove_abandoned_roots(
     adapter: str = "host-directory",
     btrfs: str = "btrfs",
 ) -> None:
+    for marker in parent.glob(".rootfs-ready.*"):
+        try:
+            marker_mode = marker.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(marker_mode):
+            raise RuntimeError(
+                f"Atlas refused an invalid private lifecycle path: {marker}"
+            )
+        marker.unlink()
+
     for pattern in (".deleting-*", ".rootfs.*", ".seed.*"):
         for candidate in parent.glob(pattern):
             if candidate.is_symlink() or not candidate.is_dir():
@@ -197,7 +288,7 @@ def _reset_environment(
     systemctl: str,
     btrfs: str = "btrfs",
     mountinfo_path: str = DEFAULT_MOUNTINFO,
-) -> None:
+) -> bool:
     state = _managed_environment_state(environment, runtime_root)
     root = state["root"]
     ready = state["ready"]
@@ -205,6 +296,7 @@ def _reset_environment(
     adapter = state["adapter"]
 
     with _lifecycle_lock(state["environment_id"], lock_root):
+        owner_home_before = _owner_home_fingerprint(environment)
         _require_managed_reset_paths(root, ready)
         subprocess.run(
             [systemctl, "stop", service],
@@ -238,6 +330,7 @@ def _reset_environment(
                 source=state["seed"],
                 root=root,
                 ready=ready,
+                ready_value=state["owner_layout_id"],
                 btrfs=btrfs,
             )
         elif root.exists():
@@ -247,6 +340,7 @@ def _reset_environment(
             shutil.rmtree(tombstone)
         else:
             ready.unlink(missing_ok=True)
+        return _require_preserved_owner_home(environment, owner_home_before)
 
 
 def _service_active_state(systemctl: str, service: str) -> str:
@@ -326,6 +420,7 @@ def _create_environment_snapshot(
     _require_snapshot_adapter(state)
     with _lifecycle_lock(state["environment_id"], lock_root):
         _require_managed_reset_paths(state["root"], state["ready"])
+        _require_current_owner_layout(state)
         snapshots = _require_snapshots_directory(state)
         target = snapshots / snapshot
         if target.exists() or target.is_symlink():
@@ -337,6 +432,9 @@ def _create_environment_snapshot(
                 raise ControlOperationError(
                     "not_initialized", "environment has no initialized root to snapshot"
                 )
+            _require_snapshot_owner_layout(
+                state["root"], state["owner_layout_id"]
+            )
             if _mounts_below(state["root"], mountinfo_path):
                 raise RuntimeError("mounts remain below environment root after stop")
             _require_btrfs_subvolume(state["root"], btrfs, "environment root")
@@ -381,16 +479,18 @@ def _restore_environment_snapshot(
     systemctl: str,
     btrfs: str,
     mountinfo_path: str = DEFAULT_MOUNTINFO,
-) -> None:
+) -> bool:
     state = _managed_environment_state(environment, runtime_root)
     _require_snapshot_adapter(state)
     with _lifecycle_lock(state["environment_id"], lock_root):
+        owner_home_before = _owner_home_fingerprint(environment)
         _require_managed_reset_paths(state["root"], state["ready"])
         snapshots = _require_snapshots_directory(state)
         source = snapshots / snapshot
         if not source.exists():
             raise ControlOperationError("not_found", "snapshot does not exist")
         _require_btrfs_subvolume(source, btrfs, "environment snapshot")
+        _require_snapshot_owner_layout(source, state["owner_layout_id"])
 
         was_active = _pause_environment(systemctl, state["service"])
         try:
@@ -406,10 +506,12 @@ def _restore_environment_snapshot(
                 source=source,
                 root=state["root"],
                 ready=state["ready"],
+                ready_value=state["owner_layout_id"],
                 btrfs=btrfs,
             )
         finally:
             _resume_environment(systemctl, state["service"], was_active)
+        return _require_preserved_owner_home(environment, owner_home_before)
 
 
 def _delete_environment_snapshot(
@@ -451,8 +553,8 @@ class EnvironmentLifecycle:
         self.mountinfo_path = mountinfo_path
         self.snapshots_enabled = snapshots_enabled
 
-    def reset(self, environment: dict[str, Any]) -> None:
-        _reset_environment(
+    def reset(self, environment: dict[str, Any]) -> bool:
+        return _reset_environment(
             environment,
             runtime_root=self.runtime_root,
             lock_root=self.lock_root,
@@ -480,8 +582,8 @@ class EnvironmentLifecycle:
             btrfs=self.btrfs,
         )
 
-    def restore_snapshot(self, environment: dict[str, Any], snapshot: str) -> None:
-        _restore_environment_snapshot(
+    def restore_snapshot(self, environment: dict[str, Any], snapshot: str) -> bool:
+        return _restore_environment_snapshot(
             environment,
             snapshot,
             runtime_root=self.runtime_root,

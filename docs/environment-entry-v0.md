@@ -1,7 +1,7 @@
 # Environment Entry v0
 
-Status: persistent-service, reboot-persistent resettable root, and durable-volume
-adapter validated in QEMU
+Status: persistent-service, reboot-persistent resettable root, durable owner
+home composition, and durable-volume adapter implemented and KVM-proven
 
 ## Outcome
 
@@ -41,8 +41,8 @@ right. Later package aliases replace earlier aliases, Git configuration merges
 recursively, and later variables replace earlier variables. Instance values
 then override every layer. Duplicate layers and unknown layers are rejected.
 Atlas-reserved keys, including the `ATLAS_` prefix and runtime-owned
-`GIT_CONFIG_SYSTEM`, `HOME`, `LOGNAME`, `PATH`, `SHELL`, and `USER`, cannot be
-supplied by a layer or instance.
+`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `HOME`, `LOGNAME`, `PATH`, `SHELL`,
+and `USER`, cannot be supplied by a layer or instance.
 
 A layer is convenience, not a trust boundary. Two environments created from the
 same layer do not share identity, mutable OS state, processes, or grants.
@@ -53,19 +53,29 @@ An environment instance is the mutable realization of a definition. It has:
 
 - an opaque Atlas identity independent of its human-readable name
 - a kernel-enforced principal and cgroup boundary
-- a resettable root filesystem and home
+- a resettable root filesystem and environment-local home paths
 - a process and resource-accounting scope
 - an effective non-secret configuration snapshot
 - declared network behavior
 - references to volumes, grants, surfaces, routes, and activity
 
 The instance is reusable across entries and resettable over its lifecycle.
-Installed packages, caches, `$HOME`, and root-filesystem changes survive an SSH
-disconnect, environment restart, host reboot, and supported update.
-`atlas environment reset <name>` terminates the instance and deliberately
-destroys those changes. The Btrfs adapter publishes a fresh root from its
-declared seed before reset returns; the volatile directory adapter recreates
-the root on the next entry.
+Installed packages, `/etc`, environment-local home paths, and root-filesystem
+changes survive an SSH disconnect, environment restart, host reboot, and
+supported update. `atlas environment reset <name>` terminates the instance and
+deliberately destroys those changes. The Btrfs adapter publishes a fresh root
+from its declared seed before reset returns; the volatile directory adapter
+recreates the root on the next entry. Durable owner-home data is mounted outside
+that replacement and is not restored by a root snapshot.
+
+The host-owned readiness sidecar records the owner-layout identity required by
+the active generation. The mutable environment root cannot rewrite that
+authority. If the owner account, home composition, elevation support, or its
+Nix closure changes, entry fails with an explicit reset requirement. Reset
+realizes the current applied seed and writes the new host marker while
+preserving durable owner data. A root snapshot from an older owner layout is
+not restorable under the new layout. Configuration-only generation changes
+whose owner-layout identity is unchanged continue to preserve the root.
 
 Resettable does not mean recreated for every connection or reboot. It means the
 operator can deliberately throw the machine state away without losing data
@@ -80,9 +90,10 @@ but Atlas does not transparently resume arbitrary processes, connections, or
 client-owned terminal state.
 
 Agents should not need special paths to keep ordinary files across reboot.
-Installed packages, `/etc`, home configuration, caches, and other normal root
-filesystem contents belong to resettable machine state. Conventional temporary
-locations may be cleared only under an explicit, discoverable policy.
+Installed packages, `/etc`, the declared resettable home paths, caches, and
+other normal root filesystem contents belong to resettable machine state.
+Conventional temporary locations may be cleared only under an explicit,
+discoverable policy.
 
 ### Volume
 
@@ -96,12 +107,31 @@ instance must not delete volume contents. Multiple cooperating environments may
 mount the same volume deliberately. An environment without that mount must not
 be able to reach it through its filesystem.
 
-The current spike mounts one `projects` volume at `/home/agent/work` in
-`shared-dev` and `personal-dev`. `restricted` receives no project volume.
-`/home/agent` is a temporary adapter convention, not an agent identity or the
-settled product home. The intended product account belongs to the human owner,
-and durable mounts should appear at conventional paths inside that owner's
-normal environment view.
+Atlas automatically manages one owner-home volume and may compose it into an
+environment at `/home/<owner>`. The current proof composes it into `shared-dev`
+and `personal-dev`, while `restricted` receives a resettable home and no owner
+data. The separate `projects` volume is mounted at `/home/owner/Projects` in the
+two cooperating environments and omitted from `restricted`.
+
+The mounted owner home is durable by default. Atlas overlays these
+environment-local paths from the resettable root:
+
+- `~/.config`
+- `~/.cache`
+- `~/.local/bin`
+- `~/.local/state`
+
+`~/.local/share`, repositories, documents, artifacts, and ordinary files under
+the home remain durable. Two environments may therefore see the same owner
+files while receiving different tool configuration, caches, local executables,
+and local state. Root snapshot, restore, and reset include the overlaid paths
+but exclude the durable home beneath them.
+
+This boundary is explicit rather than heuristic. A dotfile such as `~/.bashrc`
+or application state written outside the declared resettable paths remains
+durable. Atlas must not claim it can identify arbitrary configuration by
+filename. A later contract may make the list configurable, but v0 keeps one
+small, inspectable default.
 
 ### Entry
 
@@ -122,14 +152,18 @@ Every process started through an entry receives:
 - the effective non-secret variables in the environment definition
 - only the volumes attached by its definition
 
-The in-environment user is mapped root in v0 so a client can use ordinary Ubuntu
-tools such as `apt` and mutate the resettable filesystem. The launcher sets its
-prototype home to `/home/agent`. Neither the account nor the path means one
-agent owns the environment: several human or agent-driven processes may share
-it. User namespaces map that identity away from host root. The owner-account,
-home-layout, and environment-local elevation contract remain open before a
-persistent installation. This is a prototype isolation mechanism, not a claim
-that every possible container escape has been excluded.
+An entry runs as the configured human-owner account and UID, with a conventional
+home at `/home/<owner>`. The account has passwordless `sudo` inside the Ubuntu
+environment so agents can use normal instructions such as `sudo apt install`
+without receiving Atlas-host root. In the current single-owner model, every
+process admitted to that environment can obtain its environment-local root and
+read or modify everything mounted there. Separate environments, omitted
+volumes, and future Grants are the authority boundaries when that is too broad.
+
+Several human or agent-driven processes may share the account. The account is
+the human owner's execution context, not an agent identity. User namespaces map
+environment root away from host root. This is a prototype isolation mechanism,
+not a claim that every possible container escape has been excluded.
 
 ## Projects, repositories, and agents
 
@@ -149,10 +183,10 @@ worktrees with their normal tools. Atlas requires no repository registration
 step and owns no coding session abstraction.
 
 Several agents may enter one environment and share its mutable execution state.
-Several environments may mount one project volume and share its files without
-sharing installed packages, `$HOME`, or `/etc`. Atlas does not serialize Git
-operations or make concurrent writes safe. Operators and agent tools still own
-that coordination.
+Several environments may mount one project volume and the durable owner home
+while keeping installed packages, `/etc`, and the declared resettable home paths
+separate. Atlas does not serialize Git operations or make concurrent writes
+safe. Operators and agent tools still own that coordination.
 
 Separate environments are warranted when agents need different credentials,
 network policy, installed dependencies, reset policy, or resource limits.
@@ -168,9 +202,10 @@ configuration. Managed Git configuration follows the same rule.
 
 Names, email addresses, default branches, aliases, and similar Git settings may
 be composed in layers. The generated system file is immutable. Mutable global
-Git configuration lives in the resettable environment home and is removed by
-reset. If a config file must be durable, the operator may deliberately place it
-on a volume and link or include it, accepting the shared-data semantics.
+Git configuration is redirected to `~/.config/git/config`, lives in the
+resettable environment view, and is removed by reset. If a config file must be
+durable, the operator may deliberately place it outside the resettable paths
+and link or include it, accepting the shared-data semantics.
 
 SSH keys, signing keys, GitHub tokens, credential helpers containing secrets,
 and other authentication material are grants, not environment configuration.
@@ -224,11 +259,16 @@ The adapter currently:
 - lets that root grow elastically on the Atlas data filesystem, with no default
   per-environment quota
 - stores volume data under `/var/lib/atlas/volumes/<id>/data`
+- creates one automatic owner-home volume and mounts it only into environments
+  whose definitions request owner-home access
+- overlays `~/.config`, `~/.cache`, `~/.local/bin`, and `~/.local/state` from
+  each environment's resettable root
+- enters as the human-owner UID with environment-local passwordless `sudo`
 - maps each fixed Tailscale SSH login to one environment launcher
 - supervises one persistent `systemd-nspawn` service per environment with a
   user namespace
 - joins each entry to that service's namespaces and delegated session cgroup
-- idmaps only explicitly attached volumes into the container
+- idmaps the owner home and explicitly attached volumes into the container
 - mounts the Atlas contract and local control socket
 - appends declared Nix tool closures to the ordinary Ubuntu PATH
 - supplies the environment's init and untouched base units through a stable
@@ -243,12 +283,12 @@ The adapter currently:
 The persistent VM places `/var/lib/atlas` on a dedicated Btrfs filesystem. Each
 root is a subvolume that shares the filesystem's available capacity and has no
 arbitrary 1 GiB ceiling. Live process and mount state are reconstructed after
-host reboot, while installed packages, `/etc`, ordinary home files, and caches
-remain until explicit reset. Volumes are sibling Btrfs subvolumes composed into
-the environment at their declared paths, so root reset and restore do not
-include them. The spike does not yet reserve host recovery capacity, enforce
-optional quotas, encrypt persistent storage, or snapshot durable data, so those
-capabilities are reported as degraded or absent. Network isolation is still
+host reboot, while installed packages, `/etc`, and resettable home paths remain
+until explicit reset. Volumes are sibling Btrfs subvolumes composed into the
+environment at their declared paths, so root reset and restore do not include
+them. The installed-host layout reserves host recovery capacity and encrypts
+Atlas state in the KVM proof, but physical recovery, optional quotas, and
+durable-data snapshots remain absent. Network isolation is still
 shared-host and reported as degraded. The read-only host Nix store remains
 visible so declared tools can execute and is reported as degraded tool
 isolation.
@@ -264,26 +304,29 @@ eventual runtime manager, container backend, or base distribution.
 
 ## Acceptance story
 
-1. The owner declares a durable `projects` volume and three environments.
-2. `shared-dev` and `personal-dev` mount it at `/home/agent/work`; `restricted`
-   does not.
+1. Atlas creates the configured owner's durable home and the owner declares a
+   separate durable `projects` volume and three environments.
+2. `shared-dev` and `personal-dev` receive the owner home and mount `projects`
+   at `/home/owner/Projects`; `restricted` receives neither.
 3. An existing SSH-compatible client enters `shared-dev`, clones a repository
    onto the volume, and commits with its managed Git identity.
-4. `personal-dev` sees the repository through the same volume but retains a
-   different `/etc`, `$HOME`, installed tool set, and Git identity.
+4. `personal-dev` sees durable owner files and the repository, but retains a
+   different `/etc`, resettable home configuration, installed tool set, and Git
+   identity.
 5. A human or agent-driven process installs a Debian package and changes `/etc`
    with environment-local administrative authority in
    `shared-dev`. Neither change appears in `personal-dev`.
 6. A second client concurrently enters the same `shared-dev` instance and sees
    its state.
-7. The host reboots. Its package, `/etc` change, and home remain; live process
-   state and `/run` do not. The repository on the volume also remains.
+7. The host reboots. Its package, `/etc` change, resettable home configuration,
+   durable owner files, and repository remain; live process state and `/run` do
+   not.
 8. The operator snapshots `shared-dev`, makes another root change, and restores
    the snapshot. The later root change disappears while later volume data
    remains.
 9. The operator resets `shared-dev` while a workload is active. Its package,
-   process tree, `/etc` change, and resettable home disappear; the repository
-   on the volume remains.
+   process tree, `/etc` change, and resettable home paths disappear; durable
+   owner files and the repository remain.
 10. `restricted` cannot see the project volume and cannot reset another
    environment.
 11. New resettable state and the durable repository survive control-service
@@ -291,17 +334,25 @@ eventual runtime manager, container backend, or base distribution.
 
 ## Proven in the QEMU contract
 
-The AArch64 integration test proves:
+The current x86_64 KVM integration test passed on August 29, 2026. Together
+with the earlier AArch64 QEMU proof, it verifies:
 
 - deterministic layer, package, Git, and variable composition
 - evaluation failure for invalid names, IDs, UIDs, variables, volumes, and
   mount targets
 - fixed interactive and non-interactive entry into named environments
 - peer-derived environment identity with non-environment callers failing closed
-- a mapped root user can mutate the environment without mutating host `/etc`
+- the configured human owner enters at `/home/<owner>` and can use passwordless
+  environment-local `sudo` without mutating host `/etc`
 - a local Debian package installs and persists across sequential entries and
   host reboot
-- `/etc` and ordinary home changes persist across host reboot
+- `/etc`, resettable home paths, and durable owner files persist across host
+  reboot
+- two environments share the durable owner home while retaining independent
+  `~/.config` state, and an environment without owner-home access cannot see it
+- explicit reset removes `~/.config`, `~/.cache`, `~/.local/bin`, and
+  `~/.local/state` while preserving ordinary owner files, `~/.local/share`, and
+  the nested durable project volume
 - `/run` and live environment processes remain volatile across host reboot
 - `/var/lib/atlas` is a dedicated Btrfs filesystem in the VM; each resettable
   root and durable volume is a subvolume with no fixed-size image or default
@@ -313,6 +364,9 @@ The AArch64 integration test proves:
 - a symbolic link or non-directory at a managed root fails closed, and
   interrupted root and seed bootstrap subvolumes are recursively cleaned
   without following links
+- owner-home mountpoints are prepared through descriptor-relative operations;
+  final and intermediate owner-created symlinks fail closed without modifying
+  their host targets
 - simultaneous clients enter one persistent environment instance
 - package and filesystem mutations do not appear in a neighboring environment
 - an active workload is anchored beneath the environment service cgroup
@@ -321,10 +375,19 @@ The AArch64 integration test proves:
 - reset preserves the attached project volume
 - a named read-only root snapshot survives reboot, lists deterministically,
   restores through an atomic root swap, and deletes explicitly
+- snapshot compatibility validation refuses an environment-root symbolic link
+  to the host-owned owner-layout marker
 - root snapshot creation fails explicitly when the resettable root contains a
   nested Btrfs subvolume; reset remains able to remove that root recursively
 - snapshot restore removes later root changes while preserving later volume
-  changes
+  and ordinary owner-home changes
+- a stale host-owned owner-layout marker blocks entry until explicit reset, and
+  reset reports that an environment without owner-home access preserved no
+  owner home
+- changing one environment's owner-home attachment produces a distinct
+  compatibility marker, leaves that environment inactive until explicit reset,
+  and does not invalidate an unaffected environment; changing only ordinary
+  environment variables preserves the existing root
 - two environments share one explicitly mounted volume
 - an environment without the mount cannot read that volume
 - an environment cannot invoke the operator-only reset operation
@@ -339,16 +402,15 @@ The proof uses harmless configuration and no real credentials.
 ## Hands-on shape
 
 After building and enrolling the host, an SSH-compatible client uses the fixed
-environment target. The current `/home/agent` path shown here is only a spike
-convention pending the owner-account contract:
+environment target:
 
 ```bash
 ssh atlas-shared-dev@<atlas-tailnet-host>
 atlas environment inspect self --json
-cd /home/agent/work
+cd /home/owner/Projects
 git clone <test-repository-url> repo-a
-apt update
-apt install <tool>
+sudo apt update
+sudo apt install <tool>
 ```
 
 From the operator account, reset only the resettable environment instance:
@@ -365,14 +427,13 @@ atlas environment snapshot restore shared-dev before-upgrade --json
 atlas environment snapshot delete shared-dev before-upgrade --json
 ```
 
-On the next entry, installed tools and home configuration are fresh while
-`/home/agent/work/repo-a` remains.
+On the next entry, installed tools and the declared resettable home paths are
+fresh while `/home/owner/Projects/repo-a` and ordinary durable owner files
+remain.
 
 ## Deferred decisions
 
 - runtime creation and deletion of definitions, instances, and volumes
-- human owner account, conventional home layout, and environment-local elevation
-- automatic creation and attachment of primary durable owner storage
 - protected host recovery capacity and optional quotas for additional
   environments
 - encrypted physical storage, unlock, recovery, and backup policy

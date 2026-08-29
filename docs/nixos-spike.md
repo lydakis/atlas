@@ -28,14 +28,16 @@ The revision after the product-boundary discussion makes two corrections:
    development, automated-test, and optional deployment artifacts.
 2. Atlas environments are OS compartments used by existing agent clients. They
    are not repositories, worktrees, conversations, terminals, or tasks.
-3. Durable data belongs to explicit volumes, while an environment instance owns
-   resettable root, home, installed tools, and caches plus volatile processes.
-   The current Btrfs adapter preserves that root across reboot until explicit
-   reset, lets it grow with the Atlas data filesystem, and supplies cheap root
-   snapshots and restore.
+3. Durable data belongs to volumes. Atlas automatically manages the human
+   owner's conventional home as one volume, while the environment owns its
+   resettable root and the `~/.config`, `~/.cache`, `~/.local/bin`, and
+   `~/.local/state` views composed over that home. The Btrfs adapter preserves
+   the root across reboot until explicit reset, lets it grow with the Atlas data
+   filesystem, and supplies cheap root snapshots and restore.
 4. Agents are programs using an environment, not environment owners or Linux
-   identities. The spike's `/home/agent` is temporary; the owner-account and
-   elevation contract is not yet settled.
+   identities. Entry uses the human-owner account with passwordless
+   environment-local `sudo`; this broad authority belongs to the environment,
+   not to an agent identity.
 
 ## Current host contract
 
@@ -44,6 +46,9 @@ The reusable `atlas.host` module currently declares:
 - `enable`
 - `dataRoot`
 - `storage.adapter`
+- `owner.name`
+- `owner.uid`
+- `owner.homeVolumeId`
 - `tailscale.enable`
 - `tailscale.authKeyFile`
 - `tailscale.ssh`
@@ -229,6 +234,27 @@ The development adapter reports shared-host networking, encryption, and
 storage-reserve policy as degraded. Its resettable roots and named volumes live
 on a dedicated but unencrypted Btrfs data filesystem.
 
+The owner-home revision passed the complete x86_64 KVM host contract on August
+29, 2026. It verified entry as the configured normal owner UID, passwordless
+environment-local `sudo`, a durable home shared by selected environments,
+omission from a restricted environment, per-environment resettable home paths,
+and preservation of ordinary owner files and a nested project volume across
+reboot, root snapshot restore, and explicit reset.
+
+The hardening rerun on August 29 additionally verified that final-component and
+intermediate owner-home symlinks fail closed without mutating their host target,
+all four resettable home paths persist across reboot and disappear on reset,
+ordinary owner files created after a root snapshot survive restore, and a stale
+host-owned owner-layout marker blocks entry until explicit reset. The lifecycle
+response now reports owner-home preservation from an observed device-and-inode
+check rather than from the declaration alone. Snapshot compatibility also
+refuses an environment-root symbolic link to that host-owned marker. A later
+KVM generation-switch proof detached and reattached the durable home for one
+environment: each transition blocked that environment until explicit reset,
+preserved the durable owner files, and left an unaffected environment usable.
+The existing configuration-only generation switch continued to preserve the
+root without requiring reset.
+
 The parameterized x86 installed-storage module is a separate physical-alpha
 proof. On August 29, 2026, one fully instantiated KVM acceptance test passed
 after it:
@@ -242,8 +268,9 @@ after it:
   capacity for the Btrfs Atlas data filesystem
 - verified the active dm-crypt mapping, distinct mount sources, and reported
   encryption and host-recovery-reserve mechanisms
-- preserved resettable environment state and durable owner data across reboot
-- reset the environment root while preserving the declared work volume
+- preserved resettable environment state, the automatic durable owner home,
+  and a declared work volume across reboot
+- reset the environment root while preserving both durable storage classes
 
 The automated guest uses a harmless test-only initrd key so the test driver can
 boot without a human. The reusable installed-storage module embeds no key and
@@ -288,10 +315,11 @@ not configure Herdr or adopt its session model.
 
 ## Security boundary
 
-Environment processes are neither Nix allowed users nor Nix trusted users. The
-root identity inside nspawn is remapped by a user namespace and has no general
-host sudo rule. Nix trusted users are effectively root-equivalent because they
-can influence privileged builds and substituters, so the spike admits only host
+Environment processes are neither Nix allowed users nor Nix trusted users. They
+enter as the human-owner UID and may use passwordless `sudo` inside nspawn. That
+environment root is remapped by a user namespace and has no general host sudo
+rule. Nix trusted users are effectively root-equivalent because they can
+influence privileged builds and substituters, so the spike admits only host
 root.
 
 The optional Tailscale auth-key setting accepts a canonical external runtime
@@ -323,11 +351,14 @@ policy must treat it accordingly.
 - Resettable roots and durable volumes share the Atlas data filesystem. The
   fixed host logical volume protects capacity structurally in KVM, but recovery
   under real full-disk pressure and optional quotas remain unproven.
-- The spike still requires a declared volume; automatic per-owner durable
-  storage is not implemented.
-- `/home/agent` is still a prototype path for mapped root. The human owner
-  account, conventional home layout, and environment-local elevation contract
-  remain undecided.
+- The owner-home implementation and nested resettable home paths passed the KVM
+  host and installed-layout proofs but have not yet been exercised on physical
+  hardware. Those proofs must be rerun for each change to their mount and
+  privilege contract.
+- Owner-layout changes, including changes to the copied environment-local
+  sudo/PAM support closure, deliberately require explicit environment reset.
+  Atlas has no in-place migration framework for mutable roots yet. Snapshots
+  from an older owner layout are rejected rather than relabeled as current.
 - The fixed login adapter and Herdr have not yet been exercised on physical
   hardware, and Codex has not yet been tested as a remote target.
 - Runtime creation and deletion of definitions or volumes is not implemented.

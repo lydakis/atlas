@@ -12,7 +12,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from atlas.control import _read_request, handle_request  # noqa: E402
-from atlas.lifecycle import _pause_environment, _reset_environment  # noqa: E402
+from atlas.lifecycle import (  # noqa: E402
+    ControlOperationError,
+    _pause_environment,
+    _remove_abandoned_roots,
+    _require_snapshot_owner_layout,
+    _reset_environment,
+)
 from atlas.storage import (  # noqa: E402
     MAX_BTRFS_DIAGNOSTIC_BYTES,
     _delete_managed_tree,
@@ -31,6 +37,7 @@ RESTRICTED_CGROUP = (
     "atlas-environments-restricted.slice/"
     "atlas-environment-restricted.service"
 )
+OWNER_LAYOUT_ID = "b" * 64
 
 ENVIRONMENTS = {
     "restricted": {
@@ -42,6 +49,7 @@ ENVIRONMENTS = {
             "serviceUnit": "atlas-environment-restricted.service",
         },
         "variables": {"DEMO_SCOPE": "restricted"},
+        "homeComposition": {"durable": False, "resettablePaths": []},
         "volumes": [],
     },
     "shared-dev": {
@@ -56,11 +64,16 @@ ENVIRONMENTS = {
             "DEMO_API_ORIGIN": "https://example.invalid",
             "DEMO_OVERRIDE": "instance",
         },
+        "homeComposition": {
+            "durable": True,
+            "durableHostPath": "/var/lib/atlas/volumes/owner/data",
+            "resettablePaths": [".config"],
+        },
         "volumes": [
             {
                 "access": "read-write",
                 "name": "projects",
-                "target": "/home/agent/work",
+                "target": "/home/owner/Projects",
             }
         ],
     },
@@ -91,6 +104,7 @@ class RecordingLifecycle:
 
     def reset(self, environment):
         self.reset_names.append(environment["name"])
+        return bool(environment.get("homeComposition", {}).get("durable", False))
 
     def create_snapshot(self, environment, snapshot):
         self.snapshot_calls.append(("create", environment["name"], snapshot))
@@ -100,6 +114,7 @@ class RecordingLifecycle:
 
     def restore_snapshot(self, environment, snapshot):
         self.snapshot_calls.append(("restore", environment["name"], snapshot))
+        return bool(environment.get("homeComposition", {}).get("durable", False))
 
     def delete_snapshot(self, environment, snapshot):
         self.snapshot_calls.append(("delete", environment["name"], snapshot))
@@ -211,7 +226,16 @@ class AtlasControlProtocolTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["result"]["name"], "shared-dev")
         self.assertEqual(response["result"]["preservedVolumes"], ["projects"])
+        self.assertTrue(response["result"]["preservedOwnerHome"])
         self.assertEqual(self.lifecycle.reset_names, ["shared-dev"])
+
+    def test_reset_reports_when_an_environment_has_no_durable_owner_home(self):
+        response = self.request(
+            0,
+            {"version": 1, "operation": "environment.reset", "name": "restricted"},
+        )
+        self.assertTrue(response["ok"])
+        self.assertFalse(response["result"]["preservedOwnerHome"])
 
     def test_public_surface_does_not_expose_reset_even_to_root(self):
         response = self.request(
@@ -242,6 +266,7 @@ class AtlasControlProtocolTests(unittest.TestCase):
                 {"version": 1, "operation": "environment.snapshot.restore", "name": "shared-dev", "snapshot": "baseline"},
                 {
                     "name": "shared-dev",
+                    "preservedOwnerHome": True,
                     "preservedVolumes": ["projects"],
                     "restored": True,
                     "snapshot": "baseline",
@@ -327,14 +352,19 @@ class EnvironmentLifecycleTests(unittest.TestCase):
         root = runtime_parent / "rootfs"
         root.mkdir(parents=True)
         ready = runtime_parent / "rootfs.ready"
-        ready.write_text("ready\n", encoding="utf-8")
+        ready.write_text(f"{OWNER_LAYOUT_ID}\n", encoding="utf-8")
         lock_root = Path(temporary_directory) / "locks"
         outside = Path(temporary_directory) / "durable-volume"
         outside.mkdir()
         (outside / "repository").write_text("durable", encoding="utf-8")
         environment = {
             **ENVIRONMENTS["shared-dev"],
+            "homeComposition": {
+                **ENVIRONMENTS["shared-dev"]["homeComposition"],
+                "durableHostPath": str(outside),
+            },
             "runtime": {
+                "ownerLayoutId": OWNER_LAYOUT_ID,
                 "readyHostPath": str(ready),
                 "rootHostPath": str(root),
             },
@@ -350,6 +380,9 @@ class EnvironmentLifecycleTests(unittest.TestCase):
         (seed / "etc" / "atlas").mkdir(parents=True)
         (seed / "etc" / "atlas" / "seed-id").write_text(
             f"{expected_seed_id}\n", encoding="utf-8"
+        )
+        (seed / "etc" / "atlas" / "owner-layout-id").write_text(
+            f"{OWNER_LAYOUT_ID}\n", encoding="utf-8"
         )
         snapshots = root.parent / "snapshots"
         snapshots.mkdir()
@@ -378,7 +411,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             empty_mountinfo.touch()
 
             with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed) as run:
-                _reset_environment(
+                preserved_owner_home = _reset_environment(
                     environment,
                     runtime_root=str(runtime_root),
                     lock_root=str(lock_root),
@@ -404,6 +437,18 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             )
             self.assertEqual(list(root.parent.glob(".deleting-*")), [])
 
+    def test_abandoned_ready_marker_is_removed_before_lifecycle_work(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            marker = parent / ".rootfs-ready.interrupted"
+            marker.write_text("pending\n", encoding="utf-8")
+            mountinfo = parent / "empty-mountinfo"
+            mountinfo.touch()
+
+            _remove_abandoned_roots(parent, str(mountinfo))
+
+            self.assertFalse(marker.exists())
+
     def test_btrfs_root_replacement_uses_a_writable_snapshot_and_removes_old_root(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
@@ -413,7 +458,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             root.mkdir()
             (root / "old-state").write_text("old", encoding="utf-8")
             ready = parent / "rootfs.ready"
-            ready.write_text("ready\n", encoding="utf-8")
+            ready.write_text("old-layout\n", encoding="utf-8")
 
             def create_snapshot(snapshot_source, destination, _btrfs, *, readonly):
                 self.assertEqual(snapshot_source, source)
@@ -434,14 +479,67 @@ class EnvironmentLifecycleTests(unittest.TestCase):
                     source=source,
                     root=root,
                     ready=ready,
+                    ready_value=OWNER_LAYOUT_ID,
                     btrfs="/bin/btrfs",
                 )
 
             self.assertEqual((root / "seed-state").read_text(encoding="utf-8"), "fresh")
             self.assertFalse((root / "old-state").exists())
             self.assertTrue(ready.is_file())
+            self.assertEqual(ready.read_text(encoding="utf-8").strip(), OWNER_LAYOUT_ID)
             self.assertEqual(list(parent.glob(".deleting-*")), [])
             self.assertEqual(list(parent.glob(".rootfs.*")), [])
+
+    def test_btrfs_root_replacement_cleans_candidates_when_marker_setup_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            source = parent / "seed"
+            source.mkdir()
+            root = parent / "rootfs"
+            root.mkdir()
+            ready = parent / "rootfs.ready"
+
+            def create_snapshot(_source, destination, _btrfs, *, readonly):
+                self.assertFalse(readonly)
+                destination.mkdir()
+
+            def delete_tree(path, adapter, _btrfs):
+                self.assertEqual(adapter, "btrfs-subvolume")
+                shutil.rmtree(path)
+
+            with (
+                mock.patch("atlas.storage._require_btrfs_subvolume"),
+                mock.patch("atlas.storage._btrfs_snapshot", side_effect=create_snapshot),
+                mock.patch("atlas.storage._delete_managed_tree", side_effect=delete_tree),
+                mock.patch("atlas.storage.os.chmod", side_effect=OSError("interrupted")),
+                self.assertRaisesRegex(OSError, "interrupted"),
+            ):
+                _replace_btrfs_root(
+                    source=source,
+                    root=root,
+                    ready=ready,
+                    ready_value=OWNER_LAYOUT_ID,
+                    btrfs="/bin/btrfs",
+                )
+
+            self.assertTrue(root.is_dir())
+            self.assertFalse(ready.exists())
+            self.assertEqual(list(parent.glob(".rootfs.*")), [])
+            self.assertEqual(list(parent.glob(".rootfs-ready.*")), [])
+
+    def test_snapshot_layout_marker_cannot_follow_an_environment_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "rootfs"
+            marker_parent = root / "etc" / "atlas"
+            marker_parent.mkdir(parents=True)
+            host_marker = Path(temporary_directory) / "rootfs.ready"
+            host_marker.write_text(f"{OWNER_LAYOUT_ID}\n", encoding="utf-8")
+            (marker_parent / "owner-layout-id").symlink_to(host_marker)
+
+            with self.assertRaises(ControlOperationError) as error:
+                _require_snapshot_owner_layout(root, OWNER_LAYOUT_ID)
+
+            self.assertEqual(error.exception.code, "reset_required")
 
     def test_btrfs_cleanup_recursively_deletes_nested_subvolumes_and_commits(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -543,7 +641,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
                 mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
                 mock.patch("atlas.lifecycle._replace_btrfs_root") as replace,
             ):
-                _reset_environment(
+                preserved_owner_home = _reset_environment(
                     environment,
                     runtime_root=str(runtime_root),
                     lock_root=str(lock_root),
@@ -552,14 +650,56 @@ class EnvironmentLifecycleTests(unittest.TestCase):
                     mountinfo_path=str(empty_mountinfo),
                 )
 
+            self.assertTrue(preserved_owner_home)
             replace.assert_called_once_with(
                 source=seed,
                 root=root,
                 ready=ready,
+                ready_value=OWNER_LAYOUT_ID,
                 btrfs="/bin/btrfs",
             )
             self.assertEqual(run.call_args_list[2].args[0], ["/bin/prepare-seed"])
             self.assertEqual((outside / "repository").read_text(), "durable")
+
+    def test_reset_fails_if_the_durable_owner_home_is_replaced_during_reset(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            (
+                environment,
+                runtime_root,
+                lock_root,
+                root,
+                _ready,
+                _seed,
+                outside,
+                empty_mountinfo,
+            ) = self._btrfs_runtime_fixture(temporary_directory)
+            completed = [
+                subprocess.CompletedProcess([], 0),
+                subprocess.CompletedProcess([], 3),
+                subprocess.CompletedProcess([], 0),
+            ]
+
+            def replace_owner_home(**_arguments):
+                outside.rename(outside.parent / "replaced-owner-home")
+                outside.mkdir()
+
+            with (
+                mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed),
+                mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
+                mock.patch(
+                    "atlas.lifecycle._replace_btrfs_root",
+                    side_effect=replace_owner_home,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "owner home changed"):
+                    _reset_environment(
+                        environment,
+                        runtime_root=str(runtime_root),
+                        lock_root=str(lock_root),
+                        systemctl="/bin/systemctl",
+                        btrfs="/bin/btrfs",
+                        mountinfo_path=str(empty_mountinfo),
+                    )
 
     def test_reset_reconstructs_a_missing_btrfs_root(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -599,6 +739,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
                 source=seed,
                 root=root,
                 ready=ready,
+                ready_value=OWNER_LAYOUT_ID,
                 btrfs="/bin/btrfs",
             )
             self.assertEqual((outside / "repository").read_text(), "durable")
@@ -640,6 +781,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
                 source=seed,
                 root=root,
                 ready=ready,
+                ready_value=OWNER_LAYOUT_ID,
                 btrfs="/bin/btrfs",
             )
             self.assertEqual((outside / "repository").read_text(), "durable")
@@ -832,7 +974,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             )
             mountinfo = Path(temporary_directory) / "mountinfo"
             mountinfo.write_text(
-                f"10 1 0:1 / {root}/home/agent/work rw - tmpfs tmpfs rw\n",
+                f"10 1 0:1 / {root}/home/owner/Projects rw - tmpfs tmpfs rw\n",
                 encoding="utf-8",
             )
             completed = [
@@ -859,6 +1001,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             environment = {
                 **ENVIRONMENTS["shared-dev"],
                 "runtime": {
+                    "ownerLayoutId": OWNER_LAYOUT_ID,
                     "readyHostPath": str(outside / "ready"),
                     "rootHostPath": str(outside),
                 },

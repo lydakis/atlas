@@ -39,6 +39,17 @@ let
   environmentSnapshots = environment: "${environmentStateParent environment}/snapshots";
   environmentLock = environment: "/run/atlas/locks/${environment.id}.lock";
   volumePath = volume: "${toString cfg.dataRoot}/volumes/${volume.id}/data";
+  ownerHome = "/home/${cfg.owner.name}";
+  ownerHomeVolume = {
+    id = cfg.owner.homeVolumeId;
+  };
+  ownerHomePath = volumePath ownerHomeVolume;
+  resettableHomePaths = [
+    ".cache"
+    ".config"
+    ".local/bin"
+    ".local/state"
+  ];
   dataRootPersistent = cfg.dataRootPersistence == "reboot-persistent";
   btrfsStorage = cfg.storage.adapter == "btrfs-subvolume";
   escapedSliceSegment = name: lib.replaceStrings [ "-" ] [ "\\x2d" ] name;
@@ -65,45 +76,147 @@ let
     architecture = ubuntuArchitecture;
     source = "canonical-oci-rootfs";
   };
-  bootstrapTree = ''
-    bootstrap_tree() {
-      local target="$1"
-      tar --extract --gzip --numeric-owner --file=${ubuntuRootfs} --directory="$target"
-      install -d -m 0755 \
-        "$target/etc/atlas" \
-        "$target/etc/systemd/system" \
-        "$target/home/agent" \
-        "$target/home/agent/work" \
-        "$target/run/atlas" \
-        "$target/run/atlas-host-systemd" \
-        "$target/usr/lib/systemd"
-      sed -i -E 's#^(root:[^:]*:[^:]*:[^:]*:[^:]*):/root:#\1:/home/agent:#' \
-        "$target/etc/passwd"
-      ln -sfn /run/atlas-host-systemd/lib/systemd/systemd "$target/sbin/init"
-      rm -rf -- "$target/usr/lib/systemd/system"
-      install -d -m 0755 "$target/usr/lib/systemd/system"
-      while IFS= read -r -d "" source_path; do
-        relative_path="''${source_path#./}"
-        install -d -m 0755 "$target/usr/lib/systemd/system/$relative_path"
-      done < <(
-        cd ${pkgs.systemd}/example/systemd/system
-        find . -mindepth 1 -type d -print0
-      )
-      while IFS= read -r -d "" source_path; do
-        relative_path="''${source_path#./}"
-        ln -sfn \
-          "/run/atlas-host-systemd/example/systemd/system/$relative_path" \
-          "$target/usr/lib/systemd/system/$relative_path"
-      done < <(
-        cd ${pkgs.systemd}/example/systemd/system
-        find . -mindepth 1 ! -type d -print0
-      )
-      ln -sfn /usr/lib/systemd/system/multi-user.target \
-        "$target/etc/systemd/system/default.target"
-    }
+  ownerLayout = ''
+        provision_owner() {
+          local target="$1"
+          local account numeric_id
+          local -a removed_users=()
+          local -a removed_groups=()
+
+          while IFS=: read -r account _ numeric_id _; do
+            if [ "$account" = ${lib.escapeShellArg cfg.owner.name} ] && \
+               [ "$numeric_id" != ${lib.escapeShellArg (toString cfg.owner.uid)} ]; then
+              echo "Atlas refused an owner name that collides with a base-image account" >&2
+              return 1
+            fi
+            if [ "$numeric_id" = ${lib.escapeShellArg (toString cfg.owner.uid)} ] || \
+               [ "$account" = ${lib.escapeShellArg cfg.owner.name} ]; then
+              removed_users+=("$account")
+            fi
+          done < "$target/etc/passwd"
+          while IFS=: read -r account _ numeric_id _; do
+            if [ "$account" = ${lib.escapeShellArg cfg.owner.name} ] && \
+               [ "$numeric_id" != ${lib.escapeShellArg (toString cfg.owner.uid)} ]; then
+              echo "Atlas refused an owner name that collides with a base-image group" >&2
+              return 1
+            fi
+            if [ "$numeric_id" = ${lib.escapeShellArg (toString cfg.owner.uid)} ] || \
+               [ "$account" = ${lib.escapeShellArg cfg.owner.name} ]; then
+              removed_groups+=("$account")
+            fi
+          done < "$target/etc/group"
+
+          for account in "''${removed_users[@]}"; do
+            sed -i -E "/^''${account}:/d" \
+              "$target/etc/passwd" "$target/etc/shadow"
+          done
+          for account in "''${removed_groups[@]}"; do
+            sed -i -E "/^''${account}:/d" \
+              "$target/etc/group" "$target/etc/gshadow"
+          done
+
+          install -d -m 0755 \
+            "$target/etc/atlas" \
+            "$target/etc/pam.d" \
+            "$target/etc/sudoers.d" \
+            "$target${ownerHome}" \
+            "$target/usr/local/bin"
+          install -d -m 0700 ${
+            concatMapStringsSep " " (path: ''"$target${ownerHome}/${path}"'') resettableHomePaths
+          }
+          install -d -m 0700 "$target${ownerHome}/.config/git"
+          chown -R ${toString cfg.owner.uid}:${toString cfg.owner.uid} "$target${ownerHome}"
+          printf '%s\n' \
+            ${lib.escapeShellArg "${cfg.owner.name}:x:${toString cfg.owner.uid}:${toString cfg.owner.uid}:Atlas owner:${ownerHome}:/bin/bash"} \
+            >> "$target/etc/passwd"
+          printf '%s\n' \
+            ${lib.escapeShellArg "${cfg.owner.name}:x:${toString cfg.owner.uid}:"} \
+            >> "$target/etc/group"
+          printf '%s\n' \
+            ${lib.escapeShellArg "${cfg.owner.name}:!:20000:0:99999:7:::"} \
+            >> "$target/etc/shadow"
+          printf '%s\n' \
+            ${lib.escapeShellArg "${cfg.owner.name}:!::"} \
+            >> "$target/etc/gshadow"
+          install -m 4755 ${pkgs.sudo}/bin/sudo "$target/usr/local/bin/sudo"
+          cat > "$target/etc/pam.d/sudo" <<EOF
+    auth required ${pkgs.pam}/lib/security/pam_deny.so
+    account required ${pkgs.pam}/lib/security/pam_permit.so
+    session required ${pkgs.pam}/lib/security/pam_permit.so
+    EOF
+          chmod 0644 "$target/etc/pam.d/sudo"
+          rm -rf -- "$target/etc/sudoers.d"
+          install -d -m 0750 "$target/etc/sudoers.d"
+          cat > "$target/etc/sudoers" <<'EOF'
+    Defaults env_reset
+    Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    root ALL=(ALL:ALL) ALL
+    @includedir /etc/sudoers.d
+    EOF
+          printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' \
+            ${lib.escapeShellArg cfg.owner.name} \
+            > "$target/etc/sudoers.d/atlas-owner"
+          chmod 0440 "$target/etc/sudoers" "$target/etc/sudoers.d/atlas-owner"
+        }
   '';
-  seedBootstrapDigest = builtins.hashString "sha256" bootstrapTree;
-  seedId = builtins.hashString "sha256" "${ubuntuRootfs}:${pkgs.systemd}:${seedBootstrapDigest}";
+  ownerBootstrapId = builtins.hashString "sha256" ownerLayout;
+  environmentOwnerLayoutId =
+    environment:
+    builtins.hashString "sha256" (
+      builtins.toJSON {
+        inherit ownerBootstrapId;
+        durableOwnerHome = environment.ownerHome;
+        ownerHomeVolumeId = if environment.ownerHome then cfg.owner.homeVolumeId else null;
+      }
+    );
+  bootstrapTree =
+    environment:
+    let
+      ownerLayoutId = environmentOwnerLayoutId environment;
+    in
+    ''
+      ${ownerLayout}
+      bootstrap_tree() {
+        local target="$1"
+        tar --extract --gzip --numeric-owner --file=${ubuntuRootfs} --directory="$target"
+        install -d -m 0755 \
+          "$target/etc/atlas" \
+          "$target/etc/systemd/system" \
+          "$target/run/atlas" \
+          "$target/run/atlas-host-systemd" \
+          "$target/usr/lib/systemd"
+        ${lib.optionalString (allMountTargets != [ ]) ''
+          install -d -m 0755 ${concatMapStringsSep " " (path: ''"$target${path}"'') allMountTargets}
+        ''}
+        provision_owner "$target"
+        printf '%s\n' ${lib.escapeShellArg ownerLayoutId} > "$target/etc/atlas/owner-layout-id"
+        ln -sfn /run/atlas-host-systemd/lib/systemd/systemd "$target/sbin/init"
+        rm -rf -- "$target/usr/lib/systemd/system"
+        install -d -m 0755 "$target/usr/lib/systemd/system"
+        while IFS= read -r -d "" source_path; do
+          relative_path="''${source_path#./}"
+          install -d -m 0755 "$target/usr/lib/systemd/system/$relative_path"
+        done < <(
+          cd ${pkgs.systemd}/example/systemd/system
+          find . -mindepth 1 -type d -print0
+        )
+        while IFS= read -r -d "" source_path; do
+          relative_path="''${source_path#./}"
+          ln -sfn \
+            "/run/atlas-host-systemd/example/systemd/system/$relative_path" \
+            "$target/usr/lib/systemd/system/$relative_path"
+        done < <(
+          cd ${pkgs.systemd}/example/systemd/system
+          find . -mindepth 1 ! -type d -print0
+        )
+        ln -sfn /usr/lib/systemd/system/multi-user.target \
+          "$target/etc/systemd/system/default.target"
+      }
+    '';
+  seedBootstrapDigest = environment: builtins.hashString "sha256" (bootstrapTree environment);
+  seedId =
+    environment:
+    builtins.hashString "sha256" "${ubuntuRootfs}:${pkgs.systemd}:${seedBootstrapDigest environment}";
 
   effectiveVariables =
     environment:
@@ -145,12 +258,23 @@ let
   ) cfg.environments;
 
   volumeRecord = name: volume: {
-    inherit (volume) id owner;
+    inherit (volume) id;
     inherit name;
     hostPath = volumePath volume;
     durability = if dataRootPersistent then "host-durable" else "host-volatile";
   };
   volumeRecords = mapAttrs volumeRecord cfg.volumes;
+
+  ownerRecord = {
+    name = cfg.owner.name;
+    uid = cfg.owner.uid;
+    home = ownerHome;
+    homeStorage = {
+      id = cfg.owner.homeVolumeId;
+      hostPath = ownerHomePath;
+      durability = if dataRootPersistent then "host-durable" else "host-volatile";
+    };
+  };
 
   environmentVolumeRecords =
     environment:
@@ -163,7 +287,24 @@ let
   environmentRecord = name: environment: {
     inherit (environment) id uid;
     inherit name;
-    home = "/home/agent";
+    home = ownerHome;
+    user = {
+      name = cfg.owner.name;
+      uid = cfg.owner.uid;
+      elevation = "passwordless-environment-sudo";
+    };
+    homeComposition =
+      if environment.ownerHome then
+        {
+          durable = true;
+          durableHostPath = ownerHomePath;
+          resettablePaths = resettableHomePaths;
+        }
+      else
+        {
+          durable = false;
+          resettablePaths = [ ];
+        };
     variables = effectiveVariables environment;
     packages = effectivePackageNames environment;
     git.config = effectiveGitConfig environment;
@@ -175,6 +316,7 @@ let
     runtime = {
       backend = "systemd-nspawn-service";
       lifecycle = "resettable";
+      ownerLayoutId = environmentOwnerLayoutId environment;
       persistence = if dataRootPersistent then "until-explicit-reset" else "until-reset-or-host-reboot";
       resettable = true;
       rootHostPath = environmentRuntimeRoot environment;
@@ -187,7 +329,7 @@ let
       // optionalAttrs btrfsStorage {
         seedHostPath = environmentSeed environment;
         snapshotsHostPath = environmentSnapshots environment;
-        seed.id = seedId;
+        seed.id = seedId environment;
         seedPrepareCommand = "${seedPreparers.${name}}/bin/atlas-prepare-seed-${name}";
       };
       baseImage = baseImageRecord;
@@ -228,6 +370,8 @@ let
       resettableRoots = true;
       rebootPersistentRoots = dataRootPersistent;
       durableVolumes = dataRootPersistent;
+      durableOwnerHome = dataRootPersistent;
+      resettableHomePaths = true;
       persistentInstances = true;
       concurrentEntry = true;
     };
@@ -321,12 +465,13 @@ let
       ATLAS_CONTROL_SOCKET = "/run/atlas/control.sock";
       ATLAS_ENVIRONMENT_ID = environment.id;
       ATLAS_ENVIRONMENT_NAME = name;
+      GIT_CONFIG_GLOBAL = "${ownerHome}/.config/git/config";
       GIT_CONFIG_SYSTEM = toString gitConfigFiles.${name};
-      HOME = "/home/agent";
-      LOGNAME = "root";
-      PATH = "/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${toolPath}";
+      HOME = ownerHome;
+      LOGNAME = cfg.owner.name;
+      PATH = "${ownerHome}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${toolPath}";
       SHELL = toString environmentShell;
-      USER = "root";
+      USER = cfg.owner.name;
     };
 
   environmentArgumentLines =
@@ -359,17 +504,34 @@ let
       "        ${lib.escapeShellArg "${flag}=${source}:${mount.target}:idmap"}"
     ) (builtins.attrNames environment.volumeMounts);
 
+  ownerHomeArgumentLines =
+    environment:
+    lib.optionalString environment.ownerHome (
+      concatMapStringsSep "\n" (argument: "        ${lib.escapeShellArg argument}") (
+        [ "--bind=${ownerHomePath}:${ownerHome}:idmap" ]
+        ++ map (
+          path: "--bind=${environmentRuntimeRoot environment}${ownerHome}/${path}:${ownerHome}/${path}:idmap"
+        ) resettableHomePaths
+      )
+    );
+
   environmentDaemons = mapAttrs (
     name: environment:
     let
       runtimeRoot = environmentRuntimeRoot environment;
+      ownerLayoutId = environmentOwnerLayoutId environment;
       environmentArguments = environmentArgumentLines name environment;
+      ownerHomeArguments = ownerHomeArgumentLines environment;
       volumeArguments = volumeArgumentLines environment;
     in
     pkgs.writeShellApplication {
       name = "atlas-environment-${name}";
       runtimeInputs = [ pkgs.systemd ];
       text = ''
+        if [ "$(cat ${lib.escapeShellArg (environmentRuntimeReady environment)} 2>/dev/null || true)" != ${lib.escapeShellArg ownerLayoutId} ]; then
+          echo "Atlas environment ${name} requires an explicit reset for the current owner layout" >&2
+          exit 1
+        fi
         nspawn_arguments=(
           --quiet
           --settings=no
@@ -386,9 +548,24 @@ let
           --bind-ro=/etc/atlas:/etc/atlas
           --bind=/run/atlas/control.sock:/run/atlas/control.sock
         ${environmentArguments}
+        ${ownerHomeArguments}
         ${volumeArguments}
         )
         exec systemd-nspawn "''${nspawn_arguments[@]}"
+      '';
+    }
+  ) cfg.environments;
+
+  environmentLayoutChecks = mapAttrs (
+    name: environment:
+    let
+      ownerLayoutId = environmentOwnerLayoutId environment;
+    in
+    pkgs.writeShellApplication {
+      name = "atlas-check-owner-layout-${name}";
+      runtimeInputs = [ pkgs.coreutils ];
+      text = ''
+        [ "$(cat ${lib.escapeShellArg (environmentRuntimeReady environment)} 2>/dev/null || true)" = ${lib.escapeShellArg ownerLayoutId} ]
       '';
     }
   ) cfg.environments;
@@ -398,6 +575,8 @@ let
     let
       stateParent = environmentStateParent environment;
       seedRoot = environmentSeed environment;
+      bootstrapTreeForEnvironment = bootstrapTree environment;
+      environmentSeedId = seedId environment;
     in
     pkgs.writeShellApplication {
       name = "atlas-prepare-seed-${name}";
@@ -447,7 +626,7 @@ let
           printf '%s\n' "$temporary_path"
         }
 
-        ${bootstrapTree}
+        ${bootstrapTreeForEnvironment}
 
         if [ -L ${lib.escapeShellArg stateParent} ] || [ ! -d ${lib.escapeShellArg stateParent} ]; then
           echo "Atlas refused an invalid environment state parent" >&2
@@ -477,7 +656,7 @@ let
 
         seed_matches=false
         if [ -d ${lib.escapeShellArg seedRoot} ] && \
-           [ "$(cat ${lib.escapeShellArg "${seedRoot}/etc/atlas/seed-id"} 2>/dev/null || true)" = ${lib.escapeShellArg seedId} ] && \
+           [ "$(cat ${lib.escapeShellArg "${seedRoot}/etc/atlas/seed-id"} 2>/dev/null || true)" = ${lib.escapeShellArg environmentSeedId} ] && \
            [ "$(btrfs property get -ts ${lib.escapeShellArg seedRoot} ro 2>/dev/null || true)" = ro=true ]; then
           seed_matches=true
         fi
@@ -496,7 +675,7 @@ let
         trap cleanup_seed EXIT
         btrfs subvolume create "$temporary_seed" >/dev/null
         bootstrap_tree "$temporary_seed"
-        printf '%s\n' ${lib.escapeShellArg seedId} > "$temporary_seed/etc/atlas/seed-id"
+        printf '%s\n' ${lib.escapeShellArg environmentSeedId} > "$temporary_seed/etc/atlas/seed-id"
         btrfs property set -ts "$temporary_seed" ro true
 
         if [ -e ${lib.escapeShellArg seedRoot} ]; then
@@ -528,6 +707,8 @@ let
       snapshotsRoot = environmentSnapshots environment;
       environmentShell = environmentShells.${name};
       environmentAssignments = environmentAssignmentLines name environment;
+      ownerLayoutId = environmentOwnerLayoutId environment;
+      bootstrapTreeForEnvironment = bootstrapTree environment;
       service = environmentServiceUnit name;
       cgroupPrefix = environmentCgroupPrefix name;
     in
@@ -595,7 +776,7 @@ let
                   printf '%s\n' "$temporary_path"
                 }
 
-                ${bootstrapTree}
+                ${bootstrapTreeForEnvironment}
 
                 if [ -L ${lib.escapeShellArg stateParent} ] || [ ! -d ${lib.escapeShellArg stateParent} ]; then
                   echo "Atlas refused an invalid environment state parent" >&2
@@ -609,6 +790,11 @@ let
                 if [ -L ${lib.escapeShellArg runtimeReady} ] || \
                    { [ -e ${lib.escapeShellArg runtimeReady} ] && [ ! -f ${lib.escapeShellArg runtimeReady} ]; }; then
                   echo "Atlas refused an invalid environment readiness marker" >&2
+                  exit 1
+                fi
+                if [ -f ${lib.escapeShellArg runtimeReady} ] && \
+                   [ "$(cat ${lib.escapeShellArg runtimeReady})" != ${lib.escapeShellArg ownerLayoutId} ]; then
+                  echo "Atlas environment ${name} requires an explicit reset for the current owner layout" >&2
                   exit 1
                 fi
                 if [ "$storage_adapter" = btrfs-subvolume ]; then
@@ -640,12 +826,22 @@ let
                   refuse_mounts_below ${lib.escapeShellArg runtimeRoot}
 
                   shopt -s nullglob
+                  ready_markers=(
+                    ${stateParent}/.rootfs-ready.*
+                  )
                   private_paths=(
                     ${stateParent}/.deleting-*
                     ${stateParent}/.rootfs.*
                     ${stateParent}/.seed.*
                   )
                   shopt -u nullglob
+                  for ready_marker in "''${ready_markers[@]}"; do
+                    if [ -L "$ready_marker" ] || [ ! -f "$ready_marker" ]; then
+                      echo "Atlas refused an invalid private lifecycle path" >&2
+                      exit 1
+                    fi
+                    rm -f -- "$ready_marker"
+                  done
                   for private_path in "''${private_paths[@]}"; do
                     if [ -L "$private_path" ] || [ ! -d "$private_path" ]; then
                       echo "Atlas refused an invalid private lifecycle path" >&2
@@ -674,7 +870,8 @@ let
                     }
                     trap cleanup EXIT
                     mv -T -- "$temporary_root" ${lib.escapeShellArg runtimeRoot}
-                    install -m 0600 /dev/null ${lib.escapeShellArg runtimeReady}
+                    printf '%s\n' ${lib.escapeShellArg ownerLayoutId} > ${lib.escapeShellArg runtimeReady}
+                    chmod 0600 ${lib.escapeShellArg runtimeReady}
                     trap - EXIT
                   fi
 
@@ -709,8 +906,12 @@ let
                   --net \
                   --pid \
                   --cgroup \
-                  --wdns=/home/agent \
+                  --wdns=${lib.escapeShellArg ownerHome} \
                   -- \
+                  ${pkgs.util-linux}/bin/setpriv \
+                  --reuid=${toString cfg.owner.uid} \
+                  --regid=${toString cfg.owner.uid} \
+                  --clear-groups \
                   ${pkgs.coreutils}/bin/env -i \
         ${environmentAssignments} \
                   "''${command[@]}"
@@ -776,7 +977,7 @@ let
   ) environmentNames;
   environmentIds = map (name: cfg.environments.${name}.id) environmentNames;
   environmentUids = map (name: cfg.environments.${name}.uid) environmentNames;
-  volumeIds = map (name: cfg.volumes.${name}.id) volumeNames;
+  volumeIds = [ cfg.owner.homeVolumeId ] ++ map (name: cfg.volumes.${name}.id) volumeNames;
   allVariableNames = unique (
     concatMap (name: builtins.attrNames cfg.environmentLayers.${name}.variables) layerNames
     ++ concatMap (name: builtins.attrNames cfg.environments.${name}.variables) environmentNames
@@ -785,6 +986,7 @@ let
     name: builtins.match "^[A-Za-z_][A-Za-z0-9_]*$" name == null
   ) allVariableNames;
   runtimeVariableNames = [
+    "GIT_CONFIG_GLOBAL"
     "GIT_CONFIG_SYSTEM"
     "HOME"
     "LOGNAME"
@@ -798,6 +1000,27 @@ let
   invalidEnvironmentNames = filter (
     name: builtins.match "^[a-z][a-z0-9-]{0,19}$" name == null
   ) environmentNames;
+  ownerNameValid = builtins.match "^[a-z_][a-z0-9_-]{0,31}$" cfg.owner.name != null;
+  reservedOwnerNames = [
+    "root"
+    "daemon"
+    "bin"
+    "sys"
+    "sync"
+    "games"
+    "man"
+    "lp"
+    "mail"
+    "news"
+    "uucp"
+    "proxy"
+    "www-data"
+    "backup"
+    "list"
+    "irc"
+    "_apt"
+    "nobody"
+  ];
   invalidVolumeNames = filter (
     name: builtins.match "^[a-z][a-z0-9-]{0,39}$" name == null
   ) volumeNames;
@@ -810,6 +1033,67 @@ let
   allMountTargets = concatMap (
     name: mapAttrsToList (_volume: mount: mount.target) cfg.environments.${name}.volumeMounts
   ) environmentNames;
+  ownerHomeChildMountTargets = unique (
+    filter (path: hasPrefix "${ownerHome}/" path) (
+      concatMap (
+        name:
+        lib.optionals cfg.environments.${name}.ownerHome (
+          mapAttrsToList (_volume: mount: mount.target) cfg.environments.${name}.volumeMounts
+        )
+      ) environmentNames
+    )
+  );
+  ownerHomeManagedDirectories = unique (
+    [ ".local" ]
+    ++ resettableHomePaths
+    ++ map (path: lib.removePrefix "${ownerHome}/" path) ownerHomeChildMountTargets
+  );
+  ownerHomePrepareProgram = pkgs.writeText "atlas-owner-home-prepare.py" ''
+    import os
+    import stat
+    import sys
+
+    owner_home = sys.argv[1]
+    owner_uid = int(sys.argv[2])
+    managed_paths = sys.argv[3:]
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+    try:
+        owner_fd = os.open(owner_home, directory_flags)
+    except OSError as error:
+        raise SystemExit(f"Atlas refused an invalid durable owner home: {error}")
+
+    try:
+        owner_metadata = os.fstat(owner_fd)
+        if not stat.S_ISDIR(owner_metadata.st_mode):
+            raise SystemExit("Atlas durable owner home is not a directory")
+
+        for relative_path in managed_paths:
+            current_fd = os.dup(owner_fd)
+            try:
+                for component in relative_path.split("/"):
+                    if component in {"", ".", ".."}:
+                        raise SystemExit("Atlas refused an invalid managed owner-home path")
+                    try:
+                        os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                    try:
+                        child_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                    except OSError as error:
+                        raise SystemExit(
+                            "Atlas refused a symbolic link or non-directory below "
+                            f"the durable owner home: {relative_path}: {error}"
+                        )
+                    os.close(current_fd)
+                    current_fd = child_fd
+                    os.fchown(current_fd, owner_uid, owner_uid)
+                    os.fchmod(current_fd, 0o700)
+            finally:
+                os.close(current_fd)
+    finally:
+        os.close(owner_fd)
+  '';
   isSafeMountTarget =
     path:
     let
@@ -834,7 +1118,14 @@ let
     ) allMountTargets
   );
   invalidHomeMountTargets = unique (
-    filter (path: path == "/home/agent" || hasPrefix "${path}/" "/home/agent") allMountTargets
+    filter (
+      path:
+      path == ownerHome
+      || hasPrefix "${path}/" ownerHome
+      || builtins.any (
+        resettablePath: pathsOverlap path "${ownerHome}/${resettablePath}"
+      ) resettableHomePaths
+    ) allMountTargets
   );
 in
 {
@@ -872,6 +1163,21 @@ in
       '';
     };
 
+    owner = {
+      name = mkOption {
+        type = types.str;
+        description = "Conventional Linux username for the single human owner inside environments.";
+      };
+      uid = mkOption {
+        type = types.ints.between 1000 19999;
+        description = "Stable Linux UID for the human owner inside environment user namespaces.";
+      };
+      homeVolumeId = mkOption {
+        type = types.str;
+        description = "Opaque UUID for the automatically managed durable owner-home volume.";
+      };
+    };
+
     environmentLayers = mkOption {
       default = { };
       type = types.attrsOf (
@@ -906,11 +1212,6 @@ in
             id = mkOption {
               type = types.str;
               description = "Opaque, non-reusable volume UUID.";
-            };
-            owner = mkOption {
-              type = types.str;
-              default = "operator";
-              description = "Durable ownership label; it is not a Linux username.";
             };
           };
         }
@@ -972,6 +1273,15 @@ in
               );
               description = "Explicit durable-volume attachments for this resettable environment.";
             };
+            ownerHome = mkOption {
+              default = false;
+              type = types.bool;
+              description = ''
+                Compose the automatically managed durable owner home into this
+                environment, with the v0 resettable configuration paths mounted
+                from the environment root.
+              '';
+            };
             networkMode = mkOption {
               default = "shared-host";
               type = types.enum [ "shared-host" ];
@@ -1014,6 +1324,10 @@ in
         message = "Atlas environment names must be lowercase slugs of at most 20 characters: ${builtins.toJSON invalidEnvironmentNames}";
       }
       {
+        assertion = ownerNameValid && !(builtins.elem cfg.owner.name reservedOwnerNames);
+        message = "Atlas owner name must be a non-system conventional lowercase Linux username";
+      }
+      {
         assertion = invalidVolumeNames == [ ];
         message = "Atlas volume names must be lowercase slugs of at most 40 characters: ${builtins.toJSON invalidVolumeNames}";
       }
@@ -1035,7 +1349,7 @@ in
       }
       {
         assertion = length volumeIds == length (unique volumeIds);
-        message = "Atlas volume IDs must be unique";
+        message = "Atlas owner home volume ID and declared volume IDs must be unique";
       }
       {
         assertion = unknownLayers == [ ];
@@ -1078,11 +1392,12 @@ in
     ];
 
     atlas.host.environmentContract = {
-      version = 5;
+      version = 6;
       adapter = if btrfsStorage then "nixos-nspawn-btrfs-v0" else "nixos-nspawn-directory-v0";
       baseImage = baseImageRecord;
       composition = doctor.composition;
       identity = doctor.identity;
+      owner = ownerRecord;
       volumes = volumeRecords;
       environments = environmentRecords;
     };
@@ -1131,6 +1446,20 @@ in
               echo "Atlas Btrfs adapter requires ${toString cfg.dataRoot} to reside on Btrfs" >&2
               exit 1
             fi
+            if [ -L ${lib.escapeShellArg ownerHomePath} ]; then
+              echo "Atlas refused a symbolic link at the durable owner home" >&2
+              exit 1
+            fi
+            if [ -e ${lib.escapeShellArg ownerHomePath} ]; then
+              if ! btrfs subvolume show ${lib.escapeShellArg ownerHomePath} >/dev/null 2>&1; then
+                echo "Atlas durable owner home is not a Btrfs subvolume" >&2
+                exit 1
+              fi
+            else
+              btrfs subvolume create ${lib.escapeShellArg ownerHomePath} >/dev/null
+            fi
+            chmod 0700 ${lib.escapeShellArg ownerHomePath}
+            chown ${toString cfg.owner.uid}:${toString cfg.owner.uid} ${lib.escapeShellArg ownerHomePath}
             ${concatMapStringsSep "\n" (
               name:
               let
@@ -1150,14 +1479,39 @@ in
                   btrfs subvolume create ${lib.escapeShellArg path} >/dev/null
                 fi
                 chmod 0700 ${lib.escapeShellArg path}
+                chown ${toString cfg.owner.uid}:${toString cfg.owner.uid} ${lib.escapeShellArg path}
               ''
             ) volumeNames}
           '';
         };
 
+        atlas-owner-home-prepare = {
+          description = "Safely prepare Atlas owner-home mountpoints";
+          requires = lib.optional btrfsStorage "atlas-storage-prepare.service";
+          after = [
+            "systemd-tmpfiles-setup.service"
+          ]
+          ++ lib.optional btrfsStorage "atlas-storage-prepare.service";
+          unitConfig.RequiresMountsFor = [ ownerHomePath ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          script = ''
+            exec ${pkgs.python3}/bin/python3 -P \
+              ${ownerHomePrepareProgram} \
+              ${lib.escapeShellArg ownerHomePath} \
+              ${toString cfg.owner.uid} \
+              ${concatMapStringsSep " " lib.escapeShellArg ownerHomeManagedDirectories}
+          '';
+        };
+
         atlas-host-contract = mkIf btrfsStorage {
-          requires = [ "atlas-storage-prepare.service" ];
-          after = [ "atlas-storage-prepare.service" ];
+          requires = [
+            "atlas-storage-prepare.service"
+            "atlas-owner-home-prepare.service"
+          ];
+          after = [ "atlas-owner-home-prepare.service" ];
         };
 
         atlas-control = {
@@ -1227,13 +1581,20 @@ in
         name: environment:
         nameValuePair (environmentServiceName name) {
           description = "Persistent Atlas environment ${name}";
-          requires = [ "atlas-control.socket" ];
-          after = [ "atlas-control.socket" ];
+          requires = [
+            "atlas-control.socket"
+            "atlas-owner-home-prepare.service"
+          ];
+          after = [
+            "atlas-control.socket"
+            "atlas-owner-home-prepare.service"
+          ];
           restartTriggers = [ environmentConfigFiles.${name} ];
           unitConfig.RequiresMountsFor = [ (environmentStateParent environment) ];
           serviceConfig = {
             Type = "notify";
             NotifyAccess = "all";
+            ExecCondition = "${environmentLayoutChecks.${name}}/bin/atlas-check-owner-layout-${name}";
             ExecStart = "${environmentDaemons.${name}}/bin/atlas-environment-${name}";
             Slice = sliceUnit name;
             Delegate = true;
@@ -1303,6 +1664,10 @@ in
           "d ${environmentSnapshots environment} 0700 root root - -"
         ]
       ) environmentNames
+      ++ [ "d ${builtins.dirOf ownerHomePath} 0711 root root - -" ]
+      ++ lib.optionals (!btrfsStorage) ([
+        "d ${ownerHomePath} 0700 ${toString cfg.owner.uid} ${toString cfg.owner.uid} - -"
+      ])
       ++ concatMap (
         name:
         let
@@ -1310,7 +1675,9 @@ in
           parent = builtins.dirOf (volumePath volume);
         in
         [ "d ${parent} 0711 root root - -" ]
-        ++ lib.optional (!btrfsStorage) "d ${volumePath volume} 0700 root root - -"
+        ++ lib.optional (
+          !btrfsStorage
+        ) "d ${volumePath volume} 0700 ${toString cfg.owner.uid} ${toString cfg.owner.uid} - -"
       ) volumeNames;
     };
 

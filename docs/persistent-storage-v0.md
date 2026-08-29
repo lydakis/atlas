@@ -79,39 +79,50 @@ environment
 │   ├── packages and package database
 │   ├── /etc
 │   ├── caches and temporary build state
-│   └── resettable user and tool configuration
+│   └── environment-local home paths
+│       ├── ~/.config
+│       ├── ~/.cache
+│       ├── ~/.local/bin
+│       └── ~/.local/state
 └── durable volume mounts
-    ├── repositories and uncommitted work
-    ├── retained artifacts
-    └── other explicitly durable data
+    ├── /home/<owner>
+    │   ├── repositories and uncommitted work
+    │   ├── retained artifacts
+    │   ├── ~/.local/share
+    │   └── other ordinary owner files
+    └── other explicitly attached volumes
 ```
 
-The current declarative spike explicitly defines and attaches a `projects`
-volume at `/home/agent/work`. The product installation flow should create and
-attach a primary durable user volume to the default environment automatically.
-The final human-account and durable-home layout is still a product decision;
-`/home/agent` is a prototype path, not an agent identity or settled user model.
+Atlas automatically creates the configured owner's home volume. Environments
+request access to it independently of other declared volumes. The current proof
+also mounts a separate `projects` volume at `/home/owner/Projects`, showing that
+a conventional home may contain nested volumes with different attachment
+policy.
 
 Agents are processes, not storage owners. Attaching a volume to a second
 environment exposes the same human-owned data there without copying it. Atlas
 does not create a new environment or volume for every agent.
 
-## Owner account remains open
+## Owner account and home composition
 
-The spike currently enters as mapped root and changes that account's home from
-`/root` to `/home/agent`. This only gives the test adapter a writable conventional
-home and does not represent the product identity model.
+Entry runs as the configured human-owner account at `/home/<owner>`. It has
+passwordless environment-local `sudo`: every admitted process can become root
+inside that environment, but the user namespace does not turn that into host
+root. Agents remain programs sharing the owner's environment authority, not
+Unix identities.
 
-The intended product has a human owner account, plausibly `/home/<owner>`, with
-environment-local elevation for ordinary system administration. Agent clients
-run programs under authority granted inside that environment; they do not each
-receive or own a Unix account merely because they are agents.
+The durable home is the simple default for ordinary files. Atlas mounts four
+paths from the resettable root over it: `~/.config`, `~/.cache`,
+`~/.local/bin`, and `~/.local/state`. `~/.local/share` remains durable in v0.
+This gives different environments separate tool configuration while preserving
+the same repositories and documents. Atlas does not infer lifecycle from file
+names: dotfiles outside the explicit list remain durable.
 
-The storage adapter supports either an entirely durable owner home or selected
-durable directories mounted inside a resettable home. That policy is not chosen
-here because it determines which dotfiles, tool state, and caches reset repairs.
-The product must choose and explain it before a persistent installer is called
-safe for real work.
+Atlas prepares only the declared mountpoint paths below the durable home. The
+host helper anchors itself to an open owner-home directory and walks each path
+with descriptor-relative `mkdirat` and `openat` operations that refuse symbolic
+links. Owner-controlled pathnames therefore cannot redirect privileged
+preparation into another host location.
 
 ## Reset
 
@@ -121,17 +132,20 @@ It:
 1. takes the environment lifecycle lock
 2. validates that the managed state parent, root, and readiness marker are not
    symlinks or unexpected file types
-3. stops the complete environment service and active entry workload
-4. confirms the service is inactive
-5. refuses reset while mounts remain below the environment root
-6. removes abandoned private bootstrap or deletion directories
-7. realizes the current declared seed when its pinned identity is missing or
+3. fingerprints the durable owner-home device and inode when one is attached
+4. stops the complete environment service and active entry workload
+5. confirms the service is inactive
+6. refuses reset while mounts remain below the environment root
+7. removes abandoned private bootstrap or deletion directories
+8. realizes the current declared seed when its pinned identity is missing or
    stale, then verifies the expected identity before touching the active root
-8. creates a writable snapshot from the read-only applied seed
-9. atomically swaps that snapshot into the active root path
-10. recursively removes the detached old-root subvolume, or leaves a private tombstone for
+9. creates a writable snapshot from the read-only applied seed
+10. atomically swaps that snapshot into the active root path and publishes the
+    current owner-layout identity in a host-owned sidecar
+11. recursively removes the detached old-root subvolume, or leaves a private tombstone for
    later cleanup if deletion fails
-11. leaves every attached durable volume in place
+12. verifies the durable owner-home fingerprint is unchanged and reports that
+    observed result
 
 Reset returns immediately to an initialized root rather than re-extracting the
 base image. Because the root and seed remain below `/var/lib/atlas`, reset
@@ -153,6 +167,11 @@ its root, and restarts it. Restore takes a writable snapshot of the selected
 root snapshot, atomically replaces the active root, and restarts an environment
 that was previously running. Snapshot names are bounded lowercase slugs, and
 all snapshot paths are derived from the environment's opaque identity.
+Create and restore require the current host-owned owner-layout marker, and
+restore rejects a snapshot whose in-root compatibility marker predates the
+current layout. Atlas reads that in-root marker through descriptor-relative,
+no-follow traversal, so a mutable root cannot make an external host marker
+stand in for snapshot compatibility through a symbolic link.
 
 These operations snapshot resettable machine state only. Attached volumes are
 sibling subvolumes and are deliberately outside the root snapshot. Volume
@@ -227,6 +246,8 @@ The AArch64 host-contract test verifies that:
   and can be deleted explicitly
 - restoring a root snapshot removes later root changes while preserving later
   durable-volume changes
+- snapshot compatibility validation refuses symbolic links at every component
+  of the in-root owner-layout marker path
 - interrupted root and seed bootstrap subvolumes are recursively removed during
   entry and reset
 - root snapshot creation rejects nested Btrfs subvolumes instead of silently

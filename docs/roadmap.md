@@ -47,16 +47,19 @@ promise, not a consequence of a path happening to be on disk.
 ### Resettable machine state
 
 The environment root contains installed packages, `/etc`, caches, tool
-configuration, and any home content not placed on durable owner storage. The
-product default is disk-backed and persistent until the operator deliberately
-resets or deletes the environment. It survives disconnect, process failure,
-host reboot, and supported update, but it is not implicitly backed up and is
-not protected from explicit reset.
+configuration, and the environment-local home paths declared below. The product
+default is disk-backed and persistent until the operator deliberately resets or
+deletes the environment. It survives disconnect, process failure, host reboot,
+and supported update, but it is not implicitly backed up and is not protected
+from explicit reset.
 
-The exact owner-home composition remains open. Atlas may make the entire owner
-home durable or mount selected durable directories inside a resettable home.
-Either choice must look conventional inside the environment and state clearly
-what reset removes. `/home/agent` is only the current mapped-root spike path.
+Atlas gives the single human owner a conventional `/home/<owner>` backed by an
+automatically managed durable volume. An environment may attach that home, then
+overlay `~/.config`, `~/.cache`, `~/.local/bin`, and `~/.local/state` from its
+resettable root. `~/.local/share` and ordinary owner files are durable in v0.
+This is an explicit path contract, not a claim that Atlas recognizes every
+configuration dotfile. Environments that omit owner-home access receive a
+private resettable home instead.
 
 Copy-on-write reconstruction and atomic root replacement are now proven by the
 Btrfs adapter. Quota enforcement remains absent. Agents should not need to
@@ -119,14 +122,15 @@ ceremony, and hardware recovery remain unproven.
   one LUKS2 container, with a fixed host logical volume and an elastic Btrfs data
   logical volume. It requires installer-generated device UUIDs rather than
   trusting reusable labels. KVM proves one fully instantiated installation,
-  unattended test-key boot, reboot, reset, and durable-volume survival. The live
+  unattended test-key boot, reboot, reset, durable owner-home survival, and
+  declared-volume survival. The live
   ISO still does not install this layout, and the operator-passphrase ceremony,
   physical hardware, power-loss, recovery, and metadata-exhaustion behavior are
-  untested. The test preserves a declared work volume; automatic per-owner
-  durable storage is still absent.
-- `/home/agent` remains a spike convention for mapped root, not the product
-  identity. The owner account, conventional home layout, and environment-local
-  elevation contract remain open.
+  untested.
+- The current implementation enters as the configured human-owner UID at
+  `/home/<owner>` with passwordless environment-local `sudo`. This deliberately
+  grants every admitted process root inside that environment, not Atlas-host
+  root; narrower per-process authority remains future Grant work.
 - Environments currently share host networking. Isolation and duplicate port
   use are not yet provided by the Environment Entry adapter.
 - The read-only host Nix store remains visible inside environments for declared
@@ -139,8 +143,6 @@ ceremony, and hardware recovery remain unproven.
 - How much fixed host capacity should the first hardware profile reserve, how
   should it recover when the elastic Btrfs data filesystem is full, and which
   optional quota policy is acceptable for additional environments?
-- How should the human owner account, conventional home, and environment-local
-  elevation work without turning agents into identities?
 - Which environment backend is sufficient for the first trust model, and when
   does a higher-risk environment require a microVM?
 - Which browser automation capability can preserve the stated cookie and

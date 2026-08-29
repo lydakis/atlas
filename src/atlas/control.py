@@ -153,10 +153,11 @@ def handle_request(
         if not isinstance(name, str) or name not in environments:
             return _error("not_found", "environment does not exist")
         environment = environments[name]
-        lifecycle.reset(environment)
+        preserved_owner_home = lifecycle.reset(environment)
         return _success(
             {
                 "name": name,
+                "preservedOwnerHome": preserved_owner_home,
                 "preservedVolumes": sorted(
                     mount["name"] for mount in environment.get("volumes", [])
                 ),
@@ -207,7 +208,7 @@ def handle_request(
             )
         try:
             method = getattr(lifecycle, snapshot_methods[operation])
-            method(environment, snapshot)
+            lifecycle_result = method(environment, snapshot)
         except ControlOperationError as error:
             return _error(error.code, error.message)
         if operation == "environment.snapshot.create":
@@ -215,6 +216,7 @@ def handle_request(
         elif operation == "environment.snapshot.restore":
             result = {
                 "name": name,
+                "preservedOwnerHome": lifecycle_result,
                 "preservedVolumes": sorted(
                     mount["name"] for mount in environment.get("volumes", [])
                 ),
