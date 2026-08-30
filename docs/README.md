@@ -29,6 +29,9 @@ behavior has been implemented or validated.
 
 - [NixOS architecture spike](nixos-spike.md) records what the current adapter
   has actually demonstrated and where it remains degraded.
+- [DigitalOcean dogfood laboratory](digitalocean-dogfood.md) defines the
+  replaceable remote test host and the exact existing-client ceremony. It is a
+  runbook, not physical-product evidence.
 
 Evidence claims belong in a test or spike report. Implementation status belongs
 in the roadmap. This keeps the durable product thesis independent of whichever

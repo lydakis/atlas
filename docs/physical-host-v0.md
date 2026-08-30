@@ -35,7 +35,8 @@ unlock.
 This is evidence for the layout and lifecycle, not a user-facing installer or
 physical-hardware result. The operator prompt, recovery key flow, full-disk and
 metadata exhaustion, power loss, Secure Boot, and hardware compatibility remain
-untested. Automatic per-owner durable storage is also not implemented.
+untested. Automatic per-owner durable storage is implemented and KVM-tested,
+but not yet exercised on physical hardware.
 
 ## Build the image
 

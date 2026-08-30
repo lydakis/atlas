@@ -75,14 +75,51 @@
             }
           )
         ];
+
+      mkDigitalOceanHost =
+        bootstrap:
+        mkHost "x86_64-linux" [
+          "${nixpkgs}/nixos/modules/virtualisation/digital-ocean-config.nix"
+          self.nixosModules.digitalocean
+          {
+            atlas.host = {
+              bootstrapOpenSsh.enable = bootstrap;
+              digitalOcean.enable = true;
+            };
+            services.openssh.enable = nixpkgs.lib.mkForce bootstrap;
+            virtualisation.digitalOcean.setSshKeys = bootstrap;
+          }
+        ];
+
+      digitalOceanBootstrapHost = mkDigitalOceanHost true;
+      digitalOceanHost = mkDigitalOceanHost false;
+      digitalOceanImageHost = mkHost "x86_64-linux" [
+        "${nixpkgs}/nixos/modules/virtualisation/digital-ocean-image.nix"
+        self.nixosModules.digitalocean
+        {
+          atlas.host = {
+            bootstrapOpenSsh.enable = true;
+            digitalOcean.enable = true;
+          };
+          environment.etc."atlas/image-source".source = self;
+          image.baseName = "atlas-digitalocean-x86_64";
+          virtualisation = {
+            digitalOcean.setSshKeys = true;
+            diskSize = 8192;
+          };
+        }
+      ];
     in
     {
       nixosModules.default = import ./nixos/modules/atlas-host.nix;
+      nixosModules.digitalocean = import ./nixos/modules/atlas-digitalocean.nix;
       nixosModules.installed-storage = import ./nixos/configurations/installed-host-storage.nix;
 
       nixosConfigurations = {
         atlas-spike-aarch64 = mkVMHost "aarch64-linux";
         atlas-spike-x86_64 = mkVMHost "x86_64-linux";
+        atlas-digitalocean-bootstrap-x86_64 = digitalOceanBootstrapHost;
+        atlas-digitalocean-x86_64 = digitalOceanHost;
       };
 
       packages = forAllSystems (
@@ -119,6 +156,9 @@
             builtins.toJSON vmHost.config.atlas.host.contract
           );
         }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          digitalocean-image = digitalOceanImageHost.config.system.build.digitalOceanImage;
+        }
       );
 
       checks = forAllSystems (
@@ -150,6 +190,7 @@
             inherit pkgs;
             inherit (nixpkgs) lib;
             atlasModule = self.nixosModules.default;
+            digitalOceanModule = self.nixosModules.digitalocean;
             installedStorageModule = self.nixosModules.installed-storage;
           };
           host-contract = import ./nixos/tests/host-contract.nix {

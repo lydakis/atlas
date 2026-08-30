@@ -69,6 +69,51 @@ let
       else
         "sha256-qqeq73rxhbs1mvI151NLBYDlz3yfwn2010xIgfJ1JMw=";
   };
+  ubuntuPackageSnapshot = "20260829T000000Z";
+  ubuntuSudoDeb = pkgs.fetchurl {
+    url = "https://snapshot.ubuntu.com/ubuntu/${ubuntuPackageSnapshot}/pool/main/s/sudo/sudo_1.9.15p5-3ubuntu5.24.04.2_${ubuntuArchitecture}.deb";
+    hash =
+      if pkgs.stdenv.hostPlatform.isAarch64 then
+        "sha256-AVCCudbewXymsZKKnV93obUeFJfKOmMpI2XC1V/IDV8="
+      else
+        "sha256-1TYdQCHcfLYNSblLGGupCMEOnjjzOlXLoEkXVBHrElE=";
+  };
+  ubuntuLibapparmorDeb = pkgs.fetchurl {
+    url = "https://snapshot.ubuntu.com/ubuntu/${ubuntuPackageSnapshot}/pool/main/a/apparmor/libapparmor1_4.0.1really4.0.1-0ubuntu0.24.04.7_${ubuntuArchitecture}.deb";
+    hash =
+      if pkgs.stdenv.hostPlatform.isAarch64 then
+        "sha256-nvJll1CdT6HURshKinY556bzpsRxeV1y3xaf7LuDUUc="
+      else
+        "sha256-QgU1HDf06BPxyoG21ZoABx8PcIaeZS9KueW6fl6JXTQ=";
+  };
+  ubuntuBootstrapId = builtins.hashString "sha256" "${ubuntuLibapparmorDeb}:${ubuntuSudoDeb}";
+  atlasCaBundle = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+  migrateLegacyCaBundles = pkgs.writeShellApplication {
+    name = "atlas-migrate-legacy-ca-bundles";
+    runtimeInputs = [ pkgs.coreutils ];
+    text = ''
+      migrate_bundle() {
+        target="$1"
+        if [ ! -L "$target" ]; then
+          return
+        fi
+
+        link_target="$(readlink -- "$target")"
+        case "$link_target" in
+          /nix/store/*/etc/ssl/certs/ca-bundle.crt)
+            temporary="$(mktemp --tmpdir="$(dirname -- "$target")" .atlas-ca-bundle.XXXXXX)"
+            if ! install -m 0644 ${atlasCaBundle} "$temporary" || ! mv -T -- "$temporary" "$target"; then
+              rm -f -- "$temporary"
+              return 1
+            fi
+            ;;
+        esac
+      }
+
+      migrate_bundle /etc/ssl/certs/ca-bundle.crt
+      migrate_bundle /etc/ssl/certs/ca-certificates.crt
+    '';
+  };
   baseImageRecord = {
     distribution = "ubuntu";
     release = "24.04";
@@ -138,25 +183,12 @@ let
           printf '%s\n' \
             ${lib.escapeShellArg "${cfg.owner.name}:!::"} \
             >> "$target/etc/gshadow"
-          install -m 4755 ${pkgs.sudo}/bin/sudo "$target/usr/local/bin/sudo"
-          cat > "$target/etc/pam.d/sudo" <<EOF
-    auth required ${pkgs.pam}/lib/security/pam_deny.so
-    account required ${pkgs.pam}/lib/security/pam_permit.so
-    session required ${pkgs.pam}/lib/security/pam_permit.so
-    EOF
-          chmod 0644 "$target/etc/pam.d/sudo"
-          rm -rf -- "$target/etc/sudoers.d"
           install -d -m 0750 "$target/etc/sudoers.d"
-          cat > "$target/etc/sudoers" <<'EOF'
-    Defaults env_reset
-    Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    root ALL=(ALL:ALL) ALL
-    @includedir /etc/sudoers.d
-    EOF
-          printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' \
+          printf 'Defaults:%s !use_pty\n%s ALL=(ALL:ALL) NOPASSWD: ALL\n' \
+            ${lib.escapeShellArg cfg.owner.name} \
             ${lib.escapeShellArg cfg.owner.name} \
             > "$target/etc/sudoers.d/atlas-owner"
-          chmod 0440 "$target/etc/sudoers" "$target/etc/sudoers.d/atlas-owner"
+          chmod 0440 "$target/etc/sudoers.d/atlas-owner"
         }
   '';
   ownerBootstrapId = builtins.hashString "sha256" ownerLayout;
@@ -164,7 +196,7 @@ let
     environment:
     builtins.hashString "sha256" (
       builtins.toJSON {
-        inherit ownerBootstrapId;
+        inherit ownerBootstrapId ubuntuBootstrapId;
         durableOwnerHome = environment.ownerHome;
         ownerHomeVolumeId = if environment.ownerHome then cfg.owner.homeVolumeId else null;
       }
@@ -181,15 +213,48 @@ let
         tar --extract --gzip --numeric-owner --file=${ubuntuRootfs} --directory="$target"
         install -d -m 0755 \
           "$target/etc/atlas" \
+          "$target/etc/ssl/certs" \
           "$target/etc/systemd/system" \
+          "$target/etc/systemd/system/multi-user.target.d" \
           "$target/run/atlas" \
           "$target/run/atlas-host-systemd" \
+          "$target/usr/lib/atlas/bootstrap-packages" \
           "$target/usr/lib/systemd"
         ${lib.optionalString (allMountTargets != [ ]) ''
           install -d -m 0755 ${concatMapStringsSep " " (path: ''"$target${path}"'') allMountTargets}
         ''}
         provision_owner "$target"
         printf '%s\n' ${lib.escapeShellArg ownerLayoutId} > "$target/etc/atlas/owner-layout-id"
+        install -m 0644 ${ubuntuLibapparmorDeb} \
+          "$target/usr/lib/atlas/bootstrap-packages/libapparmor1.deb"
+        install -m 0644 ${ubuntuSudoDeb} \
+          "$target/usr/lib/atlas/bootstrap-packages/sudo.deb"
+        printf '%s\n' ${lib.escapeShellArg ubuntuBootstrapId} \
+          > "$target/usr/lib/atlas/bootstrap-packages/bootstrap-id"
+        cat > "$target/etc/systemd/system/atlas-bootstrap-packages.service" <<'EOF'
+    [Unit]
+    Description=Install pinned Ubuntu packages required by Atlas
+    ConditionPathExists=/usr/lib/atlas/bootstrap-packages/sudo.deb
+    Before=multi-user.target
+
+    [Service]
+    Type=oneshot
+    Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    StandardOutput=journal+console
+    StandardError=journal+console
+    ExecStart=/usr/bin/dpkg --install /usr/lib/atlas/bootstrap-packages/libapparmor1.deb /usr/lib/atlas/bootstrap-packages/sudo.deb
+    ExecStartPost=/bin/mv /usr/lib/atlas/bootstrap-packages/bootstrap-id /usr/lib/atlas/bootstrap-complete
+    ExecStartPost=/bin/rm -rf /usr/lib/atlas/bootstrap-packages
+    EOF
+        cat > "$target/etc/systemd/system/multi-user.target.d/atlas-bootstrap-packages.conf" <<'EOF'
+    [Unit]
+    Requires=atlas-bootstrap-packages.service
+    After=atlas-bootstrap-packages.service
+    EOF
+        install -m 0644 ${atlasCaBundle} \
+          "$target/etc/ssl/certs/ca-bundle.crt"
+        install -m 0644 ${atlasCaBundle} \
+          "$target/etc/ssl/certs/ca-certificates.crt"
         ln -sfn /run/atlas-host-systemd/lib/systemd/systemd "$target/sbin/init"
         rm -rf -- "$target/usr/lib/systemd/system"
         install -d -m 0755 "$target/usr/lib/systemd/system"
@@ -877,13 +942,32 @@ let
 
                   systemctl start ${lib.escapeShellArg service}
                 fi
-                flock -u 9
+                if [ "$(cat ${lib.escapeShellArg "${runtimeRoot}/usr/lib/atlas/bootstrap-complete"} 2>/dev/null || true)" != ${lib.escapeShellArg ubuntuBootstrapId} ]; then
+                  systemctl stop ${lib.escapeShellArg service} || true
+                  echo "Atlas environment ${name} failed its pinned Ubuntu package bootstrap" >&2
+                  exit 1
+                fi
 
                 leader="$(machinectl show ${lib.escapeShellArg "atlas-${name}"} --property=Leader --value)"
                 if ! [[ "$leader" =~ ^[1-9][0-9]*$ ]]; then
                   echo "Atlas could not resolve the environment leader" >&2
                   exit 1
                 fi
+
+                nsenter \
+                  --target "$leader" \
+                  --user \
+                  --mount \
+                  --uts \
+                  --ipc \
+                  --net \
+                  --pid \
+                  --cgroup \
+                  --wdns=/ \
+                  -- \
+                  ${migrateLegacyCaBundles}/bin/atlas-migrate-legacy-ca-bundles
+
+                flock -u 9
 
                 control_group="$(systemctl show ${lib.escapeShellArg service} --property=ControlGroup --value)"
                 case "$control_group" in
@@ -1147,6 +1231,7 @@ in
       type = types.enum [
         "none"
         "luks2-operator-passphrase"
+        "provider-managed-volume"
       ];
       description = ''
         Deployment fact describing encryption for persistent Atlas state. This
@@ -1408,15 +1493,23 @@ in
       systemPackages = [ atlasControl ] ++ lib.optionals btrfsStorage [ pkgs.btrfs-progs ];
     };
 
-    security.sudo.extraRules = mapAttrsToList (name: _environment: {
-      users = [ (loginUser name) ];
-      commands = [
-        {
-          command = "${entryLaunchers.${name}}/bin/atlas-enter-${name}";
-          options = [ "NOPASSWD" ];
-        }
-      ];
-    }) cfg.environments;
+    security.sudo = {
+      # Each fixed login can execute only its exact environment launcher. PTY
+      # mediation breaks long noninteractive commands across the namespace
+      # transition without adding a useful privilege boundary here.
+      extraConfig = concatMapStringsSep "\n" (
+        name: "Defaults:${loginUser name} !use_pty"
+      ) environmentNames;
+      extraRules = mapAttrsToList (name: _environment: {
+        users = [ (loginUser name) ];
+        commands = [
+          {
+            command = "${entryLaunchers.${name}}/bin/atlas-enter-${name}";
+            options = [ "NOPASSWD" ];
+          }
+        ];
+      }) cfg.environments;
+    };
 
     systemd = {
       services = {
@@ -1435,6 +1528,7 @@ in
           path = [
             pkgs.btrfs-progs
             pkgs.coreutils
+            pkgs.systemd
           ];
           serviceConfig = {
             Type = "oneshot";
@@ -1446,6 +1540,12 @@ in
               echo "Atlas Btrfs adapter requires ${toString cfg.dataRoot} to reside on Btrfs" >&2
               exit 1
             fi
+
+            # A provider-backed dataRoot can mount after the global tmpfiles
+            # pass. Replay only Atlas's managed subtree on the mounted
+            # filesystem before creating Btrfs subvolumes beneath it.
+            systemd-tmpfiles --create --prefix=${lib.escapeShellArg (toString cfg.dataRoot)}
+
             if [ -L ${lib.escapeShellArg ownerHomePath} ]; then
               echo "Atlas refused a symbolic link at the durable owner home" >&2
               exit 1

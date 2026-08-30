@@ -252,12 +252,18 @@ pkgs.testers.runNixOSTest {
     shared_state_parent = "/var/lib/atlas/environments/11111111-1111-4111-8111-111111111111"
     abandoned_ready = f"{shared_state_parent}/.rootfs-ready.interrupted"
     machine.succeed(f"printf 'pending\\n' > {abandoned_ready}")
+    entry("atlas-shared-dev", "sudo -n touch /etc/atlas-cold-entry")
+    machine.succeed(
+        f"test -f {shlex.quote(shared['runtime']['rootHostPath'])}/etc/atlas-cold-entry"
+    )
     shared_self = json.loads(entry("atlas-shared-dev", "atlas environment inspect self --json"))
     machine.fail(f"test -e {abandoned_ready}")
     assert shared_self["result"]["name"] == "shared-dev"
     assert shared_self["result"]["uid"] == 23001
+    entry("atlas-restricted", "true")
     restricted_self = json.loads(entry("atlas-restricted", "atlas environment inspect self --json"))
     assert restricted_self["result"]["name"] == "restricted"
+    entry("atlas-personal-dev", "true")
     personal_self = json.loads(entry("atlas-personal-dev", "atlas environment inspect self --json"))
     assert personal_self["result"]["name"] == "personal-dev"
     machine.succeed(f"systemctl is-active {shlex.quote(shared['process']['serviceUnit'])}")
@@ -274,6 +280,21 @@ pkgs.testers.runNixOSTest {
 
     assert entry("atlas-shared-dev", "git config --get user.email").strip() == "atlas@labblue.ai"
     assert entry("atlas-personal-dev", "git config --get user.email").strip() == "george@lydakis.me"
+    entry(
+        "atlas-shared-dev",
+        "test -s /etc/ssl/certs/ca-bundle.crt && test ! -L /etc/ssl/certs/ca-bundle.crt && "
+        "test -s /etc/ssl/certs/ca-certificates.crt && test ! -L /etc/ssl/certs/ca-certificates.crt",
+    )
+    retired_ca_bundle = "/nix/store/00000000000000000000000000000000-retired-cacert/etc/ssl/certs/ca-bundle.crt"
+    machine.succeed(
+        f"ln -sfn {retired_ca_bundle} {shared['runtime']['rootHostPath']}/etc/ssl/certs/ca-bundle.crt; "
+        f"ln -sfn {retired_ca_bundle} {shared['runtime']['rootHostPath']}/etc/ssl/certs/ca-certificates.crt"
+    )
+    entry(
+        "atlas-shared-dev",
+        "test -s /etc/ssl/certs/ca-bundle.crt && test ! -L /etc/ssl/certs/ca-bundle.crt && "
+        "test -s /etc/ssl/certs/ca-certificates.crt && test ! -L /etc/ssl/certs/ca-certificates.crt",
+    )
     entry("atlas-restricted", "command -v git", succeed=False)
 
     entry(
@@ -389,6 +410,12 @@ pkgs.testers.runNixOSTest {
     assert entry("atlas-shared-dev", "id -u").strip() == "1000"
     assert entry("atlas-shared-dev", "id -un").strip() == "owner"
     assert entry("atlas-shared-dev", "printf '%s|%s|%s' \"$HOME\" \"$USER\" \"$LOGNAME\"").strip() == "/home/owner|owner|owner"
+    assert entry("atlas-shared-dev", "command -v sudo").strip() == "/usr/bin/sudo"
+    assert entry("atlas-shared-dev", "dpkg-query -S /usr/bin/sudo").strip() == "sudo: /usr/bin/sudo"
+    entry("atlas-shared-dev", "dpkg-query -s sudo | grep -qx 'Status: install ok installed'")
+    entry("atlas-shared-dev", "test ! -e /usr/local/bin/sudo")
+    entry("atlas-shared-dev", "test -z \"$(grep -F /nix/store /etc/pam.d/sudo || true)\"")
+    entry("atlas-shared-dev", "test ! -e /usr/lib/atlas/bootstrap-packages")
     assert entry("atlas-shared-dev", "sudo -n id -u").strip() == "0"
     entry("atlas-shared-dev", "sudo -n sh -c 'echo persistent > /etc/atlas-persistent-state'")
     entry("atlas-shared-dev", "mkdir -p Documents .local/share; echo durable-home > Documents/persistent-home; echo durable-share > .local/share/persistent-share")
@@ -408,7 +435,9 @@ pkgs.testers.runNixOSTest {
 
     package_result = entry(
         "atlas-shared-dev",
-        "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y ${testPackage} >/tmp/atlas-apt.log && "
+        "if ! sudo -n env DEBIAN_FRONTEND=noninteractive "
+        "apt-get install -y ${testPackage} </dev/null >/tmp/atlas-apt.log 2>&1; then "
+        "cat /tmp/atlas-apt.log >&2; exit 1; fi; "
         "atlas-proof-tool",
     )
     assert package_result.strip() == "atlas-proof-tool-installed"

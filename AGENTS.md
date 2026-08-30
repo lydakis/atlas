@@ -62,19 +62,21 @@ claim has actually been demonstrated.
 
 ## Current direction
 
-The next product proof is a physical alpha on one selected x86 machine:
-persistent installation, encrypted Atlas state with a declared unlock mode,
-protected host recovery capacity, private enrollment, automatic durable owner
-storage, and reboot/reset survival. Private environment networking, paired
-operator control, and a private route form the next critical path; storage
-hardening proceeds in parallel after the physical layout is proven. Do not
-claim the browser, grant, portable-declaration, or host-base proofs ahead of
-their roadmap prerequisites unless George explicitly changes the sequence.
+The DigitalOcean Herdr dogfood proof is complete and the laboratory remains
+development infrastructure, not evidence for physical installation or
+owner-controlled disk encryption. Private environment networking is the next
+product proof, followed by paired operator control and a private route. The
+physical alpha resumes when representative x86 hardware is available; storage
+hardening continues in parallel. Do not claim the browser, grant,
+portable-declaration, or host-base proofs ahead of their roadmap prerequisites
+unless George explicitly changes the sequence.
 
 ## Implementation boundaries
 
 - `nixos/modules/atlas-environments.nix` declares the current host and
   environment contract.
+- `nixos/modules/atlas-digitalocean.nix` adapts the dogfood host to a named
+  provider volume and reports its weaker provider-managed encryption boundary.
 - `src/atlas/control.py` owns the local Unix-socket protocol, peer-derived
   authorization, and CLI surfaces.
 - `src/atlas/lifecycle.py` owns reset and snapshot orchestration.

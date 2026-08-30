@@ -86,24 +86,25 @@ proof until its prerequisites have been demonstrated.
 
 | Order | Proof | Exit evidence | State |
 | --- | --- | --- | --- |
-| 1 | Physical alpha | A selected x86 machine installs encrypted persistent Atlas state with one declared unlock mode and protected host recovery capacity, enrolls privately, exposes automatic durable owner storage to the default environment, and survives reboot and reset without losing owner data | in progress |
-| 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or metadata endpoints without policy; intended public egress still works | queued |
+| 1 | Cloud existing-client dogfood | Herdr enters both declared development environments on a persistent DigitalOcean lab host, observes their distinct non-secret configuration, operates one shared durable checkout, survives reboot, and demonstrates reset of environment-local drift without losing owner work | complete |
+| 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or cloud metadata endpoints without policy; intended public egress still works | queued |
 | 3 | Paired operator control | A controller device is explicitly paired, receives a revocable identity, and can inspect, reset, and snapshot environments over a private transport; tailnet membership alone grants no Atlas authority | queued |
 | 4 | Private route | One explicitly selected environment port is reachable from an authorized paired device without a public listener or arbitrary upstream target | queued |
 | 5 | Authenticated browser surface | An agent operates one isolated browser identity while the operator can observe, take over, return control, and revoke access | queued |
 | 6 | Narrow grant | One source credential remains outside the environment while a broker performs a bounded operation or issues a short-lived derivative | queued |
-| 7 | Existing-client dogfood | Herdr or Codex uses the complete flow on representative physical hardware without adopting an Atlas project, task, or conversation model | queued |
+| 7 | Physical alpha | A selected x86 machine installs encrypted persistent Atlas state with one declared unlock mode and protected host recovery capacity, enrolls privately, exposes automatic durable owner storage to the default environment, and survives reboot and reset without losing owner data | deferred pending hardware |
 | 8 | Runtime environment definitions | The control plane creates, inspects, resets, and deletes definitions and instances without weakening peer-derived identity or storage guarantees | later |
 | 9 | Portable environment declaration | A backend-independent, non-secret seed maps to the definition model; import requires explicit operator or client action and has no imperative setup hook | later |
 | 10 | Host-base comparison | The same proven behavior is ported to a bootc/OCI host and compared with the NixOS adapter on installation, update, rollback, recovery, and complexity | later |
 
 ### Parallel storage hardening
 
-After the physical alpha establishes the installed storage layout, harden it in
-parallel with proofs 2–5. Supported update and recovery, power-loss and
-metadata-exhaustion testing, and backup and restore are required before Atlas is
-treated as broadly operable. Optional quotas for additional environments are a
-later policy unless real multi-environment use makes them necessary sooner.
+The installed-layout KVM proof is sufficient to continue hardening storage in
+parallel with proofs 1–5, but it is not physical evidence. Supported update and
+recovery, power-loss and metadata-exhaustion testing, and backup and restore are
+required before Atlas is treated as broadly operable. Optional quotas for
+additional environments are a later policy unless real multi-environment use
+makes them necessary sooner.
 
 ## Current spike gaps
 
@@ -111,6 +112,13 @@ The NixOS adapter is evidence for lifecycle, identity, reset, volume separation,
 reboot-persistent machine state, copy-on-write root recovery, and an x86
 KVM-installed encrypted storage layout. Physical installation, the human unlock
 ceremony, and hardware recovery remain unproven.
+
+- The DigitalOcean profile is a replaceable remote laboratory. It composes the
+  same Atlas host with a separately attached Btrfs data volume, reports
+  provider-managed rather than owner-controlled encryption, and reserves the
+  root disk for host recovery. Its temporary key-only OpenSSH bootstrap is an
+  explicit degraded state that must be replaced by Tailscale SSH after
+  enrollment. Configuration evaluation is not live deployment evidence.
 
 - Persistent development and contract-test VMs mount a dedicated Btrfs data disk
   at `/var/lib/atlas`. Environment roots, applied seeds, named root snapshots,

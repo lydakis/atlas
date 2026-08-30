@@ -27,6 +27,27 @@ let
 
   dataRoot = toString cfg.dataRoot;
 
+  openSshSettings = config.services.openssh.settings;
+  unsafeOpenSshExtraConfig = builtins.any (
+    line:
+    builtins.match
+      "^[[:space:]]*([Mm][Aa][Tt][Cc][Hh]|[Ii][Nn][Cc][Ll][Uu][Dd][Ee])([[:space:]].*)?$"
+      line != null
+  ) (lib.splitString "\n" config.services.openssh.extraConfig);
+  bootstrapOpenSshPolicySatisfied =
+    config.services.openssh.enable
+    && !config.services.openssh.openFirewall
+    && config.services.openssh.ports == [ 22 ]
+    && lib.elem 22 config.networking.firewall.allowedTCPPorts
+    && (openSshSettings.AllowUsers or null) == [ "root" ]
+    && (openSshSettings.AuthenticationMethods or null) == "publickey"
+    && (openSshSettings.KbdInteractiveAuthentication or null) == false
+    && (openSshSettings.PasswordAuthentication or null) == false
+    && (openSshSettings.PermitRootLogin or null) == "prohibit-password"
+    && (openSshSettings.PubkeyAuthentication or null) == true
+    && (openSshSettings.X11Forwarding or null) == false
+    && !unsafeOpenSshExtraConfig;
+
   stateRoot = {
     group = "root";
     mode = "0711";
@@ -179,6 +200,10 @@ in
       '';
     };
 
+    bootstrapOpenSsh.enable = mkEnableOption ''
+      a temporary key-only OpenSSH bootstrap listener
+    '';
+
     contract = mkOption {
       readOnly = true;
       type = types.attrs;
@@ -198,8 +223,16 @@ in
         message = "atlas.host.tailscale.enable must be true when authKeyFile is configured";
       }
       {
-        assertion = !config.services.openssh.enable;
-        message = "atlas.host requires OpenSSH to remain disabled; use Tailscale SSH for host administration";
+        assertion = cfg.bootstrapOpenSsh.enable == config.services.openssh.enable;
+        message = "atlas.host.bootstrapOpenSsh.enable must match the effective OpenSSH service state";
+      }
+      {
+        assertion = !cfg.bootstrapOpenSsh.enable || bootstrapOpenSshPolicySatisfied;
+        message = "atlas.host bootstrap OpenSSH must preserve the exact root public-key-only policy";
+      }
+      {
+        assertion = !cfg.bootstrapOpenSsh.enable || cfg.tailscale.enable;
+        message = "atlas.host.tailscale.enable must be true when the OpenSSH bootstrap listener is enabled";
       }
     ];
 
@@ -222,7 +255,14 @@ in
       };
       configuration = {
         connectivity = {
-          openSshConfigured = false;
+          openSshConfigured = config.services.openssh.enable;
+          openSshMode =
+            if !config.services.openssh.enable then
+              "disabled"
+            else if bootstrapOpenSshPolicySatisfied then
+              "bootstrap-root-public-key-only"
+            else
+              "invalid";
           tailscale = {
             adapterEnabled = cfg.tailscale.enable;
             sshRequested = cfg.tailscale.enable && cfg.tailscale.ssh;
@@ -261,6 +301,7 @@ in
       ++ lib.optional cfg.tailscale.enable atlasEnroll;
 
     networking.firewall.enable = true;
+    networking.firewall.allowedTCPPorts = lib.optionals cfg.bootstrapOpenSsh.enable [ 22 ];
 
     nix.settings = {
       allowed-users = lib.mkForce [ "root" ];
@@ -277,6 +318,20 @@ in
       openFirewall = true;
       authKeyFile = cfg.tailscale.authKeyFile;
       extraUpFlags = lib.optionals cfg.tailscale.ssh [ "--ssh" ];
+    };
+
+    services.openssh = mkIf cfg.bootstrapOpenSsh.enable {
+      enable = true;
+      openFirewall = false;
+      settings = {
+        AllowUsers = [ "root" ];
+        AuthenticationMethods = "publickey";
+        KbdInteractiveAuthentication = false;
+        PasswordAuthentication = false;
+        PermitRootLogin = "prohibit-password";
+        PubkeyAuthentication = true;
+        X11Forwarding = false;
+      };
     };
 
     security.sudo.wheelNeedsPassword = false;

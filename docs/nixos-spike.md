@@ -255,6 +255,17 @@ preserved the durable owner files, and left an unaffected environment usable.
 The existing configuration-only generation switch continued to preserve the
 root without requiring reset.
 
+The Ubuntu-native sudo revision passed the complete x86_64 KVM host contract
+on August 30, 2026. The applied seed now carries pinned `sudo` and
+`libapparmor1` packages from an official Ubuntu snapshot. Ubuntu's own `dpkg`
+installs them during first boot, and entry fails closed unless a completion
+marker matches that exact package set. The proof verified `/usr/bin/sudo` is
+owned by the Ubuntu package, its PAM policy contains no Nix store paths,
+passwordless environment administration works, ordinary package installation
+works, and reboot and reset replay the same bootstrap. This has not yet been
+applied to the live DigitalOcean environments, which require explicit reset to
+adopt a changed owner layout.
+
 The parameterized x86 installed-storage module is a separate physical-alpha
 proof. On August 29, 2026, one fully instantiated KVM acceptance test passed
 after it:
@@ -283,6 +294,59 @@ Ubuntu filesystem and package manager, while declared Nix tools are available
 through a read-only mount of the host Nix store. This is not an executable
 allowlist.
 
+## DigitalOcean dogfood evidence
+
+The x86_64 DigitalOcean dogfood proof passed on August 29, 2026. It used a
+custom Atlas image in NYC1, a 2-vCPU/4-GiB Droplet, and a separate 50-GiB
+provider volume formatted as Btrfs. The run verified:
+
+- initial root-key OpenSSH restricted by a tag-scoped Cloud Firewall, followed
+  by interactive Tailscale enrollment and a steady profile with OpenSSH
+  disabled
+- successful Tailscale SSH after two host reboots, zero failed systemd units,
+  no TCP 22 listener, provider Recovery Console availability, and removal of
+  the bootstrap Cloud Firewall
+- the provider volume mounted at `/var/lib/atlas`, Atlas state-directory modes,
+  durable owner and project Btrfs subvolumes, and an experimental
+  provider-managed encryption report
+- entry into `shared-dev` and `personal-dev` as the conventional owner UID with
+  environment-local passwordless `sudo` and distinct managed Git identities
+- one public Atlas checkout visible from both environments through the shared
+  durable project volume while resettable `~/.config` remained separate
+- a `shared-dev` snapshot and explicit reset removing an installed package,
+  CA-package drift, and environment-local configuration while preserving the
+  uncommitted checkout marker
+- Herdr 0.8.2 installing independently in both resettable environments, both
+  local thin clients attaching through ordinary SSH over Tailscale, and the
+  shared named session reattaching after host reboot
+
+On August 30, 2026, the reviewed steady-profile hardening was deployed to the
+same lab. `/root/.ssh/authorized_keys` was present before the switch from the
+original DigitalOcean metadata bootstrap. The steady activation removed it,
+Tailscale SSH remained available, and a subsequent reboot verified the key
+stayed absent, no TCP 22 listener returned, the host contract reported OpenSSH
+disabled, the Btrfs data volume remounted, Atlas and both control sockets were
+active, and systemd had no failed units. Existing environment instances stopped
+at the generation transition and correctly refused re-entry until explicit
+reset applies the new Ubuntu-native sudo owner layout; no reset was performed
+implicitly.
+
+The live run found three adapter defects before the proof completed. A
+provider-mounted data root can hide directories created by the global tmpfiles
+pass, so Atlas now replays tmpfiles only for its managed data subtree after the
+mount. Pure flake evaluation cannot use the `/etc` symlink that exposes the
+embedded image source, so the cutover resolves and validates its immutable Nix
+store path first. The minimal Ubuntu root also lacked a conventional CA bundle,
+so the applied seed now provides `/etc/ssl/certs/ca-bundle.crt` and
+`ca-certificates.crt` from the pinned Nix CA package. The first image required a
+one-time `ca-certificates` install before public Git and Herdr downloads; future
+seeds include the trust floor.
+
+This is cloud runtime evidence only. It does not prove a physical installer,
+hardware support, owner-controlled disk encryption, cloud-provider exclusion,
+or a local unlock and recovery ceremony. Networking remains shared with the
+host and no secrets were introduced.
+
 ## Earlier Tailscale and Herdr dogfood evidence
 
 Before the nspawn and volume revision, the AArch64 development VM was enrolled
@@ -304,9 +368,8 @@ without a public OpenSSH listener. That fixed-login adapter run verified:
 That run also found two interoperability defects: nested interactive shells
 loaded the host-global NixOS PATH, and `systemd-run` expanded shell variables in
 some remote command strings. The environment shell wrapper and literal command
-passthrough fixed both defects in that adapter. The current nspawn adapter has
-passed local interactive and non-interactive entry tests, but its exact
-Tailscale SSH and Herdr path has not yet been repeated.
+passthrough fixed both defects in that adapter. The current DigitalOcean proof
+above repeated the Tailscale SSH and Herdr path with the nspawn adapter.
 
 Herdr's default managed SSH multiplexing produced intermittent exit status 255
 over this Tailscale SSH path. Herdr attached successfully with its local
@@ -355,10 +418,11 @@ policy must treat it accordingly.
   host and installed-layout proofs but have not yet been exercised on physical
   hardware. Those proofs must be rerun for each change to their mount and
   privilege contract.
-- Owner-layout changes, including changes to the copied environment-local
-  sudo/PAM support closure, deliberately require explicit environment reset.
-  Atlas has no in-place migration framework for mutable roots yet. Snapshots
-  from an older owner layout are rejected rather than relabeled as current.
+- Owner-layout changes, including changes to the pinned Ubuntu-native package
+  bootstrap and environment sudo policy, deliberately require explicit
+  environment reset. Atlas has no in-place migration framework for mutable
+  roots yet. Snapshots from an older owner layout are rejected rather than
+  relabeled as current.
 - The fixed login adapter and Herdr have not yet been exercised on physical
   hardware, and Codex has not yet been tested as a remote target.
 - Runtime creation and deletion of definitions or volumes is not implemented.

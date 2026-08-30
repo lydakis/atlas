@@ -1,5 +1,6 @@
 {
   atlasModule,
+  digitalOceanModule,
   installedStorageModule,
   lib,
   pkgs,
@@ -43,6 +44,37 @@ let
       hostRecoveryReserve = true;
     };
   };
+
+  mkDigitalOceanHost =
+    bootstrap:
+    lib.nixosSystem {
+      system = pkgs.stdenv.hostPlatform.system;
+      modules = [
+        atlasModule
+        digitalOceanModule
+        ../configurations/spike-host.nix
+        (
+          { modulesPath, ... }:
+          {
+            imports = [ "${modulesPath}/virtualisation/digital-ocean-config.nix" ];
+
+          atlas.host = {
+            bootstrapOpenSsh.enable = bootstrap;
+            digitalOcean.enable = true;
+          };
+          services.openssh.enable = lib.mkForce bootstrap;
+          virtualisation.digitalOcean.setSshKeys = bootstrap;
+          }
+        )
+      ];
+    };
+  digitalOceanBootstrapHost = mkDigitalOceanHost true;
+  digitalOceanSteadyHost = mkDigitalOceanHost false;
+  digitalOceanContract = digitalOceanBootstrapHost.config.atlas.host.contract;
+  digitalOceanPrepare =
+    digitalOceanBootstrapHost.config.systemd.services.atlas-digitalocean-volume-verify.script;
+  digitalOceanSteadyActivation =
+    digitalOceanSteadyHost.config.system.activationScripts.atlasDigitalOceanBootstrapKeyCleanup.text;
 
   alternateOwnerHomeHost = mkHost {
     atlas.host.owner.homeVolumeId = lib.mkForce "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
@@ -195,9 +227,51 @@ assert defaultContract.state.storageAdapter == "btrfs-subvolume";
 assert defaultContract.state.rootMode == "0711";
 assert defaultContract.state.directories == expectedStateDirectories;
 assert defaultContract.configuration.connectivity.openSshConfigured == false;
+assert defaultContract.configuration.connectivity.openSshMode == "disabled";
 assert defaultContract.configuration.connectivity.tailscale.adapterEnabled == true;
 assert defaultContract.configuration.connectivity.tailscale.sshRequested == true;
 assert defaultContract.configuration.connectivity.tailscale.enrollmentMode == "interactive";
+assert digitalOceanContract.configuration.connectivity.openSshConfigured == true;
+assert digitalOceanContract.configuration.connectivity.openSshMode == "bootstrap-root-public-key-only";
+assert digitalOceanBootstrapHost.config.services.openssh.settings.AllowUsers == [ "root" ];
+assert digitalOceanBootstrapHost.config.services.openssh.settings.AuthenticationMethods == "publickey";
+assert digitalOceanBootstrapHost.config.services.openssh.settings.PasswordAuthentication == false;
+assert digitalOceanBootstrapHost.config.services.openssh.settings.KbdInteractiveAuthentication == false;
+assert digitalOceanBootstrapHost.config.services.openssh.settings.PermitRootLogin == "prohibit-password";
+assert digitalOceanBootstrapHost.config.networking.firewall.allowedTCPPorts == [ 22 ];
+assert hasFailedMessage "exact root public-key-only policy" {
+  atlas.host.bootstrapOpenSsh.enable = true;
+  services.openssh.settings.PasswordAuthentication = lib.mkForce true;
+};
+assert hasFailedMessage "exact root public-key-only policy" {
+  atlas.host.bootstrapOpenSsh.enable = true;
+  services.openssh.settings.AllowUsers = lib.mkForce [
+    "owner"
+    "root"
+  ];
+};
+assert hasFailedMessage "exact root public-key-only policy" {
+  atlas.host.bootstrapOpenSsh.enable = true;
+  services.openssh.extraConfig = ''
+    Match User root
+      AuthenticationMethods password
+      PasswordAuthentication yes
+  '';
+};
+assert hasFailedMessage "must match the effective OpenSSH service state" {
+  atlas.host.bootstrapOpenSsh.enable = true;
+  services.openssh.enable = lib.mkForce false;
+};
+assert digitalOceanSteadyHost.config.virtualisation.digitalOcean.setSshKeys == false;
+assert lib.hasInfix "rm -f -- /root/.ssh/authorized_keys" digitalOceanSteadyActivation;
+assert digitalOceanBootstrapHost.config.atlas.host.storage.hostRecoveryReserve == true;
+assert digitalOceanBootstrapHost.config.atlas.host.storage.atRestEncryption
+  == "provider-managed-volume";
+assert digitalOceanBootstrapHost.config.fileSystems."/var/lib/atlas".device
+  == "/dev/disk/by-id/scsi-0DO_Volume_atlas-data";
+assert lib.hasInfix ''filesystem="$(blkid -o value -s TYPE "$device"'' digitalOceanPrepare;
+assert lib.hasInfix "requires an explicitly prepared Btrfs data volume" digitalOceanPrepare;
+assert !(lib.hasInfix "mkfs" digitalOceanPrepare);
 assert defaultContract.configuration.environmentEntry.version == 6;
 assert defaultContract.configuration.environmentEntry.adapter == "nixos-nspawn-btrfs-v0";
 assert defaultContract.configuration.environmentEntry.composition.declarative == true;
@@ -354,6 +428,9 @@ assert
 assert lib.hasPrefix "/nix/store/"
   defaultHost.config.systemd.services."atlas-environment-shared\\x2ddev".serviceConfig.ExecCondition;
 assert defaultHost.config.systemd.services.atlas-storage-prepare.serviceConfig.Type == "oneshot";
+assert lib.hasInfix
+  "systemd-tmpfiles --create --prefix=/var/lib/atlas"
+  defaultHost.config.systemd.services.atlas-storage-prepare.script;
 assert builtins.elem "CAP_SYS_ADMIN"
   defaultHost.config.systemd.services.atlas-manage.serviceConfig.CapabilityBoundingSet;
 assert builtins.elem "CAP_CHOWN"
