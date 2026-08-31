@@ -32,6 +32,9 @@ independent workstreams need assignment and coordination.
   suggestions and are never applied or executed ambiently.
 - Secrets are grants, not environment configuration. Portable environment
   definitions do not contain secret material.
+- Incus 7.0 LTS is the selected Environment substrate. It remains behind the
+  Atlas lifecycle boundary; systemd-nspawn is a temporary reference until the
+  Incus adapter passes the existing contracts.
 
 ## Persistence vocabulary
 
@@ -87,7 +90,7 @@ proof until its prerequisites have been demonstrated.
 | Order | Proof | Exit evidence | State |
 | --- | --- | --- | --- |
 | 1 | Cloud existing-client dogfood | Herdr enters both declared development environments on a persistent DigitalOcean lab host, observes their distinct non-secret configuration, operates one shared durable checkout, survives reboot, and demonstrates reset of environment-local drift without losing owner work | complete |
-| 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or cloud metadata endpoints without policy; intended public egress still works | queued |
+| 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or cloud metadata endpoints without policy; intended public egress still works | in progress |
 | 3 | Paired operator control | A controller device is explicitly paired, receives a revocable identity, and can inspect, reset, and snapshot environments over a private transport; tailnet membership alone grants no Atlas authority | queued |
 | 4 | Private route | One explicitly selected environment port is reachable from an authorized paired device without a public listener or arbitrary upstream target | queued |
 | 5 | Authenticated browser surface | An agent operates one isolated browser identity while the operator can observe, take over, return control, and revoke access | queued |
@@ -139,8 +142,10 @@ ceremony, and hardware recovery remain unproven.
   `/home/<owner>` with passwordless environment-local `sudo`. This deliberately
   grants every admitted process root inside that environment, not Atlas-host
   root; narrower per-process authority remains future Grant work.
-- Environments currently share host networking. Isolation and duplicate port
-  use are not yet provided by the Environment Entry adapter.
+- The current systemd-nspawn adapter still shares host networking. The selected
+  Incus substrate has demonstrated separate loopback and network namespaces plus
+  fail-closed egress policy in a disposable KVM proof, but the Atlas Environment
+  Entry adapter does not own that behavior yet.
 - The read-only host Nix store remains visible inside environments for declared
   tools.
 - There is no route proxy, browser service, grant broker, persistent installer,
@@ -151,8 +156,8 @@ ceremony, and hardware recovery remain unproven.
 - How much fixed host capacity should the first hardware profile reserve, how
   should it recover when the elastic Btrfs data filesystem is full, and which
   optional quota policy is acceptable for additional environments?
-- Which environment backend is sufficient for the first trust model, and when
-  does a higher-risk environment require a microVM?
+- When does a higher-risk environment require a microVM rather than the selected
+  unprivileged Incus container backend?
 - Which browser automation capability can preserve the stated cookie and
   controller boundaries?
 - Which credential protocols support useful brokered authority without exposing

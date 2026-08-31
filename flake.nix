@@ -210,6 +210,7 @@
               ;
             installedSystem = (mkInstalledTestHost system).config.system.build.toplevel;
           };
+          incus-substrate = import ./nixos/tests/incus-substrate.nix { inherit pkgs; };
         }
       );
 

@@ -29,6 +29,9 @@ behavior has been implemented or validated.
 
 - [NixOS architecture spike](nixos-spike.md) records what the current adapter
   has actually demonstrated and where it remains degraded.
+- [Incus substrate evaluation](incus-substrate-evaluation.md) records the
+  substrate selection, disposable runtime proof, image policy, and qualification
+  gates for the Incus-backed Atlas adapter.
 - [DigitalOcean dogfood laboratory](digitalocean-dogfood.md) defines the
   replaceable remote test host and the exact existing-client ceremony. It is a
   runbook, not physical-product evidence.
