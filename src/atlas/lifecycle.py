@@ -350,7 +350,14 @@ def _lifecycle_lock(environment_id: str, lock_root: str):
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         os.fchmod(lock_fd, 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        # Operator requests do not queue behind potentially stalled mutations.
+        # Only the active operation may release its authority to the environment.
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ControlOperationError(
+                "lifecycle_busy", "another lifecycle operation holds the environment lock; retry later"
+            ) from error
         yield lock_fd
     finally:
         os.close(lock_fd)

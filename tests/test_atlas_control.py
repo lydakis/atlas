@@ -594,6 +594,40 @@ class EnvironmentLifecycleTests(unittest.TestCase):
                 with (Path(lifecycle.lock_root) / f"{environment['id']}.lock").open() as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+    def test_busy_environment_rejects_lifecycle_requests_until_lock_released(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lifecycle, environment, durable_home = self.fixture(directory)
+            locks = Path(lifecycle.lock_root)
+            locks.mkdir()
+            lock_path = locks / f"{environment['id']}.lock"
+            with lock_path.open("w") as owner:
+                fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                operations = [
+                    ("reset", ()),
+                    ("list_snapshots", ()),
+                    ("create_snapshot", ("checkpoint",)),
+                    ("restore_snapshot", ("checkpoint",)),
+                    ("delete_snapshot", ("checkpoint",)),
+                ]
+                with mock.patch("atlas.lifecycle.subprocess.run") as run:
+                    for method, arguments in operations:
+                        with self.subTest(method=method):
+                            with self.assertRaises(ControlOperationError) as raised:
+                                getattr(lifecycle, method)(environment, *arguments)
+                            self.assertEqual(raised.exception.code, "lifecycle_busy")
+                    run.assert_not_called()
+                # A rejected contender must neither replace nor unlock the
+                # active operation's lock.
+                with lock_path.open() as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual((durable_home / "repository").read_text(), "durable")
+            with mock.patch(
+                "atlas.lifecycle.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0, stdout="[]", stderr=""),
+            ):
+                self.assertEqual(lifecycle.list_snapshots(environment), [])
+
     def test_reset_fingerprints_btrfs_volumes_by_subvolume_uuid(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             lifecycle, environment, _durable_home = self.fixture(temporary_directory)

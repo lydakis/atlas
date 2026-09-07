@@ -115,8 +115,12 @@ proof until its prerequisites have been demonstrated.
   60-second deadline. Timeout returns `incus_timeout`, discards partial output,
   and never establishes absence; reset does not proceed to mutation and releases
   its lock. Tests cover a real stalled query process being reaped and a successful
-  subsequent query. This does not bound shell-level `admin waitready`, lifecycle
-  lock acquisition, Btrfs fingerprint commands, reset/verification scripts, or
+  subsequent query. Python lifecycle requests now acquire the environment lock
+  without waiting: contention returns `lifecycle_busy` before any command runs,
+  leaving the active operation's lock intact. Tests cover contention for reset
+  and all snapshot entry points, then a successful snapshot query after release.
+  This does not bound shell-level `admin waitready` or lock waits, Btrfs
+  fingerprint commands, reset/verification scripts, or
   mutations yet. Mutation deadlines must account for server-side work continuing
   after the CLI exits before releasing authority to another lifecycle operation.
   Per-environment lifecycle locks now precede the global Incus
