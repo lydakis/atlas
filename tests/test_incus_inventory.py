@@ -12,10 +12,44 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from atlas.lifecycle import ControlOperationError, _object_inventory
+from atlas.lifecycle import ControlOperationError, _object_inventory, _snapshot_inventory
 
 
 class InventoryTests(unittest.TestCase):
+    def test_query_timeout_never_establishes_absence(self):
+        for kind in ("instance", "volume", "acl", "snapshot"):
+            with self.subTest(kind=kind), mock.patch(
+                "atlas.lifecycle.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("incus", 60, output=b"[]\n"),
+            ):
+                with self.assertRaises(ControlOperationError) as raised:
+                    if kind == "snapshot":
+                        _snapshot_inventory("incus", "atlas-demo")
+                    else:
+                        _object_inventory("incus", kind, "atlas-demo")
+                self.assertEqual(raised.exception.code, "incus_timeout")
+
+    def test_stalled_query_process_is_reaped_and_next_query_can_recover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            incus = Path(directory) / "incus"
+            pid_file = Path(directory) / "pid"
+            incus.write_text(
+                f"#!{sys.executable}\n"
+                "import os, time\n"
+                f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+                "print('[]', flush=True)\n"
+                "time.sleep(2)\n"
+            )
+            incus.chmod(0o755)
+            with mock.patch("atlas.lifecycle.INCUS_QUERY_TIMEOUT_SECONDS", 0.5):
+                with self.assertRaises(ControlOperationError) as raised:
+                    _object_inventory(str(incus), "instance", "atlas-demo")
+            self.assertEqual(raised.exception.code, "incus_timeout")
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), 0)
+            incus.write_text(f"#!{sys.executable}\nprint('[]')\n")
+            self.assertEqual(_object_inventory(str(incus), "instance", "atlas-demo"), [])
+
     def test_absence_requires_a_successful_valid_inventory(self):
         for kind in ("instance", "volume", "acl"):
             for payload in ("null", "{}", "broken", '[{}]', '[{"name":"bad name"}]'):

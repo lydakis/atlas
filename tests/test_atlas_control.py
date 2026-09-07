@@ -1,3 +1,4 @@
+import fcntl
 import io
 import socket
 import subprocess
@@ -572,6 +573,26 @@ class EnvironmentLifecycleTests(unittest.TestCase):
 
             self.assertEqual(raised.exception.code, "incus_failed")
             self.assertEqual(len(run.call_args_list), 1)
+
+    def test_reset_query_timeout_prevents_mutation_and_releases_lock(self):
+        for snapshot_query in (False, True):
+            with self.subTest(snapshot_query=snapshot_query), tempfile.TemporaryDirectory() as directory:
+                lifecycle, environment, durable_home = self.fixture(directory)
+                responses = []
+                if snapshot_query:
+                    responses.append(subprocess.CompletedProcess(
+                        [], 0, stdout='[{"name":"atlas-shared-dev"}]', stderr=""
+                    ))
+                responses.append(subprocess.TimeoutExpired("incus", 60, output=b"[]"))
+                with mock.patch("atlas.lifecycle.subprocess.run", side_effect=responses) as run:
+                    with self.assertRaises(ControlOperationError) as raised:
+                        lifecycle.reset(environment)
+                self.assertEqual(raised.exception.code, "incus_timeout")
+                self.assertEqual(run.call_count, len(responses))
+                self.assertTrue(all(call.args[0][0] == "/bin/incus" for call in run.call_args_list))
+                self.assertEqual((durable_home / "repository").read_text(), "durable")
+                with (Path(lifecycle.lock_root) / f"{environment['id']}.lock").open() as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_reset_fingerprints_btrfs_volumes_by_subvolume_uuid(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

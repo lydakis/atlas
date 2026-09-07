@@ -91,7 +91,7 @@ proof until its prerequisites have been demonstrated.
 | --- | --- | --- | --- |
 | 1 | Cloud existing-client dogfood | Herdr enters both declared development environments on a persistent DigitalOcean lab host, observes their distinct non-secret configuration, operates one shared durable checkout, survives reboot, and demonstrates reset of environment-local drift without losing owner work | complete |
 | 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or cloud metadata endpoints without policy; intended public egress still works; adding or renaming a definition does not silently renumber existing environment addresses | complete (controlled IPv4 VM proof) |
-| 3 | Paired operator control | A controller device is explicitly paired, receives a revocable identity, and can inspect, reset, and snapshot environments over a private transport; tailnet membership alone grants no Atlas authority; lifecycle calls have bounded execution and recover cleanly from an unavailable Incus daemon | queued |
+| 3 | Paired operator control | A controller device is explicitly paired, receives a revocable identity, and can inspect, reset, and snapshot environments over a private transport; tailnet membership alone grants no Atlas authority; lifecycle calls have bounded execution and recover cleanly from an unavailable Incus daemon | in progress (query-deadline prerequisite; pairing not implemented) |
 | 4 | Private route | One explicitly selected environment port is reachable from an authorized paired device without a public listener or arbitrary upstream target | queued |
 | 5 | Authenticated browser surface | An agent operates one isolated browser identity while the operator can observe, take over, return control, and revoke access | queued |
 | 6 | Narrow grant | One source credential remains outside the environment while a broker performs a bounded operation or issues a short-lived derivative | queued |
@@ -111,7 +111,15 @@ proof until its prerequisites have been demonstrated.
   stopped. This is a VM proof, not a revalidation of the live dogfood deployment.
 - Before completing paired operator control, bound Incus and reset subprocess
   execution and test timeout, daemon-restart, and interrupted lifecycle
-  recovery. Per-environment lifecycle locks now precede the global Incus
+  recovery. Shared Python object and snapshot inventory queries now have a
+  60-second deadline. Timeout returns `incus_timeout`, discards partial output,
+  and never establishes absence; reset does not proceed to mutation and releases
+  its lock. Tests cover a real stalled query process being reaped and a successful
+  subsequent query. This does not bound shell-level `admin waitready`, lifecycle
+  lock acquisition, Btrfs fingerprint commands, reset/verification scripts, or
+  mutations yet. Mutation deadlines must account for server-side work continuing
+  after the CLI exits before releasing authority to another lifecycle operation.
+  Per-environment lifecycle locks now precede the global Incus
   reconciliation lock, including system activation and reset. A stalled local
   daemon must not wedge operator control indefinitely or leave an environment
   falsely reported as ready.

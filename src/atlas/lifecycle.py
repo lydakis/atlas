@@ -14,6 +14,7 @@ from typing import Any
 
 
 DEFAULT_LOCK_ROOT = "/run/atlas/locks"
+INCUS_QUERY_TIMEOUT_SECONDS = 60
 MAX_INCUS_DIAGNOSTIC_BYTES = 4096
 SNAPSHOT_CONFIGURATION_MISMATCH = 20
 VolumeFingerprint = (
@@ -90,14 +91,25 @@ def _bounded_diagnostic(stderr: str | None) -> str:
     return f"{truncated}\n[truncated]"
 
 
-def _run_incus(incus: str, *arguments: str, capture: bool = False) -> str:
-    result = subprocess.run(
-        [incus, "--force-local", *arguments],
-        check=False,
-        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+def _run_incus(
+    incus: str, *arguments: str, capture: bool = False, query: bool = False
+) -> str:
+    # Only read-only queries can safely time out here. Killing a mutation's CLI
+    # does not cancel server-side work or make it safe to release its lock.
+    try:
+        result = subprocess.run(
+            [incus, "--force-local", *arguments],
+            check=False,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=INCUS_QUERY_TIMEOUT_SECONDS if query else None,
+        )
+    except subprocess.TimeoutExpired as error:
+        # Even complete-looking partial output must not establish absence.
+        raise ControlOperationError(
+            "incus_timeout", "Incus query timed out; object state is unknown"
+        ) from error
     if result.returncode != 0:
         diagnostic = _bounded_diagnostic(result.stderr)
         if diagnostic:
@@ -260,6 +272,7 @@ def _snapshot_inventory(incus: str, instance: str) -> list[str]:
         instance,
         "--format=json",
         capture=True,
+        query=True,
     )
     try:
         records = json.loads(raw_snapshots)
@@ -289,7 +302,9 @@ def _object_inventory(incus: str, kind: str, name: str | None = None) -> list[st
         arguments = ["network", "acl", "list"]
     else:
         raise ValueError("unsupported Incus inventory kind")
-    raw_instances = _run_incus(incus, *arguments, "--format=json", capture=True)
+    raw_instances = _run_incus(
+        incus, *arguments, "--format=json", capture=True, query=True
+    )
     try:
         records = json.loads(raw_instances)
     except (json.JSONDecodeError, TypeError) as error:
