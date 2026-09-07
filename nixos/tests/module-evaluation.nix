@@ -19,6 +19,21 @@ let
 
   defaultHost = mkHost { };
 
+  changedDefinitionsHost = mkHost {
+    atlas.host.environments = lib.mkForce (
+      (builtins.removeAttrs defaultHost.config.atlas.host.environments [ "restricted" ])
+      // {
+        renamed = defaultHost.config.atlas.host.environments.restricted;
+        alpha = {
+          id = "aaaaaaaa-0000-4000-8000-000000000000";
+          uid = 23004;
+        };
+      }
+    );
+  };
+  originalEnvironments = defaultHost.config.atlas.host.environmentContract.environments;
+  changedEnvironments = changedDefinitionsHost.config.atlas.host.environmentContract.environments;
+
   authKeyType = defaultHost.options.atlas.host.tailscale.authKeyFile.type;
   dataRootType = defaultHost.options.atlas.host.dataRoot.type;
 
@@ -187,6 +202,24 @@ let
   disabledContract = disabledTailscaleHost.config.atlas.host.contract;
   volatileContract = volatileStateHost.config.atlas.host.contract;
 in
+assert originalEnvironments.shared-dev.network.ipv4Address == "10.211.54.60";
+assert originalEnvironments.restricted.network.ipv4Address == "10.211.214.31";
+assert originalEnvironments.personal-dev.network.ipv4Address == "10.211.91.174";
+assert
+  changedEnvironments.shared-dev.network.ipv4Address
+  == originalEnvironments.shared-dev.network.ipv4Address;
+assert
+  changedEnvironments.personal-dev.network.ipv4Address
+  == originalEnvironments.personal-dev.network.ipv4Address;
+assert
+  changedEnvironments.renamed.network.ipv4Address
+  == originalEnvironments.restricted.network.ipv4Address;
+assert
+  changedEnvironments.shared-dev.runtime.layoutId == originalEnvironments.shared-dev.runtime.layoutId;
+assert hasFailedMessage "IPv4 collision" {
+  atlas.host.environments.shared-dev.id = lib.mkForce "000000f3-0000-4000-8000-000000000000";
+  atlas.host.environments.personal-dev.id = lib.mkForce "00000220-0000-4000-8000-000000000000";
+};
 assert !(authKeyType.check ../../README.md);
 assert authKeyType.check runtimeSecretPath;
 assert !(authKeyType.check "/nix/store/example-auth-key");

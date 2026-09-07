@@ -152,8 +152,20 @@ The integrated x86 KVM host contract passed on August 31, 2026. It verifies:
 - mutable Incus default-profile changes having no effect on profile-free Atlas
   instances
 
-The full allowed-and-denied network connection matrix remains the next roadmap
-proof. Physical installation and recovery remain unproven.
+The controlled IPv4 connection matrix now passes through the actual Atlas module
+(`nixos/tests/network-contract.py`, run by `host-contract.nix`). Known-live
+listeners distinguish host-local public addresses from genuinely forwarded
+public destinations and forwarded private LAN, tailnet, and metadata addresses.
+Each environment retains loopback isolation and DNS while private connections
+are denied and public-address egress succeeds. The matrix passes before and
+after adding a definition, and after reboot into the original generation;
+existing addresses remain unchanged and the removed instance stays stopped.
+Module assertions additionally cover renaming, fixed address vectors, and a
+real hash collision. The full x86 host proof passed on 2026-09-07 through Errand
+job `cabal/01M1YYYQ8JB0E34RZD0PXSTDXT` (1105 seconds of VM execution).
+
+This does not revalidate the live DigitalOcean deployment or prove physical
+installation, physical recovery, or comprehensive escape resistance.
 
 ## Historical prototype evidence
 

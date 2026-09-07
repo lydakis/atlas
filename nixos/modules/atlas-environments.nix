@@ -31,9 +31,19 @@ let
   incusDeclaredInstances = pkgs.writeText "atlas-incus-declared-instances" (
     concatMapStringsSep "\n" (name: "atlas-${name}") environmentNames
   );
-  environmentIpv4ByName = builtins.listToAttrs (
-    lib.imap0 (index: name: nameValuePair name "10.211.0.${toString (index + 10)}") environmentNames
-  );
+  # No probing or order-dependent allocation: a collision rejects the declaration
+  # instead of changing another environment's address. Reserve the gateway range.
+  environmentIpv4ByName = mapAttrs (
+    _name: environment:
+    let
+      digits = lib.stringToCharacters "0123456789abcdef";
+      hex = builtins.listToAttrs (lib.imap0 (index: digit: nameValuePair digit index) digits);
+      hash = builtins.substring 0 8 (builtins.hashString "sha256" environment.id);
+      value = lib.foldl' (acc: digit: acc * 16 + hex.${digit}) 0 (lib.stringToCharacters hash);
+      slot = lib.mod value (254 * 254);
+    in
+    "10.211.${toString (1 + builtins.div slot 254)}.${toString (1 + lib.mod slot 254)}"
+  ) cfg.environments;
   layerNames = builtins.attrNames cfg.environmentLayers;
   volumeNames = builtins.attrNames cfg.volumes;
 
@@ -227,6 +237,7 @@ let
     network = {
       mode = "private-nat";
       status = "experimental";
+      ipv4Address = environmentIpv4ByName.${name};
     };
     runtime = {
       backend = "incus-container";
@@ -1429,6 +1440,14 @@ in
         message = "Atlas environment IDs must be unique";
       }
       {
+        assertion = length environmentNames <= 254 * 254;
+        message = "Atlas private IPv4 address capacity is exhausted (64516 environments)";
+      }
+      {
+        assertion = length environmentNames == length (unique (builtins.attrValues environmentIpv4ByName));
+        message = "Atlas environment IPv4 collision: choose a different UUID for the new environment; existing addresses are never reassigned";
+      }
+      {
         assertion = length environmentUids == length (unique environmentUids);
         message = "Atlas environment UIDs must be unique";
       }
@@ -1535,7 +1554,7 @@ in
             name = "atlasbr0";
             type = "bridge";
             config = {
-              "ipv4.address" = "10.211.0.1/24";
+              "ipv4.address" = "10.211.0.1/16";
               "ipv4.nat" = "true";
               "ipv6.address" = "none";
             };

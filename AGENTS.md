@@ -64,9 +64,9 @@ claim has actually been demonstrated.
 
 The DigitalOcean Herdr dogfood proof is complete and the laboratory remains
 development infrastructure, not evidence for physical installation or
-owner-controlled disk encryption. Private environment networking is the next
-product proof, followed by paired operator control and a private route. The
-physical alpha resumes when representative x86 hardware is available; storage
+owner-controlled disk encryption. Private environment networking has passed the
+controlled IPv4 VM proof. Paired operator control is next, followed by a private
+route. The physical alpha resumes when representative x86 hardware is available; storage
 hardening continues in parallel. Do not claim the browser, grant,
 portable-declaration, or host-base proofs ahead of their roadmap prerequisites
 unless George explicitly changes the sequence.

@@ -302,6 +302,19 @@ Entries reuse one persistent Incus instance. Several clients can enter it at
 once and share its mutable OS state. Atlas does not provide a durable task
 abstraction or reconnect arbitrary client-owned PTYs after their client exits.
 
+Private IPv4 addresses are derived from the environment UUID, not its name or
+position in the declaration, and reported as `network.ipv4Address`. The adapter
+uses `10.211.0.0/16`, reserving `10.211.0.1` for the bridge and allocating from
+`10.211.1.1` through `10.211.254.254` with both final octets in `1..254`.
+Host networks must not overlap this fixed private subnet. The first eight
+hexadecimal digits of SHA-256(UUID), modulo 64516, select the slot. A collision
+within the declaration or a declaration exceeding 64516 environments fails Nix
+validation; no existing address is reassigned to make room. On collision,
+choose a different UUID for the new environment before creating it. Changing
+an existing UUID means changing its identity, not just its address. Renaming a
+definition preserves its address, but does not migrate the name-bound Incus
+instance or its resettable state.
+
 The persistent VM places the Incus Btrfs pool and Atlas durable volumes on the
 dedicated data filesystem. The installed-host layout reserves host recovery
 capacity and encrypts Atlas state in the KVM proof, but physical recovery,
@@ -366,10 +379,15 @@ The current x86 KVM integration test passed on August 31, 2026. It verifies:
 - a generation-stable guest contract directory whose atomically replaced file
   becomes visible without recreating the environment
 - separate network namespaces with the private NIC ACL applied
+- UUID-stable IPv4 addresses and a controlled connection matrix covering
+  same-port loopback isolation, cross-environment denial, host-local denial,
+  forwarded LAN/tailnet/metadata denial, DNS, and forwarded public-address egress
+- the same matrix after adding a definition and after reboot into the original
+  generation, without renumbering existing environments
 - Incus daemon restart without losing the running environment or durable data
 
-The full deployment-network connection matrix, resource-limit enforcement,
-update/rollback, and physical installation remain separate proof work.
+Live deployment revalidation, resource-limit enforcement, broader update/recovery,
+and physical installation remain separate proof work.
 
 ## Hands-on shape
 

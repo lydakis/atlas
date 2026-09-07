@@ -39,6 +39,11 @@ pkgs.testers.runNixOSTest {
       cores = 2;
       memorySize = 4096;
     };
+
+    specialisation.atlas-updated.configuration.atlas.host.environments.alpha = {
+      id = "aaaaaaaa-0000-4000-8000-000000000000";
+      uid = 23004;
+    };
   };
 
   testScript = ''
@@ -110,6 +115,9 @@ pkgs.testers.runNixOSTest {
             timeout=120,
         )
         machine.succeed(f"timeout -k 5 30 incus exec {name} -T -n -- true")
+
+    probe_python = "${pkgs.python3}/bin/python3"
+    ${builtins.readFile ./network-contract.py}
 
     for instance in ("atlas-shared-dev", "atlas-personal-dev", "atlas-restricted"):
         wait_for_instance(instance)
@@ -292,19 +300,8 @@ pkgs.testers.runNixOSTest {
             "| grep -F 203.0.113.0/24"
         )
 
-        machine.succeed("ip link add atlasprobe type dummy")
-        machine.succeed("ip addr add 203.0.113.10/32 dev atlasprobe")
-        machine.succeed("ip link set atlasprobe up")
-        machine.succeed(
-            "systemd-run --unit atlas-network-probe --service-type=exec "
-            "systemd-socket-activate -l 0.0.0.0:19090 /bin/cat"
-        )
-        machine.wait_until_succeeds("ss -ltn | grep -F ':19090'", timeout=30)
-        entry(
-            "atlas-shared-dev",
-            "timeout 2 bash -c 'exec 3<>/dev/tcp/203.0.113.10/19090'",
-            succeeds=False,
-        )
+        setup_network_probes()
+        original_addresses = network_matrix()
 
     with subtest("system reconciliation shares the lifecycle lock"):
         service = "atlas-environment-shared\\x2ddev.service"
@@ -454,5 +451,19 @@ pkgs.testers.runNixOSTest {
         assert machine.succeed(
             "incus config get atlas-orphan boot.autostart"
         ).strip() == "false"
+
+    with subtest("network policy and addresses survive definition addition and reboot"):
+        machine.succeed("/run/current-system/specialisation/atlas-updated/bin/switch-to-configuration test", timeout=300)
+        machine.wait_for_unit("atlas-host.target")
+        updated_addresses = network_matrix()
+        assert len(updated_addresses) == len(original_addresses) + 1
+        assert all(updated_addresses[name] == address for name, address in original_addresses.items())
+        machine.reboot()
+        machine.wait_until_succeeds("systemctl is-active atlas-host.target", timeout=600)
+        setup_network_probes()
+        # The test VM boots its original generation, also exercising rollback
+        # and removal of the added definition without renumbering the survivors.
+        assert network_matrix() == original_addresses
+        assert machine.succeed("incus list '^atlas-alpha$' --format csv -c s").strip() == "STOPPED"
   '';
 }

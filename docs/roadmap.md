@@ -90,7 +90,7 @@ proof until its prerequisites have been demonstrated.
 | Order | Proof | Exit evidence | State |
 | --- | --- | --- | --- |
 | 1 | Cloud existing-client dogfood | Herdr enters both declared development environments on a persistent DigitalOcean lab host, observes their distinct non-secret configuration, operates one shared durable checkout, survives reboot, and demonstrates reset of environment-local drift without losing owner work | complete |
-| 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or cloud metadata endpoints without policy; intended public egress still works; adding or renaming a definition does not silently renumber existing environment addresses | in progress |
+| 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or cloud metadata endpoints without policy; intended public egress still works; adding or renaming a definition does not silently renumber existing environment addresses | complete (controlled IPv4 VM proof) |
 | 3 | Paired operator control | A controller device is explicitly paired, receives a revocable identity, and can inspect, reset, and snapshot environments over a private transport; tailnet membership alone grants no Atlas authority; lifecycle calls have bounded execution and recover cleanly from an unavailable Incus daemon | queued |
 | 4 | Private route | One explicitly selected environment port is reachable from an authorized paired device without a public listener or arbitrary upstream target | queued |
 | 5 | Authenticated browser surface | An agent operates one isolated browser identity while the operator can observe, take over, return control, and revoke access | queued |
@@ -102,10 +102,13 @@ proof until its prerequisites have been demonstrated.
 
 ### Required Incus follow-ups
 
-- Before completing private environment networking, replace the current
-  name-order-derived IPv4 allocation with a stable environment-identity mapping,
-  define collision and address-exhaustion behavior, and prove that unrelated
-  definition changes do not renumber existing environments.
+- Private IPv4 allocation now derives from environment UUIDs in a fixed /16,
+  with explicit collision and capacity rejection rather than reassignment.
+  Module assertions cover addition, rename, fixed address vectors, and a real
+  hash collision. The Atlas IPv4 connection matrix passes before and after a
+  generation switch that adds an environment, and after reboot into the original
+  declaration. Existing addresses remain unchanged; the removed instance stays
+  stopped. This is a VM proof, not a revalidation of the live dogfood deployment.
 - Before completing paired operator control, bound Incus and reset subprocess
   execution and test timeout, daemon-restart, and interrupted lifecycle
   recovery. Per-environment lifecycle locks now precede the global Incus
