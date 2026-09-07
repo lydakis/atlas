@@ -129,9 +129,13 @@ proof until its prerequisites have been demonstrated.
   and queries. Timeout kills the verifier's private process group, discards its
   output, and returns `incus_timeout` without starting restore. Local process
   tests cover an exited leader whose child retains the lock and stderr pipe,
-  and preservation of normal verifier exit status and diagnostics. This does
-  not bound standalone reconciliation's `admin waitready` or lock waits, reset
-  scripts, or
+  and preservation of normal verifier exit status and diagnostics. Generated
+  reconciliation and activation scripts now use 60-second waits for individual
+  shell lock acquisitions and daemon readiness. A failed wait exits the script
+  before the following operation; it never unlocks another operation's lock.
+  Tests enforce bounded wait arguments and activation failure propagation.
+  These are per-wait limits, not a total reconciliation deadline. They do not
+  bound other raw shell queries, complete reset scripts, or
   mutations yet. Mutation deadlines must account for server-side work continuing
   after the CLI exits before releasing authority to another lifecycle operation.
   Per-environment lifecycle locks now precede the global Incus

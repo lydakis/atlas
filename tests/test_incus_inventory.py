@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -16,6 +17,39 @@ from atlas.lifecycle import ControlOperationError, _object_inventory, _snapshot_
 
 
 class InventoryTests(unittest.TestCase):
+    def test_all_shell_readiness_and_lock_waits_are_bounded(self):
+        source = (ROOT / "nixos/modules/atlas-environments.nix").read_text()
+        readiness = re.findall(r"^\s*(incus --force-local admin waitready[^\n]*)$", source, re.M)
+        locks = re.findall(r"^\s*(flock (?!-u\b)[^\n]*)$", source, re.M)
+        self.assertTrue(readiness)
+        self.assertTrue(locks)
+        for command in readiness:
+            self.assertEqual(shlex.split(command)[-2:], ["--timeout", "60"])
+        for command in locks:
+            self.assertEqual(shlex.split(command)[1:3], ["--wait", "60"])
+
+    def test_readiness_failure_stops_activation_before_inventory_or_import(self):
+        source = (ROOT / "nixos/modules/atlas-environments.nix").read_text()
+        for service_name in ("atlas-incus-image", "atlas-incus-inventory"):
+            with self.subTest(service=service_name), tempfile.TemporaryDirectory() as directory:
+                service = source.split(f"        {service_name} = {{", 1)[1]
+                script = service.split("          script = ''\n", 1)[1].split("\n          '';", 1)[0]
+                # Only the preamble is reached on readiness failure. Keep the
+                # actual service's error mode and command, then detect progress.
+                lines = script.splitlines()
+                stop = next(i for i, line in enumerate(lines) if "admin waitready" in line)
+                preamble = "\n".join(lines[:stop + 1])
+                incus = Path(directory) / "incus"
+                incus.write_text("#!/bin/sh\nexit 1\n")
+                incus.chmod(0o755)
+                result = subprocess.run(
+                    ["bash", "-c", preamble + "\necho unexpected-progress"],
+                    capture_output=True, text=True,
+                    env={**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"]},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("unexpected-progress", result.stdout)
+
     def test_query_timeout_never_establishes_absence(self):
         for kind in ("instance", "volume", "acl", "snapshot"):
             with self.subTest(kind=kind), mock.patch(

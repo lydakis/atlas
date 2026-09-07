@@ -856,17 +856,17 @@ let
             echo "Atlas received the wrong inherited lifecycle lock" >&2
             exit 1
           fi
-          flock "$inherited_lock_fd"
+          flock --wait 60 "$inherited_lock_fd"
         else
           exec 9>"$lifecycle_lock"
-          flock 9
+          flock --wait 60 9
         fi
 
         # Every mutation takes the environment lock before the global Incus
         # reconciliation lock. Snapshot operations need only the first lock.
         exec 8>/run/atlas/locks/incus-reconcile.lock
-        flock 8
-        incus --force-local admin waitready
+        flock --wait 60 8
+        incus --force-local admin waitready --timeout 60
 
         if [ "$mode" = verify-snapshot ]; then
           instance_record="$(
@@ -1739,7 +1739,7 @@ in
           ];
           script = ''
             set -euo pipefail
-            incus --force-local admin waitready
+            incus --force-local admin waitready --timeout 60
             expected_fingerprint="$(
               cat ${incusImageMetadata} ${incusImageRoot} | sha256sum
             )"
@@ -1812,7 +1812,7 @@ in
           ];
           script = ''
             set -eu
-            incus --force-local admin waitready
+            incus --force-local admin waitready --timeout 60
             instances="$(${incusInventory} instance)"
             while IFS= read -r instance; do
               [ -n "$instance" ] || continue
@@ -1827,10 +1827,10 @@ in
                 exit 1
               fi
               exec 9>"/run/atlas/locks/$environment_id.lock"
-              flock 9
+              flock --wait 60 9
 
               exec 8>/run/atlas/locks/incus-reconcile.lock
-              flock 8
+              flock --wait 60 8
               presence="$(${incusInventory} instance "$instance")"
               if [ "$presence" != present ]; then
                 echo "Atlas-marked instance $instance disappeared during inventory" >&2
