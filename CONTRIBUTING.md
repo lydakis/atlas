@@ -43,7 +43,8 @@ second source of product policy:
 - `control.py` owns the Unix-socket protocol, peer-derived authorization, and
   command-line surfaces.
 - `lifecycle.py` owns reset and snapshot orchestration.
-- `storage.py` owns directory and Btrfs filesystem mechanics.
+- Incus owns environment-root storage mechanics; Atlas lifecycle code must use
+  its local administrative API rather than manipulating pool internals.
 
 Keep the local protocol stable across internal refactors. Add a new abstraction
 only when a second implementation or a security boundary makes the seam real.

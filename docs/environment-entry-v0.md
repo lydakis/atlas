@@ -63,19 +63,39 @@ The instance is reusable across entries and resettable over its lifecycle.
 Installed packages, `/etc`, environment-local home paths, and root-filesystem
 changes survive an SSH disconnect, environment restart, host reboot, and
 supported update. `atlas environment reset <name>` terminates the instance and
-deliberately destroys those changes. The Btrfs adapter publishes a fresh root
-from its declared seed before reset returns; the volatile directory adapter
-recreates the root on the next entry. Durable owner-home data is mounted outside
-that replacement and is not restored by a root snapshot.
+deliberately destroys those changes. The Incus adapter deletes and recreates the
+instance from the pinned system image before reset returns. Durable owner-home
+data is mounted outside that replacement and is not restored by an instance
+snapshot.
 
-The host-owned readiness sidecar records the owner-layout identity required by
-the active generation. The mutable environment root cannot rewrite that
-authority. If the owner account, home composition, elevation support, or its
-Nix closure changes, entry fails with an explicit reset requirement. Reset
-realizes the current applied seed and writes the new host marker while
-preserving durable owner data. A root snapshot from an older owner layout is
-not restorable under the new layout. Configuration-only generation changes
-whose owner-layout identity is unchanged continue to preserve the root.
+The host-owned Incus instance configuration records the complete instance-layout
+identity required by the active generation only after devices and guest
+provisioning succeed. The mutable environment root cannot rewrite that
+authority. Missing readiness identity is treated as interrupted construction
+and recreated automatically. A changed image, owner account, home composition,
+elevation policy, network attachment, control surface, or durable-volume mount
+requires explicit reset. Atlas instances use no mutable Incus profiles. A
+matching identity is accepted only after Atlas also verifies the complete local
+and expanded device configuration and rejects unexpected effective instance
+configuration. Instances remain non-autostarting after verification; Atlas-owned
+systemd units start declared environments only after inventory reconciliation.
+Failed or drifted instances are stopped before reconciliation returns an error.
+Configuration-only generation changes outside that layout continue to preserve
+the root.
+
+The pre-release Incus adapter is forward-only. Atlas does not adopt or rewrite
+instances missing the current identity markers or device layout. Such drift
+fails closed and requires explicit reset.
+
+Host activation inventories Atlas-marked Incus instances. If an instance is no
+longer declared, Atlas disables its autostart and stops it before host readiness
+completes. It does not delete the instance, its root, or its named snapshots, so
+the operator can recover or explicitly remove the quarantined state.
+
+The guest-visible control contract is the only file published through a
+dedicated generation-stable host directory. NixOS activation atomically
+replaces that directory entry, so a running instance observes the active
+generation without remounting a generation-specific file inode.
 
 Resettable does not mean recreated for every connection or reboot. It means the
 operator can deliberately throw the machine state away without losing data
@@ -109,8 +129,8 @@ be able to reach it through its filesystem.
 
 Atlas automatically manages one owner-home volume and may compose it into an
 environment at `/home/<owner>`. The current proof composes it into `shared-dev`
-and `personal-dev`, while `restricted` receives a resettable home and no owner
-data. The separate `projects` volume is mounted at `/home/owner/Projects` in the
+and `personal-dev`, while `restricted` receives an environment-local resettable
+home and no durable owner data. The separate `projects` volume is mounted at `/home/owner/Projects` in the
 two cooperating environments and omitted from `restricted`.
 
 The mounted owner home is durable by default. Atlas overlays these
@@ -203,9 +223,11 @@ configuration. Managed Git configuration follows the same rule.
 Names, email addresses, default branches, aliases, and similar Git settings may
 be composed in layers. The generated system file is immutable. Mutable global
 Git configuration is redirected to `~/.config/git/config`, lives in the
-resettable environment view, and is removed by reset. If a config file must be
-durable, the operator may deliberately place it outside the resettable paths
-and link or include it, accepting the shared-data semantics.
+resettable environment view, and is removed by reset. Atlas provisions the
+parent directory so ordinary `git config --global` writes work on first entry.
+If a config file must be durable, the operator may deliberately place it
+outside the resettable paths and link or include it, accepting the shared-data
+semantics.
 
 SSH keys, signing keys, GitHub tokens, credential helpers containing secrets,
 and other authentication material are grants, not environment configuration.
@@ -215,13 +237,13 @@ Nix derivation.
 
 ## Local control interface
 
-Atlas exposes two versioned Unix-domain sockets. The public socket supports
-read-only discovery and inspection. A separate mode-`0600` management socket
-supports lifecycle mutation. Both authenticate the kernel-observed peer. The
-service derives an environment from the peer UID or an anchored cgroup prefix;
-unknown identities fail closed, and a descendant cgroup merely named after a
-different environment cannot forge identity. Caller-authored labels do not
-establish authority.
+Atlas exposes two versioned Unix-domain sockets. The public endpoint is
+`/run/atlas/public/control.sock` and supports read-only discovery and
+inspection. A separate mode-`0600` management socket supports lifecycle
+mutation. Both authenticate the kernel-observed peer. The service derives an
+environment from the peer UID or an anchored cgroup prefix; unknown identities
+fail closed, and a descendant cgroup merely named after a different environment
+cannot forge identity. Caller-authored labels do not establish authority.
 
 The implemented interface is:
 
@@ -246,61 +268,49 @@ lifecycle socket and are not exposed by the public inspection socket.
 
 The adapter currently:
 
-- pins Canonical's Ubuntu Noble 24.04 OCI root filesystem for both supported
-  architectures
-- creates one atomically prepared resettable root at
-  `/var/lib/atlas/environments/<id>/rootfs`, with readiness metadata beside it
-- stores a read-only applied seed beside each root and realizes the active root
-  as a writable Btrfs snapshot
-- validates and, when necessary, rebuilds that seed against the current pinned
-  declaration before entry or reset can use it
-- creates, lists, restores, and deletes named read-only root snapshots through
-  the operator-only lifecycle surface
-- lets that root grow elastically on the Atlas data filesystem, with no default
-  per-environment quota
-- stores volume data under `/var/lib/atlas/volumes/<id>/data`
-- creates one automatic owner-home volume and mounts it only into environments
-  whose definitions request owner-home access
-- overlays `~/.config`, `~/.cache`, `~/.local/bin`, and `~/.local/state` from
-  each environment's resettable root
-- enters as the human-owner UID with environment-local passwordless `sudo`
-- maps each fixed Tailscale SSH login to one environment launcher
-- supervises one persistent `systemd-nspawn` service per environment with a
-  user namespace
-- joins each entry to that service's namespaces and delegated session cgroup
-- idmaps the owner home and explicitly attached volumes into the container
-- mounts the Atlas contract and local control socket
-- appends declared Nix tool closures to the ordinary Ubuntu PATH
-- supplies the environment's init and untouched base units through a stable
-  read-only host-systemd bind rather than persisting generation-specific
-  Nix-store paths
-- derives self identity from the environment service's anchored cgroup tree
-- exposes reset only through a separate root-only management socket
-- serializes lifecycle changes and atomically replaces the resettable root only
-  after the service is confirmed stopped
-- reloads generated environment configuration on NixOS generation changes
+- pins the Linux Containers Ubuntu Noble 24.04 Incus system image by exact
+  metadata and rootfs hashes for both supported architectures, derives its
+  Atlas image identity and alias from those hashes, and accepts that alias only
+  when its immutable Incus fingerprint matches the pinned bytes
+- imports that image into the local Incus 7.0 LTS daemon and creates one
+  profile-free persistent unprivileged container per declared environment
+- uses an isolated ID map for every container, disables the Incus guest API,
+  and never exposes the administrative socket inside an environment
+- enters as the human-owner UID through a fixed host login and a
+  host-authorized `incus exec` launcher with environment-local passwordless
+  `sudo`
+- mounts the host Nix store and Atlas contract read-only, then adds declared Nix
+  tool closures to the ordinary Ubuntu `PATH`
+- composes the durable owner home and declared volumes through shifted disk
+  devices while keeping resettable home paths on dependent Incus volumes
+- gives each environment a separate network namespace, static private address,
+  and the `atlas-private` NIC ACL
+- proxies only the public Atlas control protocol into each container through a
+  listener bound to that declared environment identity
+- keeps the root-only Atlas lifecycle and Incus administrative sockets on the
+  host
+- creates, lists, restores, and deletes Incus instance snapshots through the
+  root-only lifecycle surface, rejecting restore before mutation when the
+  snapshot's complete effective configuration does not match the active
+  declaration
+- resets an environment by deleting and recreating its instance from the pinned
+  image while verifying the durable owner home did not change
+- forces all internal Incus commands to the local daemon rather than consulting
+  ambient remote configuration
 
-The persistent VM places `/var/lib/atlas` on a dedicated Btrfs filesystem. Each
-root is a subvolume that shares the filesystem's available capacity and has no
-arbitrary 1 GiB ceiling. Live process and mount state are reconstructed after
-host reboot, while installed packages, `/etc`, and resettable home paths remain
-until explicit reset. Volumes are sibling Btrfs subvolumes composed into the
-environment at their declared paths, so root reset and restore do not include
-them. The installed-host layout reserves host recovery capacity and encrypts
-Atlas state in the KVM proof, but physical recovery, optional quotas, and
-durable-data snapshots remain absent. Network isolation is still
-shared-host and reported as degraded. The read-only host Nix store remains
-visible so declared tools can execute and is reported as degraded tool
-isolation.
+Entries reuse one persistent Incus instance. Several clients can enter it at
+once and share its mutable OS state. Atlas does not provide a durable task
+abstraction or reconnect arbitrary client-owned PTYs after their client exits.
 
-Entries reuse one persistent nspawn instance. Several clients can enter it at
-once and share its mutable OS state. Their processes live under the environment
-service's cgroup, so stopping or resetting the instance includes active entries.
-Atlas does not yet provide a durable task abstraction or reconnect arbitrary
-client-owned PTYs after their client exits.
+The persistent VM places the Incus Btrfs pool and Atlas durable volumes on the
+dedicated data filesystem. The installed-host layout reserves host recovery
+capacity and encrypts Atlas state in the KVM proof, but physical recovery,
+optional quotas, and durable-data backup remain absent. The read-only host Nix
+store remains visible and is reported as degraded tool isolation.
 
-This adapter proves the lifecycle and identity seam. It does not settle the
-eventual runtime manager, container backend, or base distribution.
+This adapter proves the lifecycle and identity seam. Incus is the only current
+environment mechanism, while the Atlas protocol remains the stable product
+boundary above it.
 
 ## Acceptance story
 
@@ -324,7 +334,8 @@ eventual runtime manager, container backend, or base distribution.
 8. The operator snapshots `shared-dev`, makes another root change, and restores
    the snapshot. The later root change disappears while later volume data
    remains.
-9. The operator resets `shared-dev` while a workload is active. Its package,
+9. Reset is refused while the named checkpoint exists. The operator explicitly
+   deletes it, then resets `shared-dev` while a workload is active. Its package,
    process tree, `/etc` change, and resettable home paths disappear; durable
    owner files and the repository remain.
 10. `restricted` cannot see the project volume and cannot reset another
@@ -332,72 +343,33 @@ eventual runtime manager, container backend, or base distribution.
 11. New resettable state and the durable repository survive control-service
     restart and NixOS generation switch and rollback.
 
-## Proven in the QEMU contract
+## Proven in the KVM contract
 
-The current x86_64 KVM integration test passed on August 29, 2026. Together
-with the earlier AArch64 QEMU proof, it verifies:
+The current x86 KVM integration test passed on August 31, 2026. It verifies:
 
-- deterministic layer, package, Git, and variable composition
-- evaluation failure for invalid names, IDs, UIDs, variables, volumes, and
-  mount targets
-- fixed interactive and non-interactive entry into named environments
-- peer-derived environment identity with non-environment callers failing closed
-- the configured human owner enters at `/home/<owner>` and can use passwordless
-  environment-local `sudo` without mutating host `/etc`
-- a local Debian package installs and persists across sequential entries and
-  host reboot
-- `/etc`, resettable home paths, and durable owner files persist across host
-  reboot
-- two environments share the durable owner home while retaining independent
-  `~/.config` state, and an environment without owner-home access cannot see it
-- explicit reset removes `~/.config`, `~/.cache`, `~/.local/bin`, and
-  `~/.local/state` while preserving ordinary owner files, `~/.local/share`, and
-  the nested durable project volume
-- `/run` and live environment processes remain volatile across host reboot
-- `/var/lib/atlas` is a dedicated Btrfs filesystem in the VM; each resettable
-  root and durable volume is a subvolume with no fixed-size image or default
-  per-environment quota
-- each initialized environment has a read-only applied seed and writable
-  copy-on-write root
-- reset refreshes a stale applied seed before reconstructing the root
-- reset reconstructs an absent Btrfs root and repairs a missing readiness marker
-- a symbolic link or non-directory at a managed root fails closed, and
-  interrupted root and seed bootstrap subvolumes are recursively cleaned
-  without following links
-- owner-home mountpoints are prepared through descriptor-relative operations;
-  final and intermediate owner-created symlinks fail closed without modifying
-  their host targets
-- simultaneous clients enter one persistent environment instance
-- package and filesystem mutations do not appear in a neighboring environment
-- an active workload is anchored beneath the environment service cgroup
-- reset stops the active workload and atomically removes installed tools,
-  resettable home, and root-filesystem changes
-- reset preserves the attached project volume
-- a named read-only root snapshot survives reboot, lists deterministically,
-  restores through an atomic root swap, and deletes explicitly
-- snapshot compatibility validation refuses an environment-root symbolic link
-  to the host-owned owner-layout marker
-- root snapshot creation fails explicitly when the resettable root contains a
-  nested Btrfs subvolume; reset remains able to remove that root recursively
-- snapshot restore removes later root changes while preserving later volume
-  and ordinary owner-home changes
-- a stale host-owned owner-layout marker blocks entry until explicit reset, and
-  reset reports that an environment without owner-home access preserved no
-  owner home
-- changing one environment's owner-home attachment produces a distinct
-  compatibility marker, leaves that environment inactive until explicit reset,
-  and does not invalidate an unaffected environment; changing only ordinary
-  environment variables preserves the existing root
-- two environments share one explicitly mounted volume
-- an environment without the mount cannot read that volume
-- an environment cannot invoke the operator-only reset operation
-- the public control socket cannot invoke reset
-- resettable machine state and volume state survive control restart, generation
-  switch, and rollback
-- changed declarative configuration is visible after generation switch and
-  returns to baseline after rollback
+- deterministic layer, package, Git, variable, volume, and owner-home
+  composition plus fail-closed option evaluation
+- fixed owner entry into persistent unprivileged Incus instances
+- host-bound environment identity through the public UNIX proxy, with no
+  caller-authored identity accepted
+- no Incus administrative or guest API socket inside an environment
+- Ubuntu package installation and `/etc` mutation isolated to one instance and
+  persistent across restart
+- durable owner and declared-volume sharing only among selected environments
+- instance snapshots that roll back root and dependent resettable paths while
+  preserving later durable writes
+- reset refusal while named snapshots exist, preserving checkpoints until
+  their explicit deletion
+- delete-and-recreate reset that removes package, root, and resettable-home
+  drift while preserving the Btrfs identities of the durable owner home and
+  declared volumes
+- a generation-stable guest contract directory whose atomically replaced file
+  becomes visible without recreating the environment
+- separate network namespaces with the private NIC ACL applied
+- Incus daemon restart without losing the running environment or durable data
 
-The proof uses harmless configuration and no real credentials.
+The full deployment-network connection matrix, resource-limit enforcement,
+update/rollback, and physical installation remain separate proof work.
 
 ## Hands-on shape
 

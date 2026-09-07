@@ -1,59 +1,30 @@
 { pkgs, atlasModule }:
 let
-  testRepository =
-    pkgs.runCommand "atlas-test-repository.git"
-      {
-        nativeBuildInputs = [ pkgs.git ];
-      }
-      ''
-        export HOME="$TMPDIR/home"
-        mkdir -p "$HOME" work
-        git init --bare "$out"
-        git -C work init --initial-branch=main
-        git -C work config user.name "Atlas Fixture"
-        git -C work config user.email "fixture@example.invalid"
-        echo "Atlas environment fixture" > work/README.md
-        git -C work add README.md
-        git -C work commit -m "Create fixture"
-        git -C work remote add origin "$out"
-        git -C work push origin main
-        git --git-dir="$out" symbolic-ref HEAD refs/heads/main
-      '';
   testPackage =
     pkgs.runCommand "atlas-proof-tool_1.0_all.deb"
       {
         nativeBuildInputs = [ pkgs.dpkg ];
       }
       ''
-        mkdir -p package/DEBIAN package/usr/local/bin package/usr/lib/systemd/system
+        mkdir -p package/DEBIAN package/usr/local/bin
         cat > package/DEBIAN/control <<'EOF'
         Package: atlas-proof-tool
         Version: 1.0
         Architecture: all
         Maintainer: Atlas Test <atlas@example.invalid>
-        Description: Offline package-manager fixture for the Atlas environment contract
+        Description: Offline package-manager fixture for the Atlas Incus contract
         EOF
         cat > package/usr/local/bin/atlas-proof-tool <<'EOF'
         #!/bin/sh
         echo atlas-proof-tool-installed
         EOF
         chmod 0755 package/usr/local/bin/atlas-proof-tool
-        cat > package/usr/lib/systemd/system/atlas-proof-tool.service <<'EOF'
-        [Unit]
-        Description=Atlas proof service
-
-        [Service]
-        Type=oneshot
-        ExecStart=/usr/local/bin/atlas-proof-tool
-        EOF
         dpkg-deb --root-owner-group --build package "$out"
       '';
 in
 pkgs.testers.runNixOSTest {
   name = "atlas-host-contract";
 
-  # Docker Desktop on the development Mac does not expose KVM. Keep the test
-  # runnable there through QEMU TCG while allowing native builders to use KVM.
   requiredFeatures.kvm = false;
   qemu.forceAccel = false;
 
@@ -64,14 +35,9 @@ pkgs.testers.runNixOSTest {
       ../configurations/btrfs-vm-storage.nix
     ];
 
-    specialisation.atlas-owner-home-detached.configuration = {
-      system.nixos.tags = [ "atlas-owner-home-detached" ];
-      atlas.host.environments.shared-dev.ownerHome = pkgs.lib.mkForce false;
-    };
-
     virtualisation = {
       cores = 2;
-      memorySize = 2048;
+      memorySize = 4096;
     };
   };
 
@@ -79,596 +45,414 @@ pkgs.testers.runNixOSTest {
     import json
     import shlex
 
-    # The storage contract includes an in-place reboot. Keep QEMU alive across
-    # the guest reboot so the driver reconnects to the same persistent disk.
+    serial_stdout_off()
     machine.start(allow_reboot=True)
-
-    machine.wait_for_unit("atlas-host.target")
-    machine.wait_for_unit("tailscaled.service")
+    machine.wait_for_unit("incus.service")
+    machine.wait_for_unit("incus-preseed.service")
+    try:
+        machine.wait_until_succeeds(
+            "systemctl is-active atlas-host.target", timeout=600
+        )
+    except Exception:
+        machine.log(machine.execute("systemctl --no-pager --full --failed")[1])
+        machine.log(
+            machine.execute(
+                "systemctl --no-pager --full status atlas-host.target "
+                "atlas-storage-prepare.service atlas-owner-home-prepare.service "
+                "atlas-incus-image.service atlas-incus-network-policy.service "
+                "'atlas-environment-*.service'"
+            )[1]
+        )
+        machine.log(
+            machine.execute(
+                "journalctl --no-pager -b -u atlas-host.target "
+                "-u atlas-storage-prepare.service -u atlas-owner-home-prepare.service "
+                "-u atlas-incus-image.service -u atlas-incus-network-policy.service "
+                "-u 'atlas-environment-*.service'"
+            )[1]
+        )
+        raise
     machine.wait_for_unit("atlas-control.socket")
     machine.wait_for_unit("atlas-manage.socket")
+    with subtest("Incus requires the data mount before startup"):
+        for property in ("Requires", "After"):
+            dependencies = machine.succeed(
+                f"systemctl show incus.service -p {property} --value"
+            ).split()
+            assert "var-lib-atlas.mount" in dependencies
+        machine.succeed("mountpoint /var/lib/atlas")
 
-    def entry(user, command, succeed=True):
+    with subtest("management capabilities are explicitly restricted"):
+        machine.succeed("systemctl start atlas-manage.service")
+        pid = machine.succeed(
+            "systemctl show atlas-manage.service -p MainPID --value"
+        ).strip()
+        status = machine.succeed(f"cat /proc/{pid}/status")
+        fields = dict(line.split(":", 1) for line in status.splitlines())
+        expected = (1 << 2) | (1 << 21)  # DAC_READ_SEARCH and SYS_ADMIN
+        for field in ("CapBnd", "CapPrm", "CapEff"):
+            assert int(fields[field].strip(), 16) == expected, (field, fields[field])
+        assert int(fields["CapAmb"].strip(), 16) == 0
+
+    machine.succeed("test -S /run/atlas/public/control.sock")
+    machine.fail("test -e /run/atlas/control.sock")
+
+    def entry(user, command, succeeds=True):
         shell = machine.succeed(f"getent passwd {user} | cut -d: -f7").strip()
         invocation = f"sudo -u {user} {shell} -c {shlex.quote(command)}"
-        if succeed:
+        if succeeds:
             return machine.succeed(invocation)
         return machine.fail(invocation)
 
-    contract = json.loads(machine.succeed("cat /etc/atlas/host-contract.json"))
-    assert contract["version"] == 7
-    assert contract["intent"]["primitives"] == ["host", "environment", "volume", "grant", "surface", "route"]
-    assert contract["implementation"]["primitives"] == ["host", "environment", "volume"]
-    assert contract["state"]["root"] == "/var/lib/atlas"
-    assert contract["state"]["rootMode"] == "0711"
-    assert contract["configuration"]["connectivity"]["openSshConfigured"] is False
-    assert contract["configuration"]["connectivity"]["tailscale"]["adapterEnabled"] is True
-    assert contract["configuration"]["connectivity"]["tailscale"]["sshRequested"] is True
-    assert contract["configuration"]["connectivity"]["tailscale"]["enrollmentMode"] == "interactive"
-    assert contract["configuration"]["nix"]["allowedUsers"] == ["root"]
-    assert contract["configuration"]["nix"]["trustedUsers"] == ["root"]
-    environment_entry = contract["configuration"]["environmentEntry"]
-    assert environment_entry["version"] == 6
-    assert environment_entry["composition"]["declarative"] is True
-    assert environment_entry["composition"]["runtimeCreation"] is False
-    assert environment_entry["composition"]["disposableRoots"] is False
-    assert environment_entry["composition"]["resettableRoots"] is True
-    assert environment_entry["composition"]["rebootPersistentRoots"] is True
-    assert environment_entry["composition"]["durableVolumes"] is True
-    assert environment_entry["composition"]["persistentInstances"] is True
-    assert environment_entry["composition"]["concurrentEntry"] is True
-    assert environment_entry["composition"]["durableOwnerHome"] is True
-    assert environment_entry["composition"]["resettableHomePaths"] is True
-    assert environment_entry["owner"] == {
-        "home": "/home/owner",
-        "homeStorage": {
-            "durability": "host-durable",
-            "hostPath": "/var/lib/atlas/volumes/dddddddd-dddd-4ddd-8ddd-dddddddddddd/data",
-            "id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        },
-        "name": "owner",
-        "uid": 1000,
-    }
-    assert environment_entry["identity"]["source"] == "unix-peer-credentials-and-anchored-cgroup"
-    assert environment_entry["identity"]["callerAuthoredIdentityAccepted"] is False
-    shared = environment_entry["environments"]["shared-dev"]
-    personal = environment_entry["environments"]["personal-dev"]
-    assert shared["id"] == "11111111-1111-4111-8111-111111111111"
-    assert shared["entry"]["loginUser"] == "atlas-shared-dev"
-    assert shared["runtime"]["backend"] == "systemd-nspawn-service"
-    assert shared["runtime"]["lifecycle"] == "resettable"
-    assert len(shared["runtime"]["ownerLayoutId"]) == 64
-    assert shared["runtime"]["persistence"] == "until-explicit-reset"
-    assert shared["runtime"]["storage"]["adapter"] == "btrfs-subvolume"
-    assert shared["runtime"]["storage"]["copyOnWrite"] is True
-    assert shared["runtime"]["storage"]["snapshots"] is True
-    assert shared["runtime"]["storage"]["seedHostPath"].endswith("/seed")
-    assert shared["runtime"]["storage"]["snapshotsHostPath"].endswith("/snapshots")
-    assert len(shared["runtime"]["storage"]["seed"]["id"]) == 64
-    assert shared["runtime"]["storage"]["seedPrepareCommand"].startswith("/nix/store/")
-    assert shared["runtime"]["rootHostPath"] == "/var/lib/atlas/environments/11111111-1111-4111-8111-111111111111/rootfs"
-    assert shared["runtime"]["baseImage"]["distribution"] == "ubuntu"
-    assert shared["volumes"] == [{
-        "access": "read-write",
-        "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        "name": "projects",
-        "target": "/home/owner/Projects",
-    }]
-    assert shared["home"] == "/home/owner"
-    assert shared["user"] == {
-        "elevation": "passwordless-environment-sudo",
-        "name": "owner",
-        "uid": 1000,
-    }
-    assert shared["homeComposition"] == {
-        "durable": True,
-        "durableHostPath": "/var/lib/atlas/volumes/dddddddd-dddd-4ddd-8ddd-dddddddddddd/data",
-        "resettablePaths": [".cache", ".config", ".local/bin", ".local/state"],
-    }
-    assert shared["variables"] == {
-        "DEMO_API_ORIGIN": "https://example.invalid",
-        "DEMO_BASE": "base",
-        "DEMO_GENERATION": "baseline",
-        "DEMO_NODE": "enabled",
-        "DEMO_OVERRIDE": "instance",
-    }
-    assert shared["packages"] == {"git": "git", "python": "python3"}
-    assert shared["git"]["config"]["user"] == {
-        "email": "atlas@labblue.ai",
-        "name": "George Lydakis",
-    }
-    assert personal["git"]["config"]["user"]["email"] == "george@lydakis.me"
-    assert environment_entry["environments"]["restricted"]["packages"] == {}
-    assert environment_entry["environments"]["restricted"]["homeComposition"] == {
-        "durable": False,
-        "resettablePaths": [],
-    }
-    projects = environment_entry["volumes"]["projects"]
-    owner_home_path = environment_entry["owner"]["homeStorage"]["hostPath"]
-    assert projects["durability"] == "host-durable"
-    assert projects["hostPath"] == "/var/lib/atlas/volumes/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/data"
-    machine.succeed(f"test $(stat -c %u {projects['hostPath']}) = 1000")
-    machine.succeed(f"btrfs subvolume show {owner_home_path}")
-    machine.succeed(f"test $(stat -c %u {owner_home_path}) = 1000")
-
-    symlink_target = "/tmp/atlas-owner-home-symlink-target"
-    machine.succeed(f"mkdir -p {symlink_target}; chown 1000:1000 {symlink_target}")
-    for managed_path in (".cache", ".local"):
-        candidate = f"{owner_home_path}/{managed_path}"
-        machine.succeed(
-            f"rm -rf {shlex.quote(candidate)}; "
-            f"ln -s {shlex.quote(symlink_target)} {shlex.quote(candidate)}"
+    def wait_for_instance(name):
+        machine.wait_until_succeeds(
+            f"incus list {name} --format csv -c s | grep -Fx RUNNING",
+            timeout=120,
         )
-        machine.fail("systemctl restart atlas-owner-home-prepare.service")
-        machine.succeed(f"test -z \"$(find {symlink_target} -mindepth 1 -print -quit)\"")
+        machine.succeed(f"timeout -k 5 30 incus exec {name} -T -n -- true")
+
+    for instance in ("atlas-shared-dev", "atlas-personal-dev", "atlas-restricted"):
+        wait_for_instance(instance)
+
+    with subtest("host contract selects Incus without a substrate fallback"):
+        contract = json.loads(machine.succeed("cat /etc/atlas/host-contract.json"))
+        environment_entry = contract["configuration"]["environmentEntry"]
+        assert environment_entry["adapter"] == "nixos-incus-btrfs-v0"
+        assert environment_entry["baseImage"] == {
+            "architecture": "${if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64"}",
+            "build": "20260829",
+            "contentId": environment_entry["baseImage"]["contentId"],
+            "distribution": "ubuntu",
+            "release": "24.04",
+            "source": "linuxcontainers-incus-image",
+        }
+        assert len(environment_entry["baseImage"]["contentId"]) == 64
+        shared = environment_entry["environments"]["shared-dev"]
+        assert shared["runtime"]["backend"] == "incus-container"
+        assert shared["runtime"]["instance"]["name"] == "atlas-shared-dev"
+        assert shared["runtime"]["instance"]["verifyCommand"].startswith("/nix/store/")
+        assert len(shared["runtime"]["layoutId"]) == 64
+        assert shared["entry"]["adapter"] == "fixed-login-to-persistent-incus"
+        assert environment_entry["identity"]["source"] == (
+            "unix-peer-credentials-or-host-bound-environment-listener"
+        )
+        assert environment_entry["identity"]["callerAuthoredIdentityAccepted"] is False
+        assert environment_entry["composition"]["persistentInstances"] is True
+        assert environment_entry["composition"]["resettableRoots"] is True
+        assert environment_entry["composition"]["durableOwnerHome"] is True
+        machine.succeed("incus version | grep -F 7.0.1")
+        machine.succeed("incus storage show atlas | grep -F 'driver: btrfs'")
+        machine.succeed("grep -Fx Y /sys/module/apparmor/parameters/enabled")
+        machine.succeed("systemctl is-active apparmor.service")
+        machine.succeed("systemctl is-active atlas-incus-network-policy.service")
+        machine.succeed("systemctl restart atlas-incus-image.service")
+        machine.succeed("systemctl is-active atlas-incus-image.service")
+        for instance in ("atlas-shared-dev", "atlas-personal-dev", "atlas-restricted"):
+            assert json.loads(machine.succeed(
+                f"incus query /1.0/instances/{instance}"
+            ))["profiles"] == []
+            assert machine.succeed(
+                f"incus config get {instance} boot.autostart"
+            ).strip() == "false"
+
+    with subtest("noninteractive entry preserves streamed stdin"):
+        shell = machine.succeed("getent passwd atlas-shared-dev | cut -d: -f7").strip()
+        output = machine.succeed(
+            f"printf 'streamed payload\\nsecond line\\n' | "
+            f"timeout 60 sudo -u atlas-shared-dev {shell} -c cat"
+        )
+        assert output == "streamed payload\nsecond line\n"
+
+    with subtest("fixed entry reaches the persistent instance as the owner"):
+        assert entry("atlas-shared-dev", "id -u").strip() == "1000"
+        assert entry("atlas-shared-dev", "id -un").strip() == "owner"
+        assert entry(
+            "atlas-shared-dev",
+            "printf '%s|%s|%s' \"$HOME\" \"$USER\" \"$ATLAS_ENVIRONMENT_NAME\"",
+        ).strip() == "/home/owner|owner|shared-dev"
+        assert entry("atlas-shared-dev", "command -v git").startswith("/nix/store/")
+        assert entry("atlas-shared-dev", "git config --get user.email").strip() == "atlas@labblue.ai"
+        entry("atlas-shared-dev", "git config --global atlas.write-test writable")
+        assert entry(
+            "atlas-shared-dev", "git config --global --get atlas.write-test"
+        ).strip() == "writable"
+        assert entry("atlas-personal-dev", "git config --get user.email").strip() == "george@lydakis.me"
+        assert entry("atlas-restricted", "id -u").strip() == "1000"
+        assert entry("atlas-restricted", "pwd").strip() == "/home/owner"
+        entry("atlas-restricted", "touch resettable-owner-home")
+        assert entry("atlas-restricted", "sudo -n id -u").strip() == "0"
+        entry("atlas-restricted", "command -v git", succeeds=False)
+        assert entry("atlas-shared-dev", "sudo -n id -u").strip() == "0"
+        entry("atlas-shared-dev", "test ! -S /var/lib/incus/unix.socket")
+        entry("atlas-shared-dev", "test ! -S /run/incus/unix.socket")
+        entry("atlas-shared-dev", "test ! -S /dev/incus/sock")
+
+    with subtest("control identity is bound to the environment listener"):
+        leader = machine.succeed(
+            "incus info atlas-shared-dev | sed -n 's/^PID: //p'"
+        ).strip()
+        host_cgroup = machine.succeed(f"cat /proc/{leader}/cgroup").strip()
+        machine.log(f"Incus entry host cgroup: {host_cgroup}")
+        assert "lxc.payload.atlas-shared-dev" in host_cgroup
+        inspected = json.loads(entry("atlas-shared-dev", "atlas environment inspect self --json"))
+        assert inspected["ok"] is True
+        assert inspected["result"]["name"] == "shared-dev"
+
+    with subtest("ordinary mutable root and durable data persist independently"):
+        entry("atlas-shared-dev", "sudo -n sh -c 'echo root > /etc/atlas-root-state'")
+        entry("atlas-shared-dev", "mkdir -p Documents .config/atlas Projects/repo-a")
+        entry("atlas-shared-dev", "echo durable > Documents/owner-state")
+        entry("atlas-shared-dev", "echo resettable > .config/atlas/config-state")
+        entry("atlas-shared-dev", "echo volume > Projects/repo-a/volume-state")
+        machine.succeed("incus restart --timeout 30 --force atlas-shared-dev")
+        wait_for_instance("atlas-shared-dev")
+        entry("atlas-shared-dev", "test -f /etc/atlas-root-state")
+        assert entry("atlas-personal-dev", "cat Documents/owner-state").strip() == "durable"
+        assert entry("atlas-personal-dev", "cat Projects/repo-a/volume-state").strip() == "volume"
+        entry("atlas-restricted", "test -e /home/owner/Documents/owner-state", succeeds=False)
+
+    with subtest("Ubuntu package installation mutates only one instance root"):
         machine.succeed(
-            f"rm {shlex.quote(candidate)}; mkdir {shlex.quote(candidate)}; "
-            f"chown 1000:1000 {shlex.quote(candidate)}; "
-            "systemctl restart atlas-owner-home-prepare.service"
+            "incus file push ${testPackage} atlas-shared-dev/tmp/atlas-proof-tool.deb"
+        )
+        entry("atlas-shared-dev", "sudo -n dpkg -i /tmp/atlas-proof-tool.deb")
+        assert entry("atlas-shared-dev", "atlas-proof-tool").strip() == "atlas-proof-tool-installed"
+        entry("atlas-personal-dev", "command -v atlas-proof-tool", succeeds=False)
+
+    with subtest("snapshot restore rolls back root and resettable home only"):
+        project_path = environment_entry["environments"]["shared-dev"]["volumes"][0]["hostPath"]
+        expected_layout = environment_entry["environments"]["shared-dev"]["runtime"]["layoutId"]
+        project_inode_before = machine.succeed(
+            f"stat -c '%d:%i' {shlex.quote(project_path)}"
+        ).strip()
+        machine.succeed("incus config set atlas-shared-dev security.nesting=true")
+        machine.succeed("incus snapshot create atlas-shared-dev stale-layout")
+        machine.succeed("incus config unset atlas-shared-dev security.nesting")
+        machine.fail(
+            "atlas environment snapshot restore shared-dev stale-layout --json"
+        )
+        assert machine.succeed(
+            "incus config get atlas-shared-dev user.atlas.layout-id"
+        ).strip() == expected_layout
+        machine.succeed("atlas environment snapshot delete shared-dev stale-layout --json")
+        machine.succeed("atlas environment snapshot create shared-dev baseline --json")
+        entry("atlas-shared-dev", "sudo -n touch /etc/after-snapshot")
+        entry("atlas-shared-dev", "echo later > .config/atlas/after-snapshot")
+        entry("atlas-shared-dev", "echo durable-later > Documents/after-snapshot")
+        entry("atlas-shared-dev", "echo volume-later > Projects/repo-a/after-snapshot")
+        machine.succeed("atlas environment snapshot restore shared-dev baseline --json")
+        wait_for_instance("atlas-shared-dev")
+        project_inode_after = machine.succeed(
+            f"stat -c '%d:%i' {shlex.quote(project_path)}"
+        ).strip()
+        assert project_inode_after == project_inode_before
+        entry("atlas-shared-dev", "test ! -e /etc/after-snapshot")
+        entry("atlas-shared-dev", "test ! -e .config/atlas/after-snapshot")
+        assert entry("atlas-shared-dev", "cat Documents/after-snapshot").strip() == "durable-later"
+        assert entry("atlas-shared-dev", "cat Projects/repo-a/after-snapshot").strip() == "volume-later"
+        snapshots = json.loads(machine.succeed("atlas environment snapshot list shared-dev --json"))
+        assert snapshots["result"]["snapshots"] == ["baseline"]
+        machine.fail("atlas environment reset shared-dev --json")
+        snapshots = json.loads(machine.succeed("atlas environment snapshot list shared-dev --json"))
+        assert snapshots["result"]["snapshots"] == ["baseline"]
+        machine.succeed("atlas environment snapshot delete shared-dev baseline --json")
+
+    with subtest("explicit reset recreates root and dependent volumes"):
+        owner_home_path = environment_entry["owner"]["homeStorage"]["hostPath"]
+        inode_before = machine.succeed(f"stat -c '%d:%i' {shlex.quote(owner_home_path)}").strip()
+        machine.succeed("atlas environment reset shared-dev --json")
+        wait_for_instance("atlas-shared-dev")
+        inode_after = machine.succeed(f"stat -c '%d:%i' {shlex.quote(owner_home_path)}").strip()
+        assert inode_after == inode_before
+        entry("atlas-shared-dev", "test ! -e /etc/atlas-root-state")
+        entry("atlas-shared-dev", "command -v atlas-proof-tool", succeeds=False)
+        entry("atlas-shared-dev", "test ! -e .config/atlas/config-state")
+        assert entry("atlas-shared-dev", "cat Documents/owner-state").strip() == "durable"
+        assert entry("atlas-shared-dev", "cat Projects/repo-a/volume-state").strip() == "volume"
+
+    with subtest("private network namespaces and ACL are applied"):
+        shared_pid = machine.succeed("incus info atlas-shared-dev | sed -n 's/^PID: //p'").strip()
+        personal_pid = machine.succeed("incus info atlas-personal-dev | sed -n 's/^PID: //p'").strip()
+        assert shared_pid != personal_pid
+        shared_net = machine.succeed(f"readlink /proc/{shared_pid}/ns/net").strip()
+        personal_net = machine.succeed(f"readlink /proc/{personal_pid}/ns/net").strip()
+        assert shared_net != personal_net
+        for name in ("atlas-shared-dev", "atlas-personal-dev", "atlas-restricted"):
+            assert machine.succeed(
+                f"incus config device get {name} eth0 security.acls"
+            ).strip() == "atlas-private"
+
+        machine.succeed(
+            "incus network acl rule add atlas-private egress "
+            "action=allow destination=203.0.113.0/24"
+        )
+        machine.succeed("systemctl restart atlas-incus-network-policy.service")
+        machine.fail(
+            "incus network acl show atlas-private "
+            "| grep -F 203.0.113.0/24"
         )
 
-    machine.succeed("test $(stat -c %a /var/lib/atlas) = 711")
-    for directory, metadata in contract["state"]["directories"].items():
-        path = f"/var/lib/atlas/{directory}"
-        machine.succeed(f"test $(stat -c %a {path}) = {metadata['mode'].lstrip('0')}")
-        machine.succeed(f"test $(stat -c %U {path}) = {metadata['owner']}")
-        machine.succeed(f"test $(stat -c %G {path}) = {metadata['group']}")
-    machine.succeed("atlas-enroll --help | grep -F 'Interactively enroll this host in Tailscale'")
-    machine.fail("systemctl is-enabled sshd.service")
-    machine.fail("ss -ltnH 'sport = :22' | grep -q .")
-    machine.succeed("systemctl show atlas-host-contract.service -p Slice --value | grep -Fx atlas-control.slice")
-    machine.succeed("test $(stat -c %a /run/atlas/control.sock) = 666")
-    machine.succeed("test $(stat -c %a /run/atlas/manage.sock) = 600")
-
-    doctor = json.loads(machine.succeed("atlas doctor --json"))
-    assert doctor["ok"] is True
-    assert doctor["result"]["status"] == "experimental"
-    assert doctor["result"]["composition"]["runtimeCreation"] is False
-    assert doctor["result"]["networkIsolation"] == {"mode": "shared-host", "status": "degraded"}
-    assert doctor["result"]["rootIsolation"]["mode"] == "systemd-nspawn-user-namespace"
-    assert doctor["result"]["rootIsolation"]["hostRootShared"] is False
-    assert doctor["result"]["storage"]["mode"] == "btrfs-copy-on-write-with-explicit-volumes"
-    assert doctor["result"]["storage"]["bounded"] is False
-    assert doctor["result"]["storage"]["copyOnWrite"] is True
-    assert doctor["result"]["storage"]["snapshots"] is True
-    assert doctor["result"]["storage"]["rollback"] is True
-    assert doctor["result"]["storage"]["hostRecoveryReserve"] is False
-    assert doctor["result"]["storage"]["rootPersistsAcrossReboot"] is True
-    assert doctor["result"]["storage"]["resettable"] is True
-    assert doctor["result"]["storage"]["atRestEncryption"] == {
-        "mode": "none",
-        "status": "degraded",
-    }
-    machine.succeed(
-        "mkdir -p /tmp/atlas-shadow; "
-        "printf '%s\\n' 'from pathlib import Path' 'Path(\"/tmp/atlas-shadow-executed\").touch()' > /tmp/atlas-shadow/atlas.py; "
-        "cd /tmp/atlas-shadow; atlas doctor --json >/dev/null; "
-        "test ! -e /tmp/atlas-shadow-executed"
-    )
-    listed = json.loads(machine.succeed("atlas environment list --json"))
-    assert [item["name"] for item in listed["result"]] == ["personal-dev", "restricted", "shared-dev"]
-    machine.fail("atlas environment inspect self --json")
-
-    shared_state_parent = "/var/lib/atlas/environments/11111111-1111-4111-8111-111111111111"
-    abandoned_ready = f"{shared_state_parent}/.rootfs-ready.interrupted"
-    machine.succeed(f"printf 'pending\\n' > {abandoned_ready}")
-    entry("atlas-shared-dev", "sudo -n touch /etc/atlas-cold-entry")
-    machine.succeed(
-        f"test -f {shlex.quote(shared['runtime']['rootHostPath'])}/etc/atlas-cold-entry"
-    )
-    shared_self = json.loads(entry("atlas-shared-dev", "atlas environment inspect self --json"))
-    machine.fail(f"test -e {abandoned_ready}")
-    assert shared_self["result"]["name"] == "shared-dev"
-    assert shared_self["result"]["uid"] == 23001
-    entry("atlas-restricted", "true")
-    restricted_self = json.loads(entry("atlas-restricted", "atlas environment inspect self --json"))
-    assert restricted_self["result"]["name"] == "restricted"
-    entry("atlas-personal-dev", "true")
-    personal_self = json.loads(entry("atlas-personal-dev", "atlas environment inspect self --json"))
-    assert personal_self["result"]["name"] == "personal-dev"
-    machine.succeed(f"systemctl is-active {shlex.quote(shared['process']['serviceUnit'])}")
-    machine.succeed("machinectl show atlas-shared-dev -p State --value | grep -Fx running")
-    machine.fail("atlas --socket /run/atlas/control.sock environment reset shared-dev --json")
-    machine.fail(
-        "atlas --socket /run/atlas/control.sock environment snapshot list shared-dev --json"
-    )
-    entry(
-        "atlas-shared-dev",
-        "atlas environment snapshot list shared-dev --json",
-        succeed=False,
-    )
-
-    assert entry("atlas-shared-dev", "git config --get user.email").strip() == "atlas@labblue.ai"
-    assert entry("atlas-personal-dev", "git config --get user.email").strip() == "george@lydakis.me"
-    entry(
-        "atlas-shared-dev",
-        "test -s /etc/ssl/certs/ca-bundle.crt && test ! -L /etc/ssl/certs/ca-bundle.crt && "
-        "test -s /etc/ssl/certs/ca-certificates.crt && test ! -L /etc/ssl/certs/ca-certificates.crt",
-    )
-    retired_ca_bundle = "/nix/store/00000000000000000000000000000000-retired-cacert/etc/ssl/certs/ca-bundle.crt"
-    machine.succeed(
-        f"ln -sfn {retired_ca_bundle} {shared['runtime']['rootHostPath']}/etc/ssl/certs/ca-bundle.crt; "
-        f"ln -sfn {retired_ca_bundle} {shared['runtime']['rootHostPath']}/etc/ssl/certs/ca-certificates.crt"
-    )
-    entry(
-        "atlas-shared-dev",
-        "test -s /etc/ssl/certs/ca-bundle.crt && test ! -L /etc/ssl/certs/ca-bundle.crt && "
-        "test -s /etc/ssl/certs/ca-certificates.crt && test ! -L /etc/ssl/certs/ca-certificates.crt",
-    )
-    entry("atlas-restricted", "command -v git", succeed=False)
-
-    entry(
-        "atlas-shared-dev",
-        "mkdir -p Developer .config/atlas && "
-        "git clone file://${testRepository} Developer/atlas && "
-        "git config --global alias.proof status && "
-        "echo shared-dev > .config/atlas/environment.txt && "
-        "cd Developer/atlas && echo shared-dev > environment.txt && git add environment.txt && "
-        "git commit -m 'Prove Atlas Git environment'",
-    )
-    assert entry(
-        "atlas-shared-dev",
-        "cd Developer/atlas && git log -1 --format='%an|%ae'",
-    ).strip() == "George Lydakis|atlas@labblue.ai"
-    assert entry("atlas-shared-dev", "git config --global --get alias.proof").strip() == "status"
-    assert entry("atlas-personal-dev", "cat Developer/atlas/environment.txt").strip() == "shared-dev"
-    entry("atlas-personal-dev", "cat .config/atlas/environment.txt", succeed=False)
-
-    noninteractive = entry(
-        "atlas-shared-dev",
-        "printf '%s|%s|%s|%s' \"$ATLAS_ENVIRONMENT_NAME\" \"$DEMO_BASE\" \"$DEMO_NODE\" \"$DEMO_OVERRIDE\"",
-    ).strip()
-    assert noninteractive == "shared-dev|base|enabled|instance"
-
-    shared_shell = machine.succeed("getent passwd atlas-shared-dev | cut -d: -f7").strip()
-    machine.succeed(
-        "printf '%s\\n' "
-        "'echo \"INTERACTIVE=$ATLAS_ENVIRONMENT_NAME|$DEMO_OVERRIDE\"' "
-        "exit > /tmp/atlas-interactive-input"
-    )
-    interactive = machine.succeed(
-        f"script -qefc 'sudo -u atlas-shared-dev {shared_shell}' /dev/null "
-        "< /tmp/atlas-interactive-input"
-    )
-    assert "INTERACTIVE=shared-dev|instance" in interactive
-
-    nested_shared = entry(
-        "atlas-shared-dev",
-        "$SHELL -ic 'printf \"NESTED=%s|%s\\n\" \"$ATLAS_ENVIRONMENT_NAME\" \"$DEMO_OVERRIDE\"; "
-        "command -v git; command -v curl || true'",
-    )
-    assert "NESTED=shared-dev|instance" in nested_shared
-    assert "/bin/git" in nested_shared
-    assert "/bin/curl" not in nested_shared
-    nested_restricted = entry(
-        "atlas-restricted",
-        "$SHELL -ic 'command -v git || true; command -v curl || true'",
-    )
-    assert "/bin/git" not in nested_restricted
-    assert "/bin/curl" not in nested_restricted
-
-    sentinel = "durable-project-state"
-    entry(
-        "atlas-shared-dev",
-        f"mkdir -p Projects/repo-a Projects/repo-b; echo {sentinel} > Projects/repo-a/environment-probe",
-    )
-    assert entry("atlas-shared-dev", "cat Projects/repo-a/environment-probe").strip() == sentinel
-    assert entry("atlas-personal-dev", "cat Projects/repo-a/environment-probe").strip() == sentinel
-    entry("atlas-restricted", "cat /home/owner/Projects/repo-a/environment-probe", succeed=False)
-
-    restricted = environment_entry["environments"]["restricted"]
-    restricted_root = restricted["runtime"]["rootHostPath"]
-    restricted_saved_root = f"{restricted_root}.saved"
-    projects_path = projects["hostPath"]
-    machine.succeed(f"systemctl stop {shlex.quote(restricted['process']['serviceUnit'])}")
-    machine.succeed(f"mv {restricted_root} {restricted_saved_root}")
-    machine.succeed(f"ln -s {projects_path} {restricted_root}")
-    entry("atlas-restricted", "true", succeed=False)
-    assert machine.succeed(f"cat {projects_path}/repo-a/environment-probe").strip() == sentinel
-    machine.succeed(f"rm {restricted_root}; mv {restricted_saved_root} {restricted_root}")
-    entry("atlas-restricted", "true")
-
-    restricted_stale_mount = f"{restricted_root}/stale-project-mount"
-    machine.succeed(f"systemctl stop {shlex.quote(restricted['process']['serviceUnit'])}")
-    machine.succeed(f"mkdir -p {shlex.quote(restricted_stale_mount)}")
-    machine.succeed(
-        f"mount --bind {shlex.quote(projects_path)} {shlex.quote(restricted_stale_mount)}"
-    )
-    entry("atlas-restricted", "true", succeed=False)
-    machine.fail(f"systemctl is-active {shlex.quote(restricted['process']['serviceUnit'])}")
-    assert machine.succeed(f"cat {projects_path}/repo-a/environment-probe").strip() == sentinel
-    machine.succeed(f"umount {shlex.quote(restricted_stale_mount)}")
-    machine.succeed(f"rmdir {shlex.quote(restricted_stale_mount)}")
-    entry("atlas-restricted", "true")
-
-    restricted_ready = restricted["runtime"]["readyHostPath"]
-    machine.succeed(f"systemctl stop {shlex.quote(restricted['process']['serviceUnit'])}")
-    machine.succeed(
-        f"rm -f {shlex.quote(restricted_root)}/etc/atlas/owner-layout-id && "
-        f"ln -s {shlex.quote(restricted_ready)} "
-        f"{shlex.quote(restricted_root)}/etc/atlas/owner-layout-id"
-    )
-    forged_snapshot = json.loads(
+        machine.succeed("ip link add atlasprobe type dummy")
+        machine.succeed("ip addr add 203.0.113.10/32 dev atlasprobe")
+        machine.succeed("ip link set atlasprobe up")
         machine.succeed(
-            "atlas environment snapshot create restricted forged-layout --json || true"
+            "systemd-run --unit atlas-network-probe --service-type=exec "
+            "systemd-socket-activate -l 0.0.0.0:19090 /bin/cat"
         )
-    )
-    assert forged_snapshot["ok"] is False
-    assert forged_snapshot["error"]["code"] == "reset_required"
-    machine.succeed(f"systemctl stop {shlex.quote(restricted['process']['serviceUnit'])}")
-    machine.succeed(f"echo stale-owner-layout > {shlex.quote(restricted_ready)}")
-    entry("atlas-restricted", "true", succeed=False)
-    repaired_restricted = json.loads(
-        machine.succeed("atlas environment reset restricted --json")
-    )
-    assert repaired_restricted["ok"] is True
-    assert repaired_restricted["result"]["preservedOwnerHome"] is False
-    machine.succeed(f"btrfs subvolume show {shlex.quote(restricted_root)}")
-    assert machine.succeed(f"cat {shlex.quote(restricted_ready)}").strip() == restricted["runtime"]["ownerLayoutId"]
-    entry("atlas-restricted", "true")
+        machine.wait_until_succeeds("ss -ltn | grep -F ':19090'", timeout=30)
+        entry(
+            "atlas-shared-dev",
+            "timeout 2 bash -c 'exec 3<>/dev/tcp/203.0.113.10/19090'",
+            succeeds=False,
+        )
 
-    assert entry("atlas-shared-dev", "id -u").strip() == "1000"
-    assert entry("atlas-shared-dev", "id -un").strip() == "owner"
-    assert entry("atlas-shared-dev", "printf '%s|%s|%s' \"$HOME\" \"$USER\" \"$LOGNAME\"").strip() == "/home/owner|owner|owner"
-    assert entry("atlas-shared-dev", "command -v sudo").strip() == "/usr/bin/sudo"
-    assert entry("atlas-shared-dev", "dpkg-query -S /usr/bin/sudo").strip() == "sudo: /usr/bin/sudo"
-    entry("atlas-shared-dev", "dpkg-query -s sudo | grep -qx 'Status: install ok installed'")
-    entry("atlas-shared-dev", "test ! -e /usr/local/bin/sudo")
-    entry("atlas-shared-dev", "test -z \"$(grep -F /nix/store /etc/pam.d/sudo || true)\"")
-    entry("atlas-shared-dev", "test ! -e /usr/lib/atlas/bootstrap-packages")
-    assert entry("atlas-shared-dev", "sudo -n id -u").strip() == "0"
-    entry("atlas-shared-dev", "sudo -n sh -c 'echo persistent > /etc/atlas-persistent-state'")
-    entry("atlas-shared-dev", "mkdir -p Documents .local/share; echo durable-home > Documents/persistent-home; echo durable-share > .local/share/persistent-share")
-    entry(
-        "atlas-shared-dev",
-        "mkdir -p .cache/atlas .config/atlas .local/bin .local/state/atlas; "
-        "echo resettable-cache > .cache/atlas/state; "
-        "echo resettable-config > .config/atlas/state; "
-        "echo resettable-bin > .local/bin/atlas-state; "
-        "echo resettable-local-state > .local/state/atlas/state",
-    )
-    entry("atlas-restricted", "test -e /home/owner/Documents/persistent-home", succeed=False)
-    entry("atlas-shared-dev", "sudo -n sh -c 'echo volatile > /run/atlas-volatile-state'")
-    entry("atlas-personal-dev", "sudo -n sh -c 'echo reset-before-reentry > /etc/atlas-offline-reset-state'")
-    entry("atlas-personal-dev", "mkdir -p .config/atlas; echo personal-dev > .config/atlas/environment.txt")
-    machine.fail("test -e /etc/atlas-persistent-state")
-
-    package_result = entry(
-        "atlas-shared-dev",
-        "if ! sudo -n env DEBIAN_FRONTEND=noninteractive "
-        "apt-get install -y ${testPackage} </dev/null >/tmp/atlas-apt.log 2>&1; then "
-        "cat /tmp/atlas-apt.log >&2; exit 1; fi; "
-        "atlas-proof-tool",
-    )
-    assert package_result.strip() == "atlas-proof-tool-installed"
-    assert entry("atlas-shared-dev", "atlas-proof-tool").strip() == "atlas-proof-tool-installed"
-    entry("atlas-shared-dev", "test -f /usr/lib/systemd/system/atlas-proof-tool.service")
-    entry("atlas-personal-dev", "command -v atlas-proof-tool", succeed=False)
-
-    shared_root = shared["runtime"]["rootHostPath"]
-    state_parent = shared_root.rsplit("/", 1)[0]
-    machine.succeed(f"test -d {shared_root}")
-    machine.succeed(
-        f"test $(findmnt -n -o UUID -T {shared_root}) = $(findmnt -n -o UUID -T /var/lib/atlas)"
-    )
-    machine.fail(f"mountpoint -q {shared_root}")
-    machine.succeed("test $(stat -f -c %T /var/lib/atlas) = btrfs")
-    machine.succeed(f"btrfs subvolume show {shared_root}")
-    machine.succeed(f"btrfs subvolume show {shared['runtime']['storage']['seedHostPath']}")
-    machine.succeed(f"btrfs subvolume show {projects_path}")
-    assert entry("atlas-shared-dev", "readlink /sbin/init").strip() == "/run/atlas-host-systemd/lib/systemd/systemd"
-    entry("atlas-shared-dev", "test -x /sbin/init")
-    journald_unit = "/usr/lib/systemd/system/systemd-journald.service"
-    assert entry("atlas-shared-dev", f"readlink {journald_unit}").strip() == (
-        "/run/atlas-host-systemd/example/systemd/system/systemd-journald.service"
-    )
-    entry("atlas-shared-dev", f"test -f {journald_unit}")
-
-    snapshot = json.loads(
-        machine.succeed("atlas environment snapshot create shared-dev before-restore --json")
-    )
-    assert snapshot["result"]["created"] is True
-    assert snapshot["result"]["snapshot"] == "before-restore"
-    snapshot_path = f"{state_parent}/snapshots/before-restore"
-    machine.succeed(f"btrfs subvolume show {snapshot_path}")
-    machine.succeed(f"test $(btrfs property get -ts {snapshot_path} ro | cut -d= -f2) = true")
-
-    machine.reboot()
-    machine.wait_for_unit("atlas-host.target")
-    machine.wait_for_unit("atlas-control.socket")
-    machine.wait_for_unit("atlas-manage.socket")
-    machine.fail(f"systemctl is-active {shlex.quote(shared['process']['serviceUnit'])}")
-    machine.fail(f"systemctl is-active {shlex.quote(personal['process']['serviceUnit'])}")
-    assert entry("atlas-personal-dev", "cat .config/atlas/environment.txt").strip() == "personal-dev"
-    personal_root = personal["runtime"]["rootHostPath"]
-    personal_ready = personal["runtime"]["readyHostPath"]
-    personal_seed = personal["runtime"]["storage"]["seedHostPath"]
-    expected_personal_seed_id = personal["runtime"]["storage"]["seed"]["id"]
-    personal_seed_orphan = f"{personal['runtime']['rootHostPath'].rsplit('/', 1)[0]}/.seed.interrupted-reset"
-    machine.succeed(
-        f"btrfs property set -ts {personal_seed} ro false; "
-        f"echo {'0' * 64} > {personal_seed}/etc/atlas/seed-id; "
-        f"touch {personal_seed}/etc/atlas/stale-seed; "
-        f"btrfs property set -ts {personal_seed} ro true; "
-        f"btrfs subvolume create {personal_seed_orphan}"
-    )
-    machine.succeed(
-        f"btrfs subvolume delete {shlex.quote(personal_root)}; "
-        f"rm -f {shlex.quote(personal_ready)}"
-    )
-    offline_reset = json.loads(machine.succeed("atlas environment reset personal-dev --json"))
-    assert offline_reset["ok"] is True
-    machine.succeed(f"btrfs subvolume show {shlex.quote(personal_root)}")
-    machine.succeed(f"test -f {shlex.quote(personal_ready)}")
-    assert machine.succeed(f"cat {personal_seed}/etc/atlas/seed-id").strip() == expected_personal_seed_id
-    machine.fail(f"test -e {personal_seed}/etc/atlas/stale-seed")
-    machine.fail(f"test -e {personal_seed_orphan}")
-    entry("atlas-personal-dev", "test -e /etc/atlas-offline-reset-state", succeed=False)
-    assert entry("atlas-shared-dev", "cat /etc/atlas-persistent-state").strip() == "persistent"
-    assert entry("atlas-shared-dev", "cat Documents/persistent-home").strip() == "durable-home"
-    assert entry("atlas-shared-dev", "cat .local/share/persistent-share").strip() == "durable-share"
-    assert entry("atlas-shared-dev", "cat .cache/atlas/state").strip() == "resettable-cache"
-    assert entry("atlas-shared-dev", "cat .config/atlas/state").strip() == "resettable-config"
-    assert entry("atlas-shared-dev", "cat .local/bin/atlas-state").strip() == "resettable-bin"
-    assert entry("atlas-shared-dev", "cat .local/state/atlas/state").strip() == "resettable-local-state"
-    assert entry("atlas-personal-dev", "cat Documents/persistent-home").strip() == "durable-home"
-    entry("atlas-personal-dev", "test -e .config/atlas/environment.txt", succeed=False)
-    assert entry("atlas-shared-dev", "atlas-proof-tool").strip() == "atlas-proof-tool-installed"
-    entry("atlas-shared-dev", "test -e /run/atlas-volatile-state", succeed=False)
-    assert entry("atlas-shared-dev", "cat Projects/repo-a/environment-probe").strip() == sentinel
-
-    machine.succeed(f"btrfs subvolume show {snapshot_path}")
-    machine.succeed(f"test $(btrfs property get -ts {snapshot_path} ro | cut -d= -f2) = true")
-    listed_snapshots = json.loads(
-        machine.succeed("atlas environment snapshot list shared-dev --json")
-    )
-    assert listed_snapshots["result"]["snapshots"] == ["before-restore"]
-
-    entry("atlas-shared-dev", "sudo -n sh -c 'echo after-snapshot > /etc/atlas-after-snapshot'")
-    entry("atlas-shared-dev", "echo durable-after-snapshot > Projects/repo-a/after-snapshot")
-    entry("atlas-shared-dev", "echo owner-home-after-snapshot > Documents/after-snapshot")
-    restored = json.loads(
-        machine.succeed("atlas environment snapshot restore shared-dev before-restore --json")
-    )
-    assert restored["result"]["restored"] is True
-    assert restored["result"]["preservedOwnerHome"] is True
-    entry("atlas-shared-dev", "test -e /etc/atlas-after-snapshot", succeed=False)
-    assert entry("atlas-shared-dev", "cat Projects/repo-a/after-snapshot").strip() == "durable-after-snapshot"
-    assert entry("atlas-shared-dev", "cat Documents/after-snapshot").strip() == "owner-home-after-snapshot"
-    assert entry("atlas-shared-dev", "atlas-proof-tool").strip() == "atlas-proof-tool-installed"
-
-    deleted_snapshot = json.loads(
-        machine.succeed("atlas environment snapshot delete shared-dev before-restore --json")
-    )
-    assert deleted_snapshot["result"]["deleted"] is True
-    machine.fail(f"test -e {snapshot_path}")
-
-    entry(
-        "atlas-shared-dev",
-        "sudo -n ${pkgs.btrfs-progs}/bin/btrfs subvolume create /opt/atlas-nested && "
-        "sudo -n sh -c 'echo nested-state > /opt/atlas-nested/state'",
-    )
-    nested_snapshot = json.loads(
+    with subtest("system reconciliation shares the lifecycle lock"):
+        service = "atlas-environment-shared\\x2ddev.service"
+        environment_id = environment_entry["environments"]["shared-dev"]["id"]
+        lock = f"/run/atlas/locks/{environment_id}.lock"
         machine.succeed(
-            "atlas environment snapshot create shared-dev nested-root --json || true"
+            f"nohup flock {shlex.quote(lock)} -c 'sleep 10' >/dev/null 2>&1 &"
         )
-    )
-    assert nested_snapshot["ok"] is False
-    assert nested_snapshot["error"]["code"] == "unsupported"
-    assert entry("atlas-shared-dev", "cat /opt/atlas-nested/state").strip() == "nested-state"
+        machine.wait_until_succeeds(
+            f"! flock -n {shlex.quote(lock)} -c true", timeout=5
+        )
+        machine.succeed(f"systemctl restart --no-block '{service}'")
+        machine.succeed("sleep 5")
+        machine.succeed(
+            "systemctl list-jobs --no-legend "
+            "| grep -F 'atlas-environment-shared\\x2ddev.service'"
+        )
+        machine.fail(f"flock -n {shlex.quote(lock)} -c true")
+        machine.wait_until_succeeds(
+            f"flock -n {shlex.quote(lock)} -c true", timeout=15
+        )
+        machine.wait_until_succeeds(
+            "! systemctl list-jobs --no-legend "
+            "| grep -F 'atlas-environment-shared\\x2ddev.service'",
+            timeout=60,
+        )
+        machine.succeed(f"systemctl is-active '{service}'")
 
-    long_command = "echo active > Projects/repo-a/long-entry; sleep 300"
-    machine.succeed(
-        "systemd-run --unit=atlas-long-entry --property=User=atlas-shared-dev -- "
-        f"{shared_shell} -c {shlex.quote(long_command)}"
-    )
-    machine.wait_until_succeeds(
-        "test $(cat /var/lib/atlas/volumes/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/data/repo-a/long-entry) = active"
-    )
-    long_host_pid = machine.wait_until_succeeds(
-        "for pid in $(pgrep -x sleep); do "
-        f"grep -Fq {shlex.quote(shared['process']['cgroupPrefix'])} /proc/$pid/cgroup && "
-        "echo $pid && exit 0; "
-        "done; exit 1"
-    ).strip()
-    concurrent = entry(
-        "atlas-shared-dev",
-        "echo concurrent > Projects/repo-a/concurrent-entry; cat Projects/repo-a/concurrent-entry",
-    )
-    assert concurrent.strip() == "concurrent"
+    with subtest("reconciliation rejects missing environment identity"):
+        service = "atlas-environment-shared\\x2ddev.service"
+        environment_id = environment_entry["environments"]["shared-dev"]["id"]
+        machine.succeed(
+            "incus config unset atlas-shared-dev user.atlas.environment-id"
+        )
+        machine.fail(f"systemctl restart '{service}'")
+        assert machine.succeed(
+            "incus list '^atlas-shared-dev$' --format csv -c s"
+        ).strip() == "STOPPED"
+        assert machine.succeed(
+            "incus config get atlas-shared-dev boot.autostart"
+        ).strip() == "false"
+        machine.succeed(
+            "incus config set atlas-shared-dev user.atlas.environment-id "
+            f"{shlex.quote(environment_id)}"
+        )
+        machine.succeed(f"systemctl restart '{service}'")
+        wait_for_instance("atlas-shared-dev")
 
-    reset_orphan = f"{state_parent}/.rootfs.interrupted-reset"
-    reset_seed_orphan = f"{state_parent}/.seed.interrupted-reset"
-    machine.succeed(f"mkdir -p {reset_orphan}; echo partial > {reset_orphan}/state")
-    machine.succeed(f"btrfs subvolume create {reset_seed_orphan}")
+    with subtest("reconciliation rejects inherited profile devices"):
+        service = "atlas-environment-shared\\x2ddev.service"
+        machine.succeed("incus profile create atlas-unexpected")
+        machine.succeed(
+            "incus profile device add atlas-unexpected inherited-device none"
+        )
+        machine.succeed("incus profile add atlas-shared-dev atlas-unexpected")
+        machine.fail(f"systemctl restart '{service}'")
+        assert machine.succeed(
+            "incus list '^atlas-shared-dev$' --format csv -c s"
+        ).strip() == "STOPPED"
+        assert machine.succeed(
+            "incus config get atlas-shared-dev boot.autostart"
+        ).strip() == "false"
+        machine.succeed("incus profile remove atlas-shared-dev atlas-unexpected")
+        machine.succeed(f"systemctl restart '{service}'")
+        wait_for_instance("atlas-shared-dev")
+        machine.succeed("incus profile delete atlas-unexpected")
 
-    reset = json.loads(machine.succeed("atlas environment reset shared-dev --json"))
-    assert reset["ok"] is True
-    assert reset["result"]["reset"] is True
-    assert reset["result"]["preservedOwnerHome"] is True
-    assert reset["result"]["preservedVolumes"] == ["projects"]
-    machine.wait_until_fails(f"test -d /proc/{long_host_pid}", timeout=60)
-    machine.fail(f"test -e {reset_orphan}")
-    machine.fail(f"test -e {reset_seed_orphan}")
-    machine.execute("systemctl kill --kill-who=all --signal=KILL atlas-long-entry.service")
-    machine.execute("systemctl stop --no-block atlas-long-entry.service")
-    entry_orphan = f"{state_parent}/.rootfs.interrupted-entry"
-    entry_seed_orphan = f"{state_parent}/.seed.interrupted-entry"
-    machine.succeed(f"mkdir -p {entry_orphan}; echo partial > {entry_orphan}/state")
-    machine.succeed(f"btrfs subvolume create {entry_seed_orphan}")
-    entry("atlas-shared-dev", "command -v atlas-proof-tool", succeed=False)
-    machine.fail(f"test -e {entry_orphan}")
-    machine.fail(f"test -e {entry_seed_orphan}")
-    entry("atlas-shared-dev", "test -e /opt/atlas-nested", succeed=False)
-    entry("atlas-shared-dev", "test -e /etc/atlas-persistent-state", succeed=False)
-    assert entry("atlas-shared-dev", "cat Documents/persistent-home").strip() == "durable-home"
-    assert entry("atlas-shared-dev", "cat .local/share/persistent-share").strip() == "durable-share"
-    entry("atlas-shared-dev", "test -e .cache/atlas/state", succeed=False)
-    entry("atlas-shared-dev", "test -e .config/atlas/state", succeed=False)
-    entry("atlas-shared-dev", "test -e .local/bin/atlas-state", succeed=False)
-    entry("atlas-shared-dev", "test -e .local/state/atlas/state", succeed=False)
-    entry("atlas-shared-dev", "test -e .config/atlas/environment.txt", succeed=False)
-    entry("atlas-personal-dev", "test -e .config/atlas/environment.txt", succeed=False)
-    assert entry("atlas-shared-dev", "cat Projects/repo-a/environment-probe").strip() == sentinel
-    assert entry("atlas-shared-dev", "cat Projects/repo-a/concurrent-entry").strip() == "concurrent"
-    entry("atlas-shared-dev", "git config --global --get alias.proof", succeed=False)
+    with subtest("mutable default profile cannot change Atlas instances"):
+        service = "atlas-environment-shared\\x2ddev.service"
+        machine.succeed("incus profile set default security.nesting=true")
+        machine.succeed(f"systemctl restart '{service}'")
+        wait_for_instance("atlas-shared-dev")
+        assert "security.nesting" not in json.loads(machine.succeed(
+            "incus query /1.0/instances/atlas-shared-dev"
+        ))["expanded_config"]
+        machine.succeed("incus profile unset default security.nesting")
 
-    machine.fail("sudo -u atlas-shared-dev sudo -n true")
+    with subtest("stable guest contract directory follows atomic updates"):
+        assert machine.succeed(
+            "incus config device get atlas-shared-dev atlas-contract source"
+        ).strip() == "/run/atlas/guest-contract"
+        host_contract_hash = machine.succeed(
+            "sha256sum /etc/atlas/control-contract.json | cut -d' ' -f1"
+        ).strip()
+        assert entry(
+            "atlas-shared-dev",
+            "sha256sum /etc/atlas-host/control-contract.json | cut -d' ' -f1",
+        ).strip() == host_contract_hash
+        machine.succeed(
+            "printf '%s\\n' '{\"generation\":\"replacement\"}' "
+            "> /run/atlas/guest-contract/.next-contract"
+        )
+        machine.succeed(
+            "mv /run/atlas/guest-contract/.next-contract "
+            "/run/atlas/guest-contract/control-contract.json"
+        )
+        assert json.loads(
+            entry("atlas-shared-dev", "cat /etc/atlas-host/control-contract.json")
+        ) == {"generation": "replacement"}
+        machine.succeed(
+            "install -m 0644 /etc/atlas/control-contract.json "
+            "/run/atlas/guest-contract/.next-contract"
+        )
+        machine.succeed(
+            "mv /run/atlas/guest-contract/.next-contract "
+            "/run/atlas/guest-contract/control-contract.json"
+        )
+        assert entry(
+            "atlas-shared-dev",
+            "sha256sum /etc/atlas-host/control-contract.json | cut -d' ' -f1",
+        ).strip() == host_contract_hash
 
-    allowed_users = machine.succeed("nix config show --json | jq -r '.\"allowed-users\".value | join(\" \")'").strip()
-    trusted_users = machine.succeed("nix config show --json | jq -r '.\"trusted-users\".value | join(\" \")'").strip()
-    assert allowed_users == "root"
-    assert trusted_users == "root"
+    with subtest("instance drift fails closed and incomplete creation self-recovers"):
+        service = "atlas-environment-shared\\x2ddev.service"
+        machine.succeed("incus config device remove atlas-shared-dev nix-store")
+        machine.fail(f"systemctl restart '{service}'")
+        machine.succeed("atlas environment reset shared-dev --json")
+        machine.succeed(f"systemctl reset-failed '{service}'")
+        machine.succeed(f"systemctl restart '{service}'")
+        entry("atlas-shared-dev", "sudo -n touch /etc/incomplete-atlas-instance")
+        machine.succeed(
+            "incus config unset atlas-shared-dev user.atlas.layout-id"
+        )
+        machine.succeed(f"systemctl restart '{service}'")
+        entry("atlas-shared-dev", "test ! -e /etc/incomplete-atlas-instance")
 
-    entry("atlas-shared-dev", "sudo -n sh -c 'echo update-persistent > /etc/atlas-update-state'")
+    with subtest("Incus daemon restart preserves live environments"):
+        pid_before = machine.succeed("incus info atlas-shared-dev | sed -n 's/^PID: //p'").strip()
+        machine.succeed("timeout 60 systemctl restart incus.service")
+        machine.succeed("incus admin waitready")
+        pid_after = machine.succeed("incus info atlas-shared-dev | sed -n 's/^PID: //p'").strip()
+        assert pid_after == pid_before
+        entry("atlas-shared-dev", "test -f Documents/owner-state")
 
-    def assert_shared_state():
-        assert entry("atlas-shared-dev", "cat Projects/repo-a/environment-probe").strip() == sentinel
-        assert entry("atlas-shared-dev", "cat /etc/atlas-update-state").strip() == "update-persistent"
-
-    assert_shared_state()
-    machine.succeed("systemctl restart atlas-control.service")
-    machine.wait_for_unit("atlas-control.service")
-    assert_shared_state()
-    baseline = machine.succeed("readlink -f /run/current-system").strip()
-    updated = machine.succeed("readlink -f /run/current-system/specialisation/atlas-updated").strip()
-    owner_home_detached = machine.succeed(
-        "readlink -f /run/current-system/specialisation/atlas-owner-home-detached"
-    ).strip()
-
-    machine.succeed(f"{updated}/bin/switch-to-configuration test")
-    machine.succeed("grep -Fx updated /etc/atlas-spike-generation")
-    updated_inspect = json.loads(machine.succeed("atlas environment inspect shared-dev --json"))
-    assert updated_inspect["result"]["variables"]["DEMO_GENERATION"] == "updated"
-    assert entry("atlas-shared-dev", "printf %s \"$DEMO_GENERATION\"").strip() == "updated"
-    assert_shared_state()
-
-    machine.succeed(f"{baseline}/bin/switch-to-configuration test")
-    machine.succeed("grep -Fx baseline /etc/atlas-spike-generation")
-    baseline_inspect = json.loads(machine.succeed("atlas environment inspect shared-dev --json"))
-    assert baseline_inspect["result"]["variables"]["DEMO_GENERATION"] == "baseline"
-    assert entry("atlas-shared-dev", "printf %s \"$DEMO_GENERATION\"").strip() == "baseline"
-    assert_shared_state()
-
-    baseline_layout_id = baseline_inspect["result"]["runtime"]["ownerLayoutId"]
-    machine.succeed(f"{owner_home_detached}/bin/switch-to-configuration test")
-    detached_inspect = json.loads(machine.succeed("atlas environment inspect shared-dev --json"))
-    assert detached_inspect["result"]["homeComposition"]["durable"] is False
-    assert detached_inspect["result"]["runtime"]["ownerLayoutId"] != baseline_layout_id
-    entry("atlas-shared-dev", "true", succeed=False)
-    assert entry("atlas-personal-dev", "cat Documents/persistent-home").strip() == "durable-home"
-    detached_reset = json.loads(machine.succeed("atlas environment reset shared-dev --json"))
-    assert detached_reset["result"]["preservedOwnerHome"] is False
-    entry("atlas-shared-dev", "test -e Documents/persistent-home", succeed=False)
-    assert entry("atlas-shared-dev", "cat Projects/repo-a/environment-probe").strip() == sentinel
-
-    machine.succeed(f"{baseline}/bin/switch-to-configuration test")
-    restored_home_inspect = json.loads(machine.succeed("atlas environment inspect shared-dev --json"))
-    assert restored_home_inspect["result"]["homeComposition"]["durable"] is True
-    assert restored_home_inspect["result"]["runtime"]["ownerLayoutId"] == baseline_layout_id
-    entry("atlas-shared-dev", "true", succeed=False)
-    restored_home_reset = json.loads(machine.succeed("atlas environment reset shared-dev --json"))
-    assert restored_home_reset["result"]["preservedOwnerHome"] is True
-    assert entry("atlas-shared-dev", "cat Documents/persistent-home").strip() == "durable-home"
+    with subtest("inventory quarantines removed Atlas environments"):
+        machine.succeed(
+            "image=$(incus image list --format csv -c l | head -n1); "
+            "incus init \"$image\" atlas-orphan "
+            "--config user.atlas.environment-id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa "
+            "--config boot.autostart=true"
+        )
+        machine.succeed("incus start atlas-orphan")
+        machine.succeed("systemctl restart atlas-incus-inventory.service")
+        assert machine.succeed(
+            "incus list '^atlas-orphan$' --format csv -c s"
+        ).strip() == "STOPPED"
+        assert machine.succeed(
+            "incus config get atlas-orphan boot.autostart"
+        ).strip() == "false"
   '';
 }

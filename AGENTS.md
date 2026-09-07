@@ -40,9 +40,9 @@ or agent-identity primitives without revisiting the product thesis.
   Controller devices require explicit, revocable pairing.
 - The managed physical image is the product target. VMs are development,
   automated-test, and optional deployment artifacts.
-- NixOS and systemd-nspawn are prototype vehicles, not permanent product
-  decisions. Judge them by measurable behavior rather than implementation
-  elegance.
+- NixOS is the current host prototype vehicle and Incus 7.0 LTS is the selected
+  Environment substrate. Judge both by measurable behavior rather than
+  implementation elegance.
 - Report degraded guarantees honestly. Do not infer a security property from a
   configured mechanism without runtime evidence.
 
@@ -79,8 +79,7 @@ unless George explicitly changes the sequence.
   provider volume and reports its weaker provider-managed encryption boundary.
 - `src/atlas/control.py` owns the local Unix-socket protocol, peer-derived
   authorization, and CLI surfaces.
-- `src/atlas/lifecycle.py` owns reset and snapshot orchestration.
-- `src/atlas/storage.py` owns directory and Btrfs filesystem mechanics.
+- `src/atlas/lifecycle.py` owns Incus reset and snapshot orchestration.
 - `tests/test_atlas_control.py` covers protocol and lifecycle regressions.
 - `nixos/tests/host-contract.nix` is the end-to-end host proof.
 

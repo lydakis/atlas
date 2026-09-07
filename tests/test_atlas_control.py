@@ -1,6 +1,5 @@
 import io
 import socket
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,33 +10,21 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from atlas.control import _read_request, handle_request  # noqa: E402
+from atlas.control import (  # noqa: E402
+    DEFAULT_SOCKET,
+    _read_request,
+    build_parser,
+    handle_request,
+)
 from atlas.lifecycle import (  # noqa: E402
+    MAX_INCUS_DIAGNOSTIC_BYTES,
     ControlOperationError,
-    _pause_environment,
-    _remove_abandoned_roots,
-    _require_snapshot_owner_layout,
-    _reset_environment,
-)
-from atlas.storage import (  # noqa: E402
-    MAX_BTRFS_DIAGNOSTIC_BYTES,
-    _delete_managed_tree,
-    _replace_btrfs_root,
-    _run_btrfs,
+    EnvironmentLifecycle,
 )
 
 
-SHARED_CGROUP = (
-    "/atlas.slice/atlas-environments.slice/"
-    "atlas-environments-shared\\x2ddev.slice/"
-    "atlas-environment-shared\\x2ddev.service"
-)
-RESTRICTED_CGROUP = (
-    "/atlas.slice/atlas-environments.slice/"
-    "atlas-environments-restricted.slice/"
-    "atlas-environment-restricted.service"
-)
-OWNER_LAYOUT_ID = "b" * 64
+SHARED_CGROUP = "/lxc.payload.atlas-shared-dev"
+RESTRICTED_CGROUP = "/lxc.payload.atlas-restricted"
 
 ENVIRONMENTS = {
     "restricted": {
@@ -72,6 +59,7 @@ ENVIRONMENTS = {
         "volumes": [
             {
                 "access": "read-write",
+                "hostPath": "/var/lib/atlas/volumes/projects/data",
                 "name": "projects",
                 "target": "/home/owner/Projects",
             }
@@ -133,11 +121,26 @@ class AtlasControlProtocolTests(unittest.TestCase):
             lifecycle=self.lifecycle if allow_management else None,
         )
 
+    def test_default_socket_uses_the_public_control_namespace(self):
+        self.assertEqual(DEFAULT_SOCKET, "/run/atlas/public/control.sock")
+
     def test_inspect_self_derives_environment_from_peer_uid(self):
         response = self.request(
             23001,
             {"version": 1, "operation": "environment.inspect-self"},
         )
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["result"]["name"], "shared-dev")
+
+    def test_host_bound_listener_confers_its_declared_environment_identity(self):
+        response = handle_request(
+            peer_uid=65534,
+            peer_cgroup="0::/untrusted/proxy",
+            request={"version": 1, "operation": "environment.inspect-self"},
+            contract=CONTRACT,
+            trusted_environment="shared-dev",
+        )
+
         self.assertTrue(response["ok"])
         self.assertEqual(response["result"]["name"], "shared-dev")
         self.assertNotIn("peerUid", response["result"])
@@ -236,6 +239,29 @@ class AtlasControlProtocolTests(unittest.TestCase):
         )
         self.assertTrue(response["ok"])
         self.assertFalse(response["result"]["preservedOwnerHome"])
+
+    def test_reset_returns_the_bounded_lifecycle_error(self):
+        self.lifecycle.reset = mock.Mock(
+            side_effect=ControlOperationError(
+                "incus_failed", "Incus could not complete the requested operation"
+            )
+        )
+
+        response = self.request(
+            0,
+            {"version": 1, "operation": "environment.reset", "name": "shared-dev"},
+        )
+
+        self.assertEqual(
+            response,
+            {
+                "ok": False,
+                "error": {
+                    "code": "incus_failed",
+                    "message": "Incus could not complete the requested operation",
+                },
+            },
+        )
 
     def test_public_surface_does_not_expose_reset_even_to_root(self):
         response = self.request(
@@ -344,676 +370,427 @@ class AtlasControlProtocolTests(unittest.TestCase):
         self.assertFalse(response["ok"])
         self.assertEqual(response["error"]["code"], "unsupported_version")
 
+    def test_serve_rejects_combined_management_and_environment_identity(self):
+        with (
+            mock.patch("sys.stderr", io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            build_parser().parse_args(
+                ["serve", "--management", "--environment", "shared-dev"]
+            )
+
 
 class EnvironmentLifecycleTests(unittest.TestCase):
-    def _runtime_fixture(self, temporary_directory):
-        runtime_root = Path(temporary_directory) / "environments"
-        runtime_parent = runtime_root / ENVIRONMENTS["shared-dev"]["id"]
-        root = runtime_parent / "rootfs"
-        root.mkdir(parents=True)
-        ready = runtime_parent / "rootfs.ready"
-        ready.write_text(f"{OWNER_LAYOUT_ID}\n", encoding="utf-8")
-        lock_root = Path(temporary_directory) / "locks"
-        outside = Path(temporary_directory) / "durable-volume"
-        outside.mkdir()
-        (outside / "repository").write_text("durable", encoding="utf-8")
+    def fixture(self, temporary_directory):
+        durable_home = Path(temporary_directory) / "durable-home"
+        durable_home.mkdir()
+        (durable_home / "repository").write_text("durable", encoding="utf-8")
+        durable_volume = Path(temporary_directory) / "durable-volume"
+        durable_volume.mkdir()
+        (durable_volume / "source").write_text("durable", encoding="utf-8")
         environment = {
             **ENVIRONMENTS["shared-dev"],
             "homeComposition": {
                 **ENVIRONMENTS["shared-dev"]["homeComposition"],
-                "durableHostPath": str(outside),
+                "durableHostPath": str(durable_home),
             },
-            "runtime": {
-                "ownerLayoutId": OWNER_LAYOUT_ID,
-                "readyHostPath": str(ready),
-                "rootHostPath": str(root),
-            },
-        }
-        return environment, runtime_root, lock_root, root, ready, outside
-
-    def _btrfs_runtime_fixture(self, temporary_directory):
-        environment, runtime_root, lock_root, root, ready, outside = self._runtime_fixture(
-            temporary_directory
-        )
-        expected_seed_id = "a" * 64
-        seed = root.parent / "seed"
-        (seed / "etc" / "atlas").mkdir(parents=True)
-        (seed / "etc" / "atlas" / "seed-id").write_text(
-            f"{expected_seed_id}\n", encoding="utf-8"
-        )
-        (seed / "etc" / "atlas" / "owner-layout-id").write_text(
-            f"{OWNER_LAYOUT_ID}\n", encoding="utf-8"
-        )
-        snapshots = root.parent / "snapshots"
-        snapshots.mkdir()
-        environment["runtime"]["storage"] = {
-            "adapter": "btrfs-subvolume",
-            "seedHostPath": str(seed),
-            "snapshotsHostPath": str(snapshots),
-            "seed": {"id": expected_seed_id},
-            "seedPrepareCommand": "/bin/prepare-seed",
-        }
-        mountinfo = Path(temporary_directory) / "empty-mountinfo"
-        mountinfo.touch()
-        return environment, runtime_root, lock_root, root, ready, seed, outside, mountinfo
-
-    def test_reset_stops_and_verifies_instance_before_detaching_root(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            environment, runtime_root, lock_root, root, ready, outside = self._runtime_fixture(
-                temporary_directory
-            )
-            (root / "installed-tool").write_text("disposable", encoding="utf-8")
-            completed = [
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 3),
-            ]
-            empty_mountinfo = Path(temporary_directory) / "empty-mountinfo"
-            empty_mountinfo.touch()
-
-            with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed) as run:
-                preserved_owner_home = _reset_environment(
-                    environment,
-                    runtime_root=str(runtime_root),
-                    lock_root=str(lock_root),
-                    systemctl="/bin/systemctl",
-                    mountinfo_path=str(empty_mountinfo),
-                )
-
-            self.assertFalse(root.exists())
-            self.assertFalse(ready.exists())
-            self.assertEqual((outside / "repository").read_text(), "durable")
-            self.assertEqual(
-                run.call_args_list[0].args[0],
-                ["/bin/systemctl", "stop", "atlas-environment-shared\\x2ddev.service"],
-            )
-            self.assertEqual(
-                run.call_args_list[1].args[0],
-                [
-                    "/bin/systemctl",
-                    "is-active",
-                    "--quiet",
-                    "atlas-environment-shared\\x2ddev.service",
-                ],
-            )
-            self.assertEqual(list(root.parent.glob(".deleting-*")), [])
-
-    def test_abandoned_ready_marker_is_removed_before_lifecycle_work(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            parent = Path(temporary_directory)
-            marker = parent / ".rootfs-ready.interrupted"
-            marker.write_text("pending\n", encoding="utf-8")
-            mountinfo = parent / "empty-mountinfo"
-            mountinfo.touch()
-
-            _remove_abandoned_roots(parent, str(mountinfo))
-
-            self.assertFalse(marker.exists())
-
-    def test_btrfs_root_replacement_uses_a_writable_snapshot_and_removes_old_root(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            parent = Path(temporary_directory)
-            source = parent / "seed"
-            source.mkdir()
-            root = parent / "rootfs"
-            root.mkdir()
-            (root / "old-state").write_text("old", encoding="utf-8")
-            ready = parent / "rootfs.ready"
-            ready.write_text("old-layout\n", encoding="utf-8")
-
-            def create_snapshot(snapshot_source, destination, _btrfs, *, readonly):
-                self.assertEqual(snapshot_source, source)
-                self.assertFalse(readonly)
-                destination.mkdir()
-                (destination / "seed-state").write_text("fresh", encoding="utf-8")
-
-            def delete_tree(path, adapter, _btrfs):
-                self.assertEqual(adapter, "btrfs-subvolume")
-                shutil.rmtree(path)
-
-            with (
-                mock.patch("atlas.storage._require_btrfs_subvolume"),
-                mock.patch("atlas.storage._btrfs_snapshot", side_effect=create_snapshot),
-                mock.patch("atlas.storage._delete_managed_tree", side_effect=delete_tree),
-            ):
-                _replace_btrfs_root(
-                    source=source,
-                    root=root,
-                    ready=ready,
-                    ready_value=OWNER_LAYOUT_ID,
-                    btrfs="/bin/btrfs",
-                )
-
-            self.assertEqual((root / "seed-state").read_text(encoding="utf-8"), "fresh")
-            self.assertFalse((root / "old-state").exists())
-            self.assertTrue(ready.is_file())
-            self.assertEqual(ready.read_text(encoding="utf-8").strip(), OWNER_LAYOUT_ID)
-            self.assertEqual(list(parent.glob(".deleting-*")), [])
-            self.assertEqual(list(parent.glob(".rootfs.*")), [])
-
-    def test_btrfs_root_replacement_cleans_candidates_when_marker_setup_fails(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            parent = Path(temporary_directory)
-            source = parent / "seed"
-            source.mkdir()
-            root = parent / "rootfs"
-            root.mkdir()
-            ready = parent / "rootfs.ready"
-
-            def create_snapshot(_source, destination, _btrfs, *, readonly):
-                self.assertFalse(readonly)
-                destination.mkdir()
-
-            def delete_tree(path, adapter, _btrfs):
-                self.assertEqual(adapter, "btrfs-subvolume")
-                shutil.rmtree(path)
-
-            with (
-                mock.patch("atlas.storage._require_btrfs_subvolume"),
-                mock.patch("atlas.storage._btrfs_snapshot", side_effect=create_snapshot),
-                mock.patch("atlas.storage._delete_managed_tree", side_effect=delete_tree),
-                mock.patch("atlas.storage.os.chmod", side_effect=OSError("interrupted")),
-                self.assertRaisesRegex(OSError, "interrupted"),
-            ):
-                _replace_btrfs_root(
-                    source=source,
-                    root=root,
-                    ready=ready,
-                    ready_value=OWNER_LAYOUT_ID,
-                    btrfs="/bin/btrfs",
-                )
-
-            self.assertTrue(root.is_dir())
-            self.assertFalse(ready.exists())
-            self.assertEqual(list(parent.glob(".rootfs.*")), [])
-            self.assertEqual(list(parent.glob(".rootfs-ready.*")), [])
-
-    def test_snapshot_layout_marker_cannot_follow_an_environment_symlink(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory) / "rootfs"
-            marker_parent = root / "etc" / "atlas"
-            marker_parent.mkdir(parents=True)
-            host_marker = Path(temporary_directory) / "rootfs.ready"
-            host_marker.write_text(f"{OWNER_LAYOUT_ID}\n", encoding="utf-8")
-            (marker_parent / "owner-layout-id").symlink_to(host_marker)
-
-            with self.assertRaises(ControlOperationError) as error:
-                _require_snapshot_owner_layout(root, OWNER_LAYOUT_ID)
-
-            self.assertEqual(error.exception.code, "reset_required")
-
-    def test_btrfs_cleanup_recursively_deletes_nested_subvolumes_and_commits(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory) / "rootfs"
-            root.mkdir()
-            with (
-                mock.patch("atlas.storage._is_btrfs_subvolume", return_value=True),
-                mock.patch("atlas.storage._run_btrfs") as run_btrfs,
-            ):
-                _delete_managed_tree(root, "btrfs-subvolume", "/bin/btrfs")
-
-            run_btrfs.assert_called_once_with(
-                "/bin/btrfs",
-                "subvolume",
-                "delete",
-                "--recursive",
-                "--commit-after",
-                "--",
-                str(root),
-            )
-
-    def test_btrfs_failure_logs_bounded_stderr_without_exposing_it(self):
-        diagnostic = b"filesystem full\n" + b"x" * (
-            MAX_BTRFS_DIAGNOSTIC_BYTES + 128
-        )
-        completed = subprocess.CompletedProcess(
-            ["/bin/btrfs", "subvolume", "delete"],
-            28,
-            stderr=diagnostic,
-        )
-        stderr = io.StringIO()
-
-        with (
-            mock.patch("atlas.storage.subprocess.run", return_value=completed),
-            mock.patch("sys.stderr", stderr),
-            self.assertRaises(subprocess.CalledProcessError) as raised,
-        ):
-            _run_btrfs("/bin/btrfs", "subvolume", "delete", "--", "/managed")
-
-        self.assertIsNone(raised.exception.stderr)
-        self.assertIn("filesystem full", stderr.getvalue())
-        self.assertIn("[truncated]", stderr.getvalue())
-        self.assertLess(len(stderr.getvalue()), MAX_BTRFS_DIAGNOSTIC_BYTES + 256)
-
-    def test_pause_quiesces_an_activating_environment(self):
-        states = iter(["activating", "inactive"])
-        commands = []
-
-        def run(command, **_kwargs):
-            commands.append(command)
-            if command[1] == "show":
-                return subprocess.CompletedProcess(
-                    command,
-                    0,
-                    stdout=f"{next(states)}\n",
-                )
-            if command[1] == "is-active":
-                return subprocess.CompletedProcess(command, 3)
-            if command[1] == "stop":
-                return subprocess.CompletedProcess(command, 0)
-            raise AssertionError(f"unexpected command: {command}")
-
-        with mock.patch("atlas.lifecycle.subprocess.run", side_effect=run):
-            should_resume = _pause_environment(
-                "/bin/systemctl",
-                "atlas-environment-shared\\x2ddev.service",
-            )
-
-        self.assertTrue(should_resume)
-        self.assertIn(
-            [
-                "/bin/systemctl",
-                "stop",
-                "atlas-environment-shared\\x2ddev.service",
+            "volumes": [
+                {
+                    **ENVIRONMENTS["shared-dev"]["volumes"][0],
+                    "hostPath": str(durable_volume),
+                }
             ],
-            commands,
+            "runtime": {
+                "backend": "incus-container",
+                "layoutId": "f" * 64,
+                "instance": {
+                    "name": "atlas-shared-dev",
+                    "resetCommand": "/nix/store/atlas-reconcile-shared-dev",
+                    "verifyCommand": "/nix/store/atlas-verify-shared-dev",
+                },
+            },
+        }
+        lifecycle = EnvironmentLifecycle(
+            lock_root=str(Path(temporary_directory) / "locks"),
+            incus="/bin/incus",
+            snapshots_enabled=True,
         )
+        return lifecycle, environment, durable_home
 
-    def test_reset_reconstructs_a_btrfs_root_from_the_applied_seed(self):
+    def test_reset_reconciles_instance_while_preserving_owner_home(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            (
-                environment,
-                runtime_root,
-                lock_root,
-                root,
-                ready,
-                seed,
-                outside,
-                empty_mountinfo,
-            ) = self._btrfs_runtime_fixture(temporary_directory)
-            completed = [
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 3),
-                subprocess.CompletedProcess([], 0),
-            ]
-
-            with (
-                mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed) as run,
-                mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
-                mock.patch("atlas.lifecycle._replace_btrfs_root") as replace,
-            ):
-                preserved_owner_home = _reset_environment(
-                    environment,
-                    runtime_root=str(runtime_root),
-                    lock_root=str(lock_root),
-                    systemctl="/bin/systemctl",
-                    btrfs="/bin/btrfs",
-                    mountinfo_path=str(empty_mountinfo),
-                )
-
-            self.assertTrue(preserved_owner_home)
-            replace.assert_called_once_with(
-                source=seed,
-                root=root,
-                ready=ready,
-                ready_value=OWNER_LAYOUT_ID,
-                btrfs="/bin/btrfs",
+            lifecycle, environment, durable_home = self.fixture(temporary_directory)
+            completed = subprocess.CompletedProcess([], 0, stderr="")
+            instances = subprocess.CompletedProcess(
+                [], 0, stdout='[{"name":"atlas-shared-dev"}]\n', stderr=""
             )
-            self.assertEqual(run.call_args_list[2].args[0], ["/bin/prepare-seed"])
-            self.assertEqual((outside / "repository").read_text(), "durable")
+            snapshots = subprocess.CompletedProcess([], 0, stdout="[]\n", stderr="")
 
-    def test_reset_fails_if_the_durable_owner_home_is_replaced_during_reset(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            (
-                environment,
-                runtime_root,
-                lock_root,
-                root,
-                _ready,
-                _seed,
-                outside,
-                empty_mountinfo,
-            ) = self._btrfs_runtime_fixture(temporary_directory)
-            completed = [
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 3),
-                subprocess.CompletedProcess([], 0),
-            ]
-
-            def replace_owner_home(**_arguments):
-                outside.rename(outside.parent / "replaced-owner-home")
-                outside.mkdir()
-
-            with (
-                mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed),
-                mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
-                mock.patch(
-                    "atlas.lifecycle._replace_btrfs_root",
-                    side_effect=replace_owner_home,
-                ),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "owner home changed"):
-                    _reset_environment(
-                        environment,
-                        runtime_root=str(runtime_root),
-                        lock_root=str(lock_root),
-                        systemctl="/bin/systemctl",
-                        btrfs="/bin/btrfs",
-                        mountinfo_path=str(empty_mountinfo),
-                    )
-
-    def test_reset_reconstructs_a_missing_btrfs_root(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            (
-                environment,
-                runtime_root,
-                lock_root,
-                root,
-                ready,
-                seed,
-                outside,
-                empty_mountinfo,
-            ) = self._btrfs_runtime_fixture(temporary_directory)
-            root.rmdir()
-            ready.unlink()
-            completed = [
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 3),
-                subprocess.CompletedProcess([], 0),
-            ]
-
-            with (
-                mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed),
-                mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
-                mock.patch("atlas.lifecycle._replace_btrfs_root") as replace,
-            ):
-                _reset_environment(
-                    environment,
-                    runtime_root=str(runtime_root),
-                    lock_root=str(lock_root),
-                    systemctl="/bin/systemctl",
-                    btrfs="/bin/btrfs",
-                    mountinfo_path=str(empty_mountinfo),
-                )
-
-            replace.assert_called_once_with(
-                source=seed,
-                root=root,
-                ready=ready,
-                ready_value=OWNER_LAYOUT_ID,
-                btrfs="/bin/btrfs",
-            )
-            self.assertEqual((outside / "repository").read_text(), "durable")
-
-    def test_reset_reconstructs_a_btrfs_root_without_a_ready_marker(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            (
-                environment,
-                runtime_root,
-                lock_root,
-                root,
-                ready,
-                seed,
-                outside,
-                empty_mountinfo,
-            ) = self._btrfs_runtime_fixture(temporary_directory)
-            ready.unlink()
-            completed = [
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 3),
-                subprocess.CompletedProcess([], 0),
-            ]
-
-            with (
-                mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed),
-                mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
-                mock.patch("atlas.lifecycle._replace_btrfs_root") as replace,
-            ):
-                _reset_environment(
-                    environment,
-                    runtime_root=str(runtime_root),
-                    lock_root=str(lock_root),
-                    systemctl="/bin/systemctl",
-                    btrfs="/bin/btrfs",
-                    mountinfo_path=str(empty_mountinfo),
-                )
-
-            replace.assert_called_once_with(
-                source=seed,
-                root=root,
-                ready=ready,
-                ready_value=OWNER_LAYOUT_ID,
-                btrfs="/bin/btrfs",
-            )
-            self.assertEqual((outside / "repository").read_text(), "durable")
-
-    def test_reset_refuses_a_seed_preparer_that_leaves_the_wrong_seed(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            expected_seed_id = "a" * 64
-            environment, runtime_root, lock_root, root, _ready, outside = self._runtime_fixture(
-                temporary_directory
-            )
-            seed = root.parent / "seed"
-            (seed / "etc" / "atlas").mkdir(parents=True)
-            (seed / "etc" / "atlas" / "seed-id").write_text(
-                f"{'b' * 64}\n", encoding="utf-8"
-            )
-            snapshots = root.parent / "snapshots"
-            snapshots.mkdir()
-            environment["runtime"]["storage"] = {
-                "adapter": "btrfs-subvolume",
-                "seedHostPath": str(seed),
-                "snapshotsHostPath": str(snapshots),
-                "seed": {"id": expected_seed_id},
-                "seedPrepareCommand": "/bin/prepare-seed",
-            }
-            empty_mountinfo = Path(temporary_directory) / "empty-mountinfo"
-            empty_mountinfo.touch()
-            completed = [
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 3),
-                subprocess.CompletedProcess([], 0),
-            ]
-
-            with (
-                mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed),
-                mock.patch("atlas.lifecycle._require_btrfs_subvolume"),
-                mock.patch("atlas.lifecycle._replace_btrfs_root") as replace,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "expected applied seed"):
-                    _reset_environment(
-                        environment,
-                        runtime_root=str(runtime_root),
-                        lock_root=str(lock_root),
-                        systemctl="/bin/systemctl",
-                        btrfs="/bin/btrfs",
-                        mountinfo_path=str(empty_mountinfo),
-                    )
-
-            replace.assert_not_called()
-            self.assertEqual((outside / "repository").read_text(), "durable")
-
-    def test_reset_cleans_interrupted_bootstrap_directories(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            environment, runtime_root, lock_root, root, ready, outside = self._runtime_fixture(
-                temporary_directory
-            )
-            interrupted = root.parent / ".rootfs.interrupted"
-            interrupted.mkdir()
-            (interrupted / "partial-root").write_text("partial", encoding="utf-8")
-            interrupted_seed = root.parent / ".seed.interrupted"
-            interrupted_seed.mkdir()
-            (interrupted_seed / "partial-seed").write_text("partial", encoding="utf-8")
-            completed = [
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 3),
-            ]
-            empty_mountinfo = Path(temporary_directory) / "empty-mountinfo"
-            empty_mountinfo.touch()
-
-            with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed):
-                _reset_environment(
-                    environment,
-                    runtime_root=str(runtime_root),
-                    lock_root=str(lock_root),
-                    systemctl="/bin/systemctl",
-                    mountinfo_path=str(empty_mountinfo),
-                )
-
-            self.assertFalse(interrupted.exists())
-            self.assertFalse(interrupted_seed.exists())
-            self.assertEqual((outside / "repository").read_text(), "durable")
-
-    def test_reset_refuses_a_symbolic_link_at_the_managed_root(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            environment, runtime_root, lock_root, root, ready, outside = self._runtime_fixture(
-                temporary_directory
-            )
-            root.rmdir()
-            root.symlink_to(outside, target_is_directory=True)
-
-            with self.assertRaisesRegex(ValueError, "symbolic link"):
-                _reset_environment(
-                    environment,
-                    runtime_root=str(runtime_root),
-                    lock_root=str(lock_root),
-                    systemctl="/bin/systemctl",
-                )
-
-            self.assertTrue(root.is_symlink())
-            self.assertEqual((outside / "repository").read_text(), "durable")
-            self.assertTrue(ready.exists())
-
-    def test_reset_refuses_a_non_directory_at_the_managed_root(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            environment, runtime_root, lock_root, root, ready, outside = self._runtime_fixture(
-                temporary_directory
-            )
-            root.rmdir()
-            root.write_text("not a root directory", encoding="utf-8")
-
-            with self.assertRaisesRegex(ValueError, "directory"):
-                _reset_environment(
-                    environment,
-                    runtime_root=str(runtime_root),
-                    lock_root=str(lock_root),
-                    systemctl="/bin/systemctl",
-                )
-
-            self.assertEqual(root.read_text(encoding="utf-8"), "not a root directory")
-            self.assertEqual((outside / "repository").read_text(), "durable")
-            self.assertTrue(ready.exists())
-
-    def test_reset_refuses_when_mount_state_cannot_be_inspected(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            environment, runtime_root, lock_root, root, ready, outside = self._runtime_fixture(
-                temporary_directory
-            )
-            missing_mountinfo = Path(temporary_directory) / "missing-mountinfo"
-            completed = [
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 3),
-            ]
-
-            with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed):
-                with self.assertRaisesRegex(RuntimeError, "inspect mount state"):
-                    _reset_environment(
-                        environment,
-                        runtime_root=str(runtime_root),
-                        lock_root=str(lock_root),
-                        systemctl="/bin/systemctl",
-                        mountinfo_path=str(missing_mountinfo),
-                    )
-
-            self.assertTrue(root.is_dir())
-            self.assertTrue(ready.exists())
-            self.assertEqual((outside / "repository").read_text(), "durable")
-
-    def test_reset_preserves_root_when_stop_fails(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            environment, runtime_root, lock_root, root, ready, _ = self._runtime_fixture(
-                temporary_directory
-            )
             with mock.patch(
                 "atlas.lifecycle.subprocess.run",
-                side_effect=subprocess.CalledProcessError(1, ["systemctl", "stop"]),
+                side_effect=[instances, snapshots, completed],
+            ) as run:
+                preserved_owner_home = lifecycle.reset(environment)
+
+            self.assertTrue(preserved_owner_home)
+            self.assertEqual((durable_home / "repository").read_text(), "durable")
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list],
+                [
+                    [
+                        "/bin/incus",
+                        "--force-local",
+                        "list",
+                        "^atlas-shared-dev$",
+                        "--format=json",
+                    ],
+                    [
+                        "/bin/incus",
+                        "--force-local",
+                        "snapshot",
+                        "list",
+                        "atlas-shared-dev",
+                        "--format=json",
+                    ],
+                    ["/nix/store/atlas-reconcile-shared-dev"],
+                ],
+            )
+            reset_call = run.call_args_list[2]
+            inherited_lock_fd = reset_call.kwargs["pass_fds"][0]
+            self.assertEqual(
+                reset_call.kwargs["env"]["ATLAS_LIFECYCLE_LOCK_FD"],
+                str(inherited_lock_fd),
+            )
+
+    def test_reset_fails_if_a_declared_volume_is_replaced(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            durable_volume = Path(environment["volumes"][0]["hostPath"])
+
+            def replace_volume(arguments, **_keywords):
+                if arguments[0] == "/bin/incus":
+                    if arguments[2] == "list":
+                        return subprocess.CompletedProcess(
+                            [],
+                            0,
+                            stdout='[{"name":"atlas-shared-dev"}]\n',
+                            stderr="",
+                        )
+                    return subprocess.CompletedProcess(
+                        [], 0, stdout="[]\n", stderr=""
+                    )
+                durable_volume.rename(durable_volume.with_name("replaced-volume"))
+                durable_volume.mkdir()
+                return subprocess.CompletedProcess([], 0, stderr="")
+
+            with (
+                mock.patch("atlas.lifecycle.subprocess.run", side_effect=replace_volume),
+                self.assertRaisesRegex(RuntimeError, "declared volume changed"),
             ):
-                with self.assertRaises(subprocess.CalledProcessError):
-                    _reset_environment(
-                        environment,
-                        runtime_root=str(runtime_root),
-                        lock_root=str(lock_root),
-                        systemctl="/bin/systemctl",
-                    )
-            self.assertTrue(root.exists())
-            self.assertTrue(ready.exists())
+                lifecycle.reset(environment)
 
-    def test_reset_preserves_root_when_instance_remains_active(self):
+    def test_reset_refuses_to_destroy_named_snapshots(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            environment, runtime_root, lock_root, root, ready, _ = self._runtime_fixture(
-                temporary_directory
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            snapshots = subprocess.CompletedProcess(
+                [], 0, stdout='[{"name":"baseline"}]\n', stderr=""
             )
-            completed = [
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 0),
+            instances = subprocess.CompletedProcess(
+                [], 0, stdout='[{"name":"atlas-shared-dev"}]\n', stderr=""
+            )
+
+            with (
+                mock.patch(
+                    "atlas.lifecycle.subprocess.run",
+                    side_effect=[instances, snapshots],
+                ) as run,
+                self.assertRaisesRegex(
+                    ControlOperationError, "delete named snapshots before reset"
+                ) as raised,
+            ):
+                lifecycle.reset(environment)
+
+            self.assertEqual(raised.exception.code, "conflict")
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list],
+                [
+                    [
+                        "/bin/incus",
+                        "--force-local",
+                        "list",
+                        "^atlas-shared-dev$",
+                        "--format=json",
+                    ],
+                    [
+                        "/bin/incus",
+                        "--force-local",
+                        "snapshot",
+                        "list",
+                        "atlas-shared-dev",
+                        "--format=json",
+                    ],
+                ],
+            )
+
+    def test_reset_recreates_a_confirmed_missing_instance(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            missing = subprocess.CompletedProcess([], 0, stdout="[]\n", stderr="")
+            completed = subprocess.CompletedProcess([], 0, stderr="")
+
+            with mock.patch(
+                "atlas.lifecycle.subprocess.run", side_effect=[missing, completed]
+            ) as run:
+                self.assertTrue(lifecycle.reset(environment))
+
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list],
+                [
+                    [
+                        "/bin/incus",
+                        "--force-local",
+                        "list",
+                        "^atlas-shared-dev$",
+                        "--format=json",
+                    ],
+                    ["/nix/store/atlas-reconcile-shared-dev"],
+                ],
+            )
+
+    def test_reset_fails_closed_when_instance_inventory_fails(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            failed = subprocess.CompletedProcess(
+                [], 1, stdout="", stderr="Incus daemon unavailable"
+            )
+
+            with (
+                mock.patch("atlas.lifecycle.subprocess.run", return_value=failed) as run,
+                self.assertRaises(ControlOperationError) as raised,
+            ):
+                lifecycle.reset(environment)
+
+            self.assertEqual(raised.exception.code, "incus_failed")
+            self.assertEqual(len(run.call_args_list), 1)
+
+    def test_reset_fingerprints_btrfs_volumes_by_subvolume_uuid(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            lifecycle.btrfs = "/bin/btrfs"
+            first_uuid = "11111111-1111-4111-8111-111111111111"
+            replacement_uuid = "22222222-2222-4222-8222-222222222222"
+            responses = [
+                subprocess.CompletedProcess(
+                    [], 0, stdout='[{"name":"atlas-shared-dev"}]\n', stderr=""
+                ),
+                subprocess.CompletedProcess([], 0, stdout="[]\n", stderr=""),
+                subprocess.CompletedProcess(
+                    [], 0, stdout=f"\tUUID: {first_uuid}\n", stderr=""
+                ),
+                subprocess.CompletedProcess(
+                    [], 0, stdout=f"\tUUID: {first_uuid}\n", stderr=""
+                ),
+                subprocess.CompletedProcess([], 0, stderr=""),
+                subprocess.CompletedProcess(
+                    [], 0, stdout=f"\tUUID: {first_uuid}\n", stderr=""
+                ),
+                subprocess.CompletedProcess(
+                    [], 0, stdout=f"\tUUID: {replacement_uuid}\n", stderr=""
+                ),
             ]
-            with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed):
-                with self.assertRaisesRegex(RuntimeError, "remains active"):
-                    _reset_environment(
-                        environment,
-                        runtime_root=str(runtime_root),
-                        lock_root=str(lock_root),
-                        systemctl="/bin/systemctl",
-                    )
-            self.assertTrue(root.exists())
-            self.assertTrue(ready.exists())
 
-    def test_reset_refuses_mounts_below_runtime_root(self):
+            with (
+                mock.patch("atlas.lifecycle.subprocess.run", side_effect=responses),
+                self.assertRaisesRegex(RuntimeError, "declared volume changed"),
+            ):
+                lifecycle.reset(environment)
+
+    def test_reset_fails_closed_if_btrfs_identity_is_unreadable(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            environment, runtime_root, lock_root, root, ready, _ = self._runtime_fixture(
-                temporary_directory
-            )
-            mountinfo = Path(temporary_directory) / "mountinfo"
-            mountinfo.write_text(
-                f"10 1 0:1 / {root}/home/owner/Projects rw - tmpfs tmpfs rw\n",
-                encoding="utf-8",
-            )
-            completed = [
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 3),
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            lifecycle.btrfs = "/bin/btrfs"
+            responses = [
+                subprocess.CompletedProcess(
+                    [], 0, stdout='[{"name":"atlas-shared-dev"}]\n', stderr=""
+                ),
+                subprocess.CompletedProcess([], 0, stdout="[]\n", stderr=""),
+                subprocess.CompletedProcess([], 1, stdout="", stderr="not a subvolume"),
             ]
-            with mock.patch("atlas.lifecycle.subprocess.run", side_effect=completed):
-                with self.assertRaisesRegex(RuntimeError, "mounts remain"):
-                    _reset_environment(
-                        environment,
-                        runtime_root=str(runtime_root),
-                        lock_root=str(lock_root),
-                        systemctl="/bin/systemctl",
-                        mountinfo_path=str(mountinfo),
-                    )
-            self.assertTrue(root.exists())
-            self.assertTrue(ready.exists())
 
-    def test_reset_rejects_a_runtime_root_outside_the_managed_boundary(self):
+            with (
+                mock.patch("atlas.lifecycle.subprocess.run", side_effect=responses) as run,
+                self.assertRaisesRegex(RuntimeError, "Btrfs subvolume identity"),
+            ):
+                lifecycle.reset(environment)
+
+            self.assertEqual(len(run.call_args_list), 3)
+
+    def test_snapshot_operations_use_only_the_local_incus_daemon(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            runtime_root = Path(temporary_directory) / "environments"
-            outside = Path(temporary_directory) / "outside"
-            outside.mkdir()
-            environment = {
-                **ENVIRONMENTS["shared-dev"],
-                "runtime": {
-                    "ownerLayoutId": OWNER_LAYOUT_ID,
-                    "readyHostPath": str(outside / "ready"),
-                    "rootHostPath": str(outside),
-                },
-            }
-            with self.assertRaisesRegex(ValueError, "outside the managed boundary"):
-                _reset_environment(
-                    environment,
-                    runtime_root=str(runtime_root),
-                    lock_root=str(Path(temporary_directory) / "locks"),
-                    systemctl="/bin/systemctl",
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            list_result = subprocess.CompletedProcess(
+                [], 0, stdout='[{"name":"baseline"},{"name":"later"}]\n', stderr=""
+            )
+
+            with mock.patch(
+                "atlas.lifecycle.subprocess.run",
+                side_effect=[
+                    subprocess.CompletedProcess([], 0, stderr=""),
+                    list_result,
+                    subprocess.CompletedProcess([], 0, stderr=""),
+                    subprocess.CompletedProcess([], 0, stderr=""),
+                    subprocess.CompletedProcess([], 0, stderr=""),
+                ],
+            ) as run:
+                lifecycle.create_snapshot(environment, "baseline")
+                self.assertEqual(
+                    lifecycle.list_snapshots(environment), ["baseline", "later"]
                 )
-            self.assertTrue(outside.exists())
+                self.assertTrue(lifecycle.restore_snapshot(environment, "baseline"))
+                lifecycle.delete_snapshot(environment, "later")
+
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list],
+                [
+                    [
+                        "/bin/incus",
+                        "--force-local",
+                        "snapshot",
+                        "create",
+                        "atlas-shared-dev",
+                        "baseline",
+                    ],
+                    [
+                        "/bin/incus",
+                        "--force-local",
+                        "snapshot",
+                        "list",
+                        "atlas-shared-dev",
+                        "--format=json",
+                    ],
+                    [
+                        "/nix/store/atlas-verify-shared-dev",
+                        "atlas-shared-dev",
+                        "baseline",
+                    ],
+                    [
+                        "/bin/incus",
+                        "--force-local",
+                        "snapshot",
+                        "restore",
+                        "atlas-shared-dev",
+                        "baseline",
+                    ],
+                    [
+                        "/bin/incus",
+                        "--force-local",
+                        "snapshot",
+                        "delete",
+                        "atlas-shared-dev",
+                        "later",
+                    ],
+                ],
+            )
+
+    def test_snapshot_restore_rejects_a_stale_instance_layout(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            stale_layout = subprocess.CompletedProcess(
+                [], 20, stderr="Atlas Incus snapshot configuration drifted"
+            )
+
+            with (
+                mock.patch(
+                    "atlas.lifecycle.subprocess.run", return_value=stale_layout
+                ) as run,
+                self.assertRaises(ControlOperationError) as raised,
+            ):
+                lifecycle.restore_snapshot(environment, "baseline")
+
+            self.assertEqual(raised.exception.code, "reset_required")
+            self.assertIn("current environment layout", raised.exception.message)
+            run.assert_called_once_with(
+                [
+                    "/nix/store/atlas-verify-shared-dev",
+                    "atlas-shared-dev",
+                    "baseline",
+                ],
+                check=False,
+                env=mock.ANY,
+                pass_fds=mock.ANY,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+    def test_snapshot_restore_reports_verifier_infrastructure_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            failed = subprocess.CompletedProcess(
+                [], 1, stderr="Incus daemon unavailable"
+            )
+
+            with (
+                mock.patch("atlas.lifecycle.subprocess.run", return_value=failed),
+                self.assertRaises(ControlOperationError) as raised,
+            ):
+                lifecycle.restore_snapshot(environment, "baseline")
+
+            self.assertEqual(raised.exception.code, "incus_failed")
+            self.assertEqual(raised.exception.message, "Incus could not verify the snapshot")
+
+    def test_runtime_rejects_non_incus_and_untrusted_reconcile_commands(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            with mock.patch("atlas.lifecycle.subprocess.run") as run:
+                environment["runtime"]["backend"] = "systemd-nspawn-service"
+                with self.assertRaisesRegex(ValueError, "must use Incus"):
+                    lifecycle.reset(environment)
+
+                environment["runtime"]["backend"] = "incus-container"
+                environment["runtime"]["instance"]["resetCommand"] = "reconcile"
+                with self.assertRaisesRegex(ValueError, "reconcile command"):
+                    lifecycle.reset(environment)
+
+                environment["runtime"]["instance"]["resetCommand"] = (
+                    "/nix/store/../usr/bin/reconcile"
+                )
+                with self.assertRaisesRegex(ValueError, "reconcile command"):
+                    lifecycle.reset(environment)
+
+                environment["runtime"]["instance"]["resetCommand"] = (
+                    "/nix/store/atlas-reconcile-shared-dev"
+                )
+                environment["runtime"]["instance"]["verifyCommand"] = "verify"
+                with self.assertRaisesRegex(ValueError, "verify command"):
+                    lifecycle.restore_snapshot(environment, "baseline")
+
+            run.assert_not_called()
+
+    def test_incus_failure_is_bounded_in_logs_and_redacted_from_the_api(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lifecycle, environment, _durable_home = self.fixture(temporary_directory)
+            diagnostic = "permission denied\n" + "x" * (
+                MAX_INCUS_DIAGNOSTIC_BYTES + 128
+            )
+            completed = subprocess.CompletedProcess([], 1, stderr=diagnostic)
+            stderr = io.StringIO()
+
+            with (
+                mock.patch("atlas.lifecycle.subprocess.run", return_value=completed),
+                mock.patch("sys.stderr", stderr),
+                self.assertRaises(ControlOperationError) as raised,
+            ):
+                lifecycle.create_snapshot(environment, "baseline")
+
+            self.assertEqual(raised.exception.code, "incus_failed")
+            self.assertNotIn("permission denied", raised.exception.message)
+            self.assertIn("permission denied", stderr.getvalue())
+            self.assertIn("[truncated]", stderr.getvalue())
+            self.assertLess(
+                len(stderr.getvalue()), MAX_INCUS_DIAGNOSTIC_BYTES + 256
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

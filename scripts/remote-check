@@ -47,5 +47,5 @@ else
 fi
 
 cd "$workspace_root"
-exec errand --on "$host" -- \
+exec errand --on "$host" --no-apply -- \
   /usr/bin/nix --extra-experimental-features 'nix-command flakes' "$@"

@@ -1,11 +1,13 @@
 { pkgs }:
 let
   ubuntuImageMetadata = pkgs.fetchurl {
-    url = "https://images.linuxcontainers.org/images/ubuntu/noble/amd64/default/20260829_07:42/incus.tar.xz";
+    name = "incus.tar.xz";
+    url = "https://github.com/lydakis/atlas/releases/download/ubuntu-noble-20260829-0742/amd64-incus.tar.xz";
     sha256 = "660cee023a16d9a4b275297137de4952ce390af8e2a032a5c1f9948bc7a5a3d9";
   };
   ubuntuImageRoot = pkgs.fetchurl {
-    url = "https://images.linuxcontainers.org/images/ubuntu/noble/amd64/default/20260829_07:42/rootfs.squashfs";
+    name = "rootfs.squashfs";
+    url = "https://github.com/lydakis/atlas/releases/download/ubuntu-noble-20260829-0742/amd64-rootfs.squashfs";
     sha256 = "493195662fccde5edaf5a2ddd05b7aaf01cc88cf4a79d0504637c80c3bf3f620";
   };
   testPackage =
@@ -42,6 +44,17 @@ pkgs.testers.runNixOSTest {
     networking = {
       nftables.enable = true;
       firewall.trustedInterfaces = [ "atlasbr0" ];
+      nftables.tables.atlas-host-input = {
+        family = "inet";
+        content = ''
+          chain input {
+            type filter hook input priority 10; policy accept;
+            iifname "atlasbr0" tcp dport 53 accept
+            iifname "atlasbr0" udp dport { 53, 67 } accept
+            iifname "atlasbr0" fib daddr type { local, broadcast, multicast } drop
+          }
+        '';
+      };
       dhcpcd.denyInterfaces = [
         "atlasbr0"
         "veth*"
@@ -106,7 +119,7 @@ pkgs.testers.runNixOSTest {
     import time
 
     serial_stdout_off()
-    machine.start(allow_reboot=True)
+    machine.start()
     machine.wait_for_unit("incus.service")
     machine.wait_for_unit("incus-preseed.service")
     machine.succeed("incus admin waitready")
@@ -160,7 +173,7 @@ pkgs.testers.runNixOSTest {
             "--config security.guestapi=false "
             "--config linux.sysctl.net.ipv6.conf.all.disable_ipv6=1 "
             "--config linux.sysctl.net.ipv6.conf.default.disable_ipv6=1 "
-            "--config boot.autostart=true "
+            "--config boot.autostart=false "
             "--config boot.host_shutdown_action=force-stop"
         )
         machine.succeed(
@@ -379,7 +392,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("ip addr add 192.168.50.10/32 dev atlasprobe")
         machine.succeed("ip addr add 100.100.100.10/32 dev atlasprobe")
         machine.succeed("ip addr add 169.254.169.254/32 dev atlasprobe")
-        machine.succeed("ip addr add 203.0.113.10/32 dev atlasprobe")
+        machine.succeed("ip addr add 198.51.100.10/32 dev atlasprobe")
         machine.succeed("ip link set atlasprobe up")
         machine.succeed(
             "systemd-run --unit atlas-network-probe --service-type=exec "
@@ -388,7 +401,8 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds("ss -ltn | grep -F ':19090'", timeout=30)
         instance_exec(
             "env-a",
-            "timeout 2 bash -c 'exec 3<>/dev/tcp/203.0.113.10/19090'",
+            "timeout 2 bash -c 'exec 3<>/dev/tcp/198.51.100.10/19090'",
+            succeeds=False,
         )
         for address in (
             "10.211.0.1",
@@ -402,31 +416,51 @@ pkgs.testers.runNixOSTest {
                 succeeds=False,
             )
 
-    with subtest("host reboot autostarts instances and preserves persistent state"):
-        boot_id_before = machine.succeed("cat /proc/sys/kernel/random/boot_id").strip()
-        instance_exec("env-a", "printf reboot-root > /etc/atlas-reboot-root")
+        machine.succeed("ip netns add atlas-external")
+        machine.succeed("ip link add atlaswan type veth peer name atlaspeer")
+        machine.succeed("ip link set atlaspeer netns atlas-external")
+        machine.succeed("ip addr add 203.0.113.1/24 dev atlaswan")
+        machine.succeed("ip link set atlaswan up")
+        machine.succeed(
+            "ip netns exec atlas-external ip addr add 203.0.113.10/24 dev atlaspeer"
+        )
+        machine.succeed("ip netns exec atlas-external ip link set atlaspeer up")
+        machine.succeed("ip netns exec atlas-external ip link set lo up")
+        machine.succeed(
+            "ip netns exec atlas-external ip route add default via 203.0.113.1"
+        )
+        machine.succeed(
+            "systemd-run --unit atlas-external-probe --service-type=exec "
+            "--property=NetworkNamespacePath=/run/netns/atlas-external "
+            "python3 -m http.server 19091 --bind 203.0.113.10"
+        )
+        machine.wait_until_succeeds(
+            "ip netns exec atlas-external ss -ltn | grep -F ':19091'", timeout=30
+        )
+        instance_exec(
+            "env-a",
+            "timeout 2 bash -c 'exec 3<>/dev/tcp/203.0.113.10/19091'",
+        )
+
+    with subtest("instance restart preserves persistent state and drops volatile listeners"):
+        instance_exec("env-a", "printf restart-root > /etc/atlas-restart-root")
         instance_exec(
             "env-a",
             "runuser -u ubuntu -- sh -c "
-            "'printf reboot-local > /home/ubuntu/.config/reboot-local'",
+            "'printf restart-local > /home/ubuntu/.config/restart-local'",
         )
         instance_exec(
             "env-a",
             "runuser -u ubuntu -- sh -c "
-            "'printf reboot-durable > /home/ubuntu/reboot-durable'",
+            "'printf restart-durable > /home/ubuntu/restart-durable'",
         )
-        machine.reboot()
-        machine.wait_for_unit("incus.service")
-        machine.wait_for_unit("incus-preseed.service")
-        machine.succeed("incus admin waitready")
+        machine.succeed("incus restart --timeout 15 --force env-a env-b")
         wait_for_instance("env-a", "10.211.0.11")
         wait_for_instance("env-b", "10.211.0.12")
-        boot_id_after = machine.succeed("cat /proc/sys/kernel/random/boot_id").strip()
-        assert boot_id_after != boot_id_before
-        instance_exec("env-a", "test -f /etc/atlas-reboot-root")
-        instance_exec("env-a", "test -f /home/ubuntu/.config/reboot-local")
-        instance_exec("env-a", "test -f /home/ubuntu/reboot-durable")
-        instance_exec("env-b", "test -f /home/ubuntu/reboot-durable")
+        instance_exec("env-a", "test -f /etc/atlas-restart-root")
+        instance_exec("env-a", "test -f /home/ubuntu/.config/restart-local")
+        instance_exec("env-a", "test -f /home/ubuntu/restart-durable")
+        instance_exec("env-b", "test -f /home/ubuntu/restart-durable")
         for name in ("env-a", "env-b"):
             instance_exec(name, "! ss -ltn | grep -Eq ':18080|:18081'")
 

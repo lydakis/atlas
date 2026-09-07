@@ -16,14 +16,13 @@ from typing import Any
 
 from .lifecycle import (
     DEFAULT_LOCK_ROOT,
-    DEFAULT_RUNTIME_ROOT,
     ControlOperationError,
     EnvironmentLifecycle,
 )
 
 
 PROTOCOL_VERSION = 1
-DEFAULT_SOCKET = "/run/atlas/control.sock"
+DEFAULT_SOCKET = "/run/atlas/public/control.sock"
 DEFAULT_MANAGEMENT_SOCKET = "/run/atlas/manage.sock"
 DEFAULT_CONTRACT = "/etc/atlas/control-contract.json"
 MAX_REQUEST_BYTES = 64 * 1024
@@ -84,6 +83,7 @@ def handle_request(
     request: Any,
     contract: dict[str, Any],
     lifecycle: EnvironmentLifecycle | None = None,
+    trusted_environment: str | None = None,
 ) -> dict[str, Any]:
     """Handle one request using identity supplied by the kernel."""
     if not isinstance(request, dict):
@@ -127,11 +127,13 @@ def handle_request(
                 "invalid_request",
                 "environment.inspect-self accepts no caller-authored identity",
             )
-        name = _environment_for_peer(
-            peer_uid=peer_uid,
-            peer_cgroup=peer_cgroup,
-            contract=contract,
-        )
+        name = trusted_environment
+        if name is None:
+            name = _environment_for_peer(
+                peer_uid=peer_uid,
+                peer_cgroup=peer_cgroup,
+                contract=contract,
+            )
         if name is None or name not in environments:
             return _error(
                 "unknown_peer",
@@ -153,7 +155,10 @@ def handle_request(
         if not isinstance(name, str) or name not in environments:
             return _error("not_found", "environment does not exist")
         environment = environments[name]
-        preserved_owner_home = lifecycle.reset(environment)
+        try:
+            preserved_owner_home = lifecycle.reset(environment)
+        except ControlOperationError as error:
+            return _error(error.code, error.message)
         return _success(
             {
                 "name": name,
@@ -302,9 +307,8 @@ def _serve_connection(connection: socket.socket, args: argparse.Namespace) -> No
             lifecycle = None
             if args.management:
                 lifecycle = EnvironmentLifecycle(
-                    runtime_root=args.runtime_root,
                     lock_root=args.lock_root,
-                    systemctl=args.systemctl,
+                    incus=args.incus,
                     btrfs=args.btrfs,
                     snapshots_enabled=bool(
                         contract.get("doctor", {}).get("storage", {}).get("snapshots")
@@ -316,6 +320,7 @@ def _serve_connection(connection: socket.socket, args: argparse.Namespace) -> No
                 request=_read_request(connection),
                 contract=contract,
                 lifecycle=lifecycle,
+                trusted_environment=args.environment,
             )
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
             response = _error("invalid_request", str(error))
@@ -350,7 +355,6 @@ def _request(socket_path: str, payload: dict[str, Any]) -> dict[str, Any]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.connect(socket_path)
         connection.sendall(json.dumps(payload, separators=(",", ":")).encode() + b"\n")
-        connection.shutdown(socket.SHUT_WR)
         chunks: list[bytes] = []
         while True:
             chunk = connection.recv(65536)
@@ -408,12 +412,13 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot_list_parser.add_argument("--json", action="store_true")
 
     serve_parser = subparsers.add_parser("serve", help=argparse.SUPPRESS)
-    serve_parser.add_argument("--management", action="store_true")
+    serve_surface = serve_parser.add_mutually_exclusive_group()
+    serve_surface.add_argument("--management", action="store_true")
+    serve_surface.add_argument("--environment", default=None)
     serve_parser.add_argument("--contract", default=DEFAULT_CONTRACT)
-    serve_parser.add_argument("--runtime-root", default=DEFAULT_RUNTIME_ROOT)
     serve_parser.add_argument("--lock-root", default=DEFAULT_LOCK_ROOT)
-    serve_parser.add_argument("--systemctl", default="systemctl")
-    serve_parser.add_argument("--btrfs", default="btrfs")
+    serve_parser.add_argument("--incus", default="incus")
+    serve_parser.add_argument("--btrfs", default=None)
     return parser
 
 
@@ -455,7 +460,7 @@ def main(argv: list[str] | None = None) -> int:
             DEFAULT_MANAGEMENT_SOCKET
             if payload["operation"] == "environment.reset"
             or payload["operation"].startswith("environment.snapshot.")
-            else DEFAULT_SOCKET
+            else os.environ.get("ATLAS_CONTROL_SOCKET", DEFAULT_SOCKET)
         )
     try:
         return _print_response(_request(socket_path, payload), args.json)

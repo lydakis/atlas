@@ -55,20 +55,21 @@ includes:
 - a mutable data boundary under `/var/lib/atlas`, outside the Nix store
 - state roots for environments, volumes, grants, browser profiles, recordings,
   and routes
-- separate resource lanes for the Atlas control plane and agent environments
+- a protected resource lane for the Atlas control plane; Incus per-environment
+  resource limits remain a later enforcement proof
 - reusable non-secret configuration, package, and Git-profile layers with
   named environment definitions
-- fixed environment login targets that enter persistent, user-namespaced Ubuntu
-  Noble compartments supervised by systemd
+- fixed environment login targets that enter persistent, isolated-ID-map Ubuntu
+  Noble Incus containers
 - resettable environment roots, with explicit durable volumes composed inside
   their ordinary Linux view and shareable across selected environments
 - a configurable human-owner account at `/home/<owner>`, with one automatic
   durable home volume and resettable `~/.config`, `~/.cache`, `~/.local/bin`,
   and `~/.local/state` views per environment
-- elastic Btrfs environment roots under `/var/lib/atlas` that preserve ordinary
+- elastic Incus Btrfs roots under `/var/lib/atlas` that preserve ordinary
   machine state across reboot without an arbitrary default quota
-- read-only applied seeds plus root snapshot, restore, and delete operations;
-  durable volumes remain outside root snapshots
+- Incus instance snapshot, restore, and delete-and-recreate reset operations;
+  durable volumes remain outside instance snapshots
 - passwordless `sudo` for the human-owner account inside an environment, so
   agents can administer ordinary Ubuntu without receiving Atlas-host root
 - a peer-authenticated read-only control socket for doctor, list, and inspect,
@@ -78,22 +79,20 @@ includes:
 - no publicly exposed OpenSSH service
 - two development environments with different Git identities plus one minimal
   environment without Git on its declared PATH
-- a QEMU integration test covering persistent and concurrent entry,
-  composition, shared-volume access, package installation, host reboot,
-  elastic Btrfs storage, root snapshot restore, volatile-state reconstruction,
-  active-workload reset, normal-owner identity and environment-local sudo,
-  durable-home composition, isolation, update, rollback, and durable-volume
-  preservation
+- a QEMU integration test covering persistent entry, composition,
+  shared-volume access, Ubuntu package installation, elastic Btrfs storage,
+  Incus snapshot restore, reset, normal-owner identity and environment-local
+  sudo, durable-home composition, private network configuration, daemon
+  recovery, and durable-volume preservation
 - an x86 KVM installed-disk acceptance test covering offline installation,
   encrypted boot, storage-capacity separation, reboot, reset, automatic owner
   home preservation, and declared durable-volume preservation
 - an earlier live-tailnet dogfood run using ordinary Tailscale SSH and Herdr's
   remote thin client against the preceding fixed-login adapter
 
-The current nspawn and volume contract passed on Apple Silicon using a
-software-emulated AArch64 guest. The earlier adapter was also enrolled into a
-real tailnet and entered as all three declared environments without exposing a
-public SSH listener. The current adapter's exact Tailscale and Herdr path still
+The Incus adapter and volume contract pass in an x86 KVM guest. An earlier
+fixed-login prototype was enrolled into a real tailnet without exposing a
+public SSH listener; the Incus adapter's exact Tailscale and Herdr path still
 needs to be repeated. See the [NixOS spike report](docs/nixos-spike.md) for the
 evidence and limitations.
 
@@ -110,18 +109,19 @@ encrypted installed-disk layout now passes in x86 KVM using a test-only initrd
 key; the real operator passphrase ceremony, physical hardware, Secure Boot,
 signed releases, and automatic failed-update recovery remain unproven.
 
-Each environment now has one persistent nspawn service. Entries join that
-service through Linux namespaces and a delegated session cgroup, so concurrent
-clients see one instance and reset can terminate the complete workload tree.
-The persistent VM now mounts a dedicated Btrfs disk at `/var/lib/atlas`.
-Resettable roots and durable volumes are separate subvolumes; roots persist
-across reboot, reset cheaply from read-only applied seeds, and support named
-snapshots and restore. The primary environment is not artificially capped. A
+Each environment now has one persistent Incus instance. Entries reuse that
+instance through host-controlled `incus exec`; reset deletes and recreates it
+from the pinned Ubuntu image. The persistent VM mounts a dedicated Btrfs disk
+at `/var/lib/atlas`. Incus-managed roots and Atlas durable volumes are separate;
+roots persist across reboot and support named snapshots and restore. The
+primary environment is not artificially capped. A
 protected host recovery reserve, optional quotas for additional environments,
 durable-volume snapshots and backup, at-rest encryption, power-loss recovery,
-and physical-hardware validation remain incomplete.
-Networking is shared with the host, and the read-only Nix store is visible for
-declared tools. These gaps are reported rather than hidden.
+and physical-hardware validation remain incomplete. Environments have separate
+network namespaces and an applied private NIC ACL, but the complete
+allowed-and-denied connection matrix remains the next product proof. The
+read-only Nix store is visible for declared tools and remains a documented
+degradation.
 
 In short, this repository proves parts of the host substrate. It does not yet
 deliver the agent-computer experience described by the thesis.

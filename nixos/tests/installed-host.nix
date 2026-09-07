@@ -132,7 +132,21 @@ pkgs.testers.runNixOSTest {
     def unlock_and_wait():
         target.start()
         target.wait_for_unit("multi-user.target")
-        target.wait_for_unit("atlas-host.target")
+        try:
+            target.wait_until_succeeds(
+                "systemctl is-active atlas-host.target", timeout=600
+            )
+        except Exception:
+            target.log(target.execute("systemctl --no-pager --full --failed")[1])
+            target.log(
+                target.execute(
+                    "systemctl --no-pager --full status atlas-host.target "
+                    "atlas-storage-prepare.service atlas-owner-home-prepare.service "
+                    "atlas-incus-image.service atlas-incus-network-policy.service "
+                    "'atlas-environment-*.service'"
+                )[1]
+            )
+            raise
 
     def entry(user, command, succeed=True):
         shell = target.succeed(f"getent passwd {user} | cut -d: -f7").strip()

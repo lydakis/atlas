@@ -58,12 +58,12 @@ let
           {
             imports = [ "${modulesPath}/virtualisation/digital-ocean-config.nix" ];
 
-          atlas.host = {
-            bootstrapOpenSsh.enable = bootstrap;
-            digitalOcean.enable = true;
-          };
-          services.openssh.enable = lib.mkForce bootstrap;
-          virtualisation.digitalOcean.setSshKeys = bootstrap;
+            atlas.host = {
+              bootstrapOpenSsh.enable = bootstrap;
+              digitalOcean.enable = true;
+            };
+            services.openssh.enable = lib.mkForce bootstrap;
+            virtualisation.digitalOcean.setSshKeys = bootstrap;
           }
         )
       ];
@@ -232,12 +232,16 @@ assert defaultContract.configuration.connectivity.tailscale.adapterEnabled == tr
 assert defaultContract.configuration.connectivity.tailscale.sshRequested == true;
 assert defaultContract.configuration.connectivity.tailscale.enrollmentMode == "interactive";
 assert digitalOceanContract.configuration.connectivity.openSshConfigured == true;
-assert digitalOceanContract.configuration.connectivity.openSshMode == "bootstrap-root-public-key-only";
+assert
+  digitalOceanContract.configuration.connectivity.openSshMode == "bootstrap-root-public-key-only";
 assert digitalOceanBootstrapHost.config.services.openssh.settings.AllowUsers == [ "root" ];
-assert digitalOceanBootstrapHost.config.services.openssh.settings.AuthenticationMethods == "publickey";
+assert
+  digitalOceanBootstrapHost.config.services.openssh.settings.AuthenticationMethods == "publickey";
 assert digitalOceanBootstrapHost.config.services.openssh.settings.PasswordAuthentication == false;
-assert digitalOceanBootstrapHost.config.services.openssh.settings.KbdInteractiveAuthentication == false;
-assert digitalOceanBootstrapHost.config.services.openssh.settings.PermitRootLogin == "prohibit-password";
+assert
+  digitalOceanBootstrapHost.config.services.openssh.settings.KbdInteractiveAuthentication == false;
+assert
+  digitalOceanBootstrapHost.config.services.openssh.settings.PermitRootLogin == "prohibit-password";
 assert digitalOceanBootstrapHost.config.networking.firewall.allowedTCPPorts == [ 22 ];
 assert hasFailedMessage "exact root public-key-only policy" {
   atlas.host.bootstrapOpenSsh.enable = true;
@@ -265,15 +269,16 @@ assert hasFailedMessage "must match the effective OpenSSH service state" {
 assert digitalOceanSteadyHost.config.virtualisation.digitalOcean.setSshKeys == false;
 assert lib.hasInfix "rm -f -- /root/.ssh/authorized_keys" digitalOceanSteadyActivation;
 assert digitalOceanBootstrapHost.config.atlas.host.storage.hostRecoveryReserve == true;
-assert digitalOceanBootstrapHost.config.atlas.host.storage.atRestEncryption
-  == "provider-managed-volume";
-assert digitalOceanBootstrapHost.config.fileSystems."/var/lib/atlas".device
+assert
+  digitalOceanBootstrapHost.config.atlas.host.storage.atRestEncryption == "provider-managed-volume";
+assert
+  digitalOceanBootstrapHost.config.fileSystems."/var/lib/atlas".device
   == "/dev/disk/by-id/scsi-0DO_Volume_atlas-data";
 assert lib.hasInfix ''filesystem="$(blkid -o value -s TYPE "$device"'' digitalOceanPrepare;
 assert lib.hasInfix "requires an explicitly prepared Btrfs data volume" digitalOceanPrepare;
 assert !(lib.hasInfix "mkfs" digitalOceanPrepare);
-assert defaultContract.configuration.environmentEntry.version == 6;
-assert defaultContract.configuration.environmentEntry.adapter == "nixos-nspawn-btrfs-v0";
+assert defaultContract.configuration.environmentEntry.version == 7;
+assert defaultContract.configuration.environmentEntry.adapter == "nixos-incus-btrfs-v0";
 assert defaultContract.configuration.environmentEntry.composition.declarative == true;
 assert defaultContract.configuration.environmentEntry.composition.runtimeCreation == false;
 assert defaultContract.configuration.environmentEntry.composition.disposableRoots == false;
@@ -355,6 +360,7 @@ assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.volumes == [
     {
       access = "read-write";
+      hostPath = "/var/lib/atlas/volumes/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/data";
       id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
       name = "projects";
       target = "/home/owner/Projects";
@@ -364,51 +370,49 @@ assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.lifecycle
   == "resettable";
 assert
-  builtins.match "[0-9a-f]{64}" defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.ownerLayoutId
+  builtins.match "[0-9a-f]{64}" defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.layoutId
   != null;
 assert
-  defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.ownerLayoutId
-  != defaultContract.configuration.environmentEntry.environments.restricted.runtime.ownerLayoutId;
+  defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.layoutId
+  != defaultContract.configuration.environmentEntry.environments.restricted.runtime.layoutId;
 assert
-  alternateOwnerHomeHost.config.atlas.host.environmentContract.environments.shared-dev.runtime.ownerLayoutId
-  != defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.ownerLayoutId;
+  alternateOwnerHomeHost.config.atlas.host.environmentContract.environments.shared-dev.runtime.layoutId
+  != defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.layoutId;
 assert
-  alternateOwnerHomeHost.config.atlas.host.environmentContract.environments.restricted.runtime.ownerLayoutId
-  == defaultContract.configuration.environmentEntry.environments.restricted.runtime.ownerLayoutId;
+  alternateOwnerHomeHost.config.atlas.host.environmentContract.environments.restricted.runtime.layoutId
+  == defaultContract.configuration.environmentEntry.environments.restricted.runtime.layoutId;
 assert
-  sharedWithoutOwnerHomeHost.config.atlas.host.environmentContract.environments.shared-dev.runtime.ownerLayoutId
-  == defaultContract.configuration.environmentEntry.environments.restricted.runtime.ownerLayoutId;
+  sharedWithoutOwnerHomeHost.config.atlas.host.environmentContract.environments.shared-dev.runtime.layoutId
+  != defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.layoutId;
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.persistence
   == "until-explicit-reset";
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.backend
-  == "systemd-nspawn-service";
-assert
-  defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.readyHostPath
-  == "/var/lib/atlas/environments/11111111-1111-4111-8111-111111111111/rootfs.ready";
+  == "incus-container";
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.storage.adapter
-  == "btrfs-subvolume";
+  == "incus-btrfs-subvolume-pool";
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.storage.copyOnWrite
   == true;
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.storage.snapshots;
 assert
-  builtins.match "[0-9a-f]{64}" defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.storage.seed.id
-  != null;
+  defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.instance.name
+  == "atlas-shared-dev";
 assert lib.hasPrefix "/nix/store/"
-  defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.storage.seedPrepareCommand;
+  defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.instance.resetCommand;
+assert lib.hasPrefix "/nix/store/"
+  defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.instance.verifyCommand;
 assert
-  defaultContract.configuration.environmentEntry.environments.shared-dev.runtime.rootHostPath
-  == "/var/lib/atlas/environments/11111111-1111-4111-8111-111111111111/rootfs";
+  builtins.stringLength defaultContract.configuration.environmentEntry.baseImage.contentId == 64;
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.process.serviceUnit
-  == "atlas-environment-shared\\x2ddev.service";
+  == "incus.service";
 assert
   defaultContract.configuration.environmentEntry.environments.shared-dev.process.cgroupPrefix
-  == "/atlas.slice/atlas-environments.slice/atlas-environments-shared\\x2ddev.slice/atlas-environment-shared\\x2ddev.service";
+  == "/lxc.payload.atlas-shared-dev";
 assert
   packageCompositionHost.config.atlas.host.environmentContract.environments.shared-dev.packages == {
     instanceWinner = lib.getName pkgs.findutils;
@@ -421,26 +425,39 @@ assert defaultHost.config.users.users.atlas-shared-dev.uid == 23001;
 assert defaultHost.config.users.users.atlas-restricted.uid == 23002;
 assert defaultHost.config.users.users.atlas-personal-dev.uid == 23003;
 assert defaultHost.config.systemd.sockets.atlas-control.socketConfig.SocketMode == "0666";
+assert
+  defaultHost.config.systemd.sockets.atlas-control.socketConfig.ListenStream
+  == "/run/atlas/public/control.sock";
 assert defaultHost.config.systemd.sockets.atlas-manage.socketConfig.SocketMode == "0600";
 assert
   defaultHost.config.systemd.services."atlas-environment-shared\\x2ddev".serviceConfig.Type
-  == "notify";
-assert lib.hasPrefix "/nix/store/"
-  defaultHost.config.systemd.services."atlas-environment-shared\\x2ddev".serviceConfig.ExecCondition;
+  == "oneshot";
+assert defaultHost.config.systemd.services.atlas-guest-contract.restartTriggers != [ ];
+assert builtins.elem "atlas-guest-contract.service"
+  defaultHost.config.systemd.services."atlas-environment-shared\\x2ddev".requires;
+assert builtins.hasAttr "atlas-incus-inventory" defaultHost.config.systemd.services;
+assert builtins.elem "atlas-incus-inventory.service"
+  defaultHost.config.systemd.services."atlas-environment-shared\\x2ddev".requires;
 assert defaultHost.config.systemd.services.atlas-storage-prepare.serviceConfig.Type == "oneshot";
-assert lib.hasInfix
-  "systemd-tmpfiles --create --prefix=/var/lib/atlas"
+assert lib.hasInfix "systemd-tmpfiles --create --prefix=/var/lib/atlas"
   defaultHost.config.systemd.services.atlas-storage-prepare.script;
-assert builtins.elem "CAP_SYS_ADMIN"
-  defaultHost.config.systemd.services.atlas-manage.serviceConfig.CapabilityBoundingSet;
-assert builtins.elem "CAP_CHOWN"
-  defaultHost.config.systemd.services.atlas-manage.serviceConfig.CapabilityBoundingSet;
-assert builtins.elem "CAP_FSETID"
-  defaultHost.config.systemd.services.atlas-manage.serviceConfig.CapabilityBoundingSet;
-assert !(defaultHost.config.systemd.services.atlas-manage.serviceConfig.RestrictSUIDSGID or false);
-assert
-  defaultHost.config.systemd.services."atlas-environment-shared\\x2ddev".serviceConfig.Slice
-  == "atlas-environments-shared\\x2ddev.slice";
+assert lib.hasInfix
+  "CapabilityBoundingSet=CAP_DAC_READ_SEARCH\nCapabilityBoundingSet=CAP_SYS_ADMIN\n"
+  defaultHost.config.systemd.units."atlas-manage.service".text;
+assert lib.hasInfix "CapabilityBoundingSet=CAP_DAC_READ_SEARCH"
+  volatileStateHost.config.systemd.units."atlas-manage.service".text;
+assert lib.hasInfix "RequiresMountsFor=/var/lib/atlas"
+  digitalOceanBootstrapHost.config.systemd.units."incus.service".text;
+assert defaultHost.config.systemd.services.atlas-manage.serviceConfig.RestrictSUIDSGID;
+assert defaultHost.config.virtualisation.incus.enable;
+assert defaultHost.config.virtualisation.incus.package == pkgs.incus-lts;
+assert builtins.elem "atlasbr0" defaultHost.config.networking.firewall.trustedInterfaces;
+assert lib.hasInfix ''iifname "atlasbr0" tcp dport 53 accept''
+  defaultHost.config.networking.nftables.tables.atlas-host-input.content;
+assert lib.hasInfix ''iifname "atlasbr0" udp dport { 53, 67 } accept''
+  defaultHost.config.networking.nftables.tables.atlas-host-input.content;
+assert lib.hasInfix "fib daddr type { local, broadcast, multicast } drop"
+  defaultHost.config.networking.nftables.tables.atlas-host-input.content;
 assert
   !(builtins.any (
     mount: lib.hasPrefix "/run/atlas/environments" mount.where
@@ -473,6 +490,12 @@ assert hasFailedMessage "canonical absolute paths" {
 };
 assert hasFailedMessage "runtime-managed paths" {
   atlas.host.environments.shared-dev.volumeMounts.projects.target = lib.mkForce "/run/atlas";
+};
+assert hasFailedMessage "runtime-managed paths" {
+  atlas.host.environments.shared-dev.volumeMounts.projects.target = lib.mkForce "/etc/atlas-host";
+};
+assert hasFailedMessage "runtime-managed paths" {
+  atlas.host.environments.shared-dev.volumeMounts.projects.target = lib.mkForce "/mnt";
 };
 assert hasFailedMessage "overlapping volume mount targets" {
   atlas.host = {
@@ -537,7 +560,7 @@ assert
   == "/dev/disk/by-uuid/cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa";
 assert volatileContract.state.persistence == "volatile-live-image";
 assert volatileContract.state.storageAdapter == "host-directory";
-assert volatileContract.configuration.environmentEntry.adapter == "nixos-nspawn-directory-v0";
+assert volatileContract.configuration.environmentEntry.adapter == "nixos-incus-directory-v0";
 assert
   volatileContract.configuration.environmentEntry.environments.shared-dev.runtime.storage.copyOnWrite
   == false;

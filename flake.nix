@@ -177,10 +177,12 @@
                 ];
               }
               ''
-                mkdir -p work/scripts work/src work/tests
+                mkdir -p work/scripts work/src work/tests work/nixos/modules
                 cp -r ${./src/atlas} work/src/atlas
                 cp ${./tests/test_atlas_control.py} work/tests/test_atlas_control.py
                 cp ${./tests/test_remote_check.py} work/tests/test_remote_check.py
+                cp ${./tests/test_incus_inventory.py} work/tests/test_incus_inventory.py
+                cp ${./nixos/modules/atlas-environments.nix} work/nixos/modules/atlas-environments.nix
                 install -m 0755 ${./scripts/remote-check} work/scripts/remote-check
                 cd work
                 python3 -m unittest discover -s tests -v

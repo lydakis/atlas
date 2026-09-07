@@ -1,7 +1,7 @@
 # NixOS host architecture spike
 
-Status: elastic Btrfs-backed Environment Entry v0 plus encrypted installed-disk
-layout validated in QEMU; physical hardware pending
+Status: Incus-backed Environment Entry v0 and encrypted installed-disk layout
+validated in x86 KVM; physical hardware pending
 
 ## Outcome
 
@@ -31,9 +31,9 @@ The revision after the product-boundary discussion makes two corrections:
 3. Durable data belongs to volumes. Atlas automatically manages the human
    owner's conventional home as one volume, while the environment owns its
    resettable root and the `~/.config`, `~/.cache`, `~/.local/bin`, and
-   `~/.local/state` views composed over that home. The Btrfs adapter preserves
-   the root across reboot until explicit reset, lets it grow with the Atlas data
-   filesystem, and supplies cheap root snapshots and restore.
+   `~/.local/state` views composed over that home. The Incus Btrfs pool
+   preserves the root until explicit reset, lets it grow with the Atlas data
+   filesystem, and supplies copy-on-write instance snapshots and restore.
 4. Agents are programs using an environment, not environment owners or Linux
    identities. Entry uses the human-owner account with passwordless
    environment-local `sudo`; this broad authority belongs to the environment,
@@ -58,11 +58,11 @@ The reusable `atlas.host` module currently declares:
 - the read-only machine contract
 
 The module serializes that declaration into the versioned host contract. The
-Python package under `src/atlas` consumes the contract through three internal
-seams: `control` owns the local protocol and peer-derived authorization,
-`lifecycle` owns reset and snapshot orchestration, and `storage` owns directory
-and Btrfs mechanics. This is an implementation boundary, not a new product
-primitive or a remote-management protocol.
+Python package under `src/atlas` consumes the contract through two internal
+seams: `control` owns the local protocol and host-derived authorization, and
+`lifecycle` owns root-only Incus reset and snapshot orchestration. Incus owns
+container storage mechanics. This is an implementation boundary, not a new
+product primitive or a remote-management protocol.
 
 Contract version 7 separates three kinds of fact:
 
@@ -83,25 +83,24 @@ The current configuration adds:
   mounted there rather than selecting a broader host directory
 - state roots for environments, volumes, grants, credentials, browser profiles,
   recordings, routes, caches, and audit data
-- separate `atlas-control.slice` and `atlas-environments.slice` resource lanes
+- a protected `atlas-control.slice`; equivalent per-environment Incus limits
+  remain to be implemented and runtime-tested
 - named environments with explicit opaque IDs, fixed entry UIDs, persistent
-  resettable Ubuntu root filesystems and homes, and per-environment resource
-  slices
+  resettable Ubuntu Incus roots, and isolated ID maps
 - durable named volumes with explicit target paths and access modes
 - ordered reusable non-secret configuration layers with instance overrides
 - aliased per-environment package profiles and managed non-secret Git
   configuration
 - fixed login shells that start interactive or non-interactive commands in
-  persistent, user-namespaced `systemd-nspawn` compartments
+  persistent unprivileged Incus containers
 - an environment shell wrapper that preserves variables and the declared PATH
   when clients create nested interactive shells
-- a socket-activated read-only control service that derives environment identity
-  from peer credentials and anchored cgroup membership, plus a separate
-  root-only lifecycle service for instance reset
-- Btrfs environment roots, read-only applied seeds, named root snapshots, and
-  durable-volume subvolumes under `/var/lib/atlas`, with external readiness
-  metadata, serialized fail-closed lifecycle changes, and generation-triggered
-  environment restart
+- a socket-activated read-only control service that derives host-entry identity
+  from peer credentials and binds proxied container callers to one declared
+  environment listener, plus a separate root-only lifecycle service
+- an Incus Btrfs pool, pinned Ubuntu system image, named instance snapshots,
+  delete-and-recreate reset, dependent resettable home volumes, and independent
+  durable-volume subvolumes under `/var/lib/atlas`
 - a Tailscale daemon and interactive `atlas-enroll` helper
 - optional unattended enrollment from a canonical external runtime auth-key
   path; Nix path values, Nix store aliases, and resolved store targets are
@@ -110,7 +109,53 @@ The current configuration adds:
 - no OpenSSH service or public TCP port 22
 - a live physical ISO with local-console enrollment instructions
 
-## Original validated evidence
+## Current Incus Environment Entry evidence
+
+The integrated x86 KVM host contract passed on August 31, 2026. It verifies:
+
+- pinned Incus LTS 7.0.1 plus pinned Ubuntu Noble metadata and rootfs hashes
+- one persistent unprivileged instance per declared environment with isolated
+  ID maps and no guest API or administrative socket inside the container
+- fixed owner entry, declared PATH and Git configuration, writable global Git
+  configuration on first entry, and environment-local passwordless sudo,
+  including a usable resettable owner home when durable owner data is not
+  attached
+- host-bound `inspect self` identity through the Incus UNIX proxy without
+  trusting caller-authored labels
+- ordinary Ubuntu package and `/etc` mutation isolated to one environment and
+  persistent across instance restart
+- durable owner files and a declared project volume shared only with the two
+  environments that receive them
+- Incus instance snapshot restore rolling back root and dependent resettable
+  home state while preserving later durable writes, plus rejection of a stale
+  snapshot layout before restore mutates the instance
+- reset refusal while named snapshots exist, preserving them until explicit
+  deletion
+- explicit delete-and-recreate reset preserving the durable owner-home and
+  declared-volume Btrfs subvolume UUIDs
+- a complete host-owned instance-layout identity published only after successful
+  provisioning, permanently Atlas-owned startup with Incus autostart disabled,
+  automatic recovery from missing readiness identity, and stop quarantine after
+  unexpected effective configuration, local-device, or profile drift
+- atomic guest-contract updates through a dedicated generation-stable directory
+  without recreating the running environment
+- a single public endpoint at `/run/atlas/public/control.sock`, with no legacy
+  socket alias
+- activation-time quarantine of declared-ready and interrupted-construction
+  Atlas instances after removal, stopping them and disabling autostart without
+  deleting their recoverable state
+- system reconciliation blocking on the same per-environment lifecycle lock as
+  reset and snapshots
+- separate network namespaces, exact application of the `atlas-private` NIC ACL,
+  and removal of an injected stale rule during policy reconciliation
+- Incus daemon restart preserving the live instance and durable data
+- mutable Incus default-profile changes having no effect on profile-free Atlas
+  instances
+
+The full allowed-and-denied network connection matrix remains the next roadmap
+proof. Physical installation and recovery remain unproven.
+
+## Historical prototype evidence
 
 | Check | Result |
 | --- | --- |
@@ -156,9 +201,9 @@ machine. This is validation timing, not a performance measurement. It validates
 the host configuration, not Tailscale authentication against a real tailnet or
 behavior on physical hardware.
 
-## Environment Entry v0 evidence
+## Retired nspawn Environment Entry evidence
 
-The revised Environment Entry v0 integration test passed on August 26, 2026.
+The retired Environment Entry v0 integration test passed on August 26, 2026.
 It booted the complete AArch64 host under QEMU and verified:
 
 - left-to-right layer composition and instance overrides
@@ -189,7 +234,7 @@ It booted the complete AArch64 host under QEMU and verified:
 - durable volume data across control-service restart, generation switch, and
   rollback
 
-The persistent-instance hardening revision passed on August 27, 2026. The same
+The retired persistent-instance hardening revision passed on August 27, 2026. The same
 booted-host contract additionally verified:
 
 - one systemd-owned nspawn service per declared environment

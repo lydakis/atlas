@@ -32,9 +32,9 @@ independent workstreams need assignment and coordination.
   suggestions and are never applied or executed ambiently.
 - Secrets are grants, not environment configuration. Portable environment
   definitions do not contain secret material.
-- Incus 7.0 LTS is the selected Environment substrate. It remains behind the
-  Atlas lifecycle boundary; systemd-nspawn is a temporary reference until the
-  Incus adapter passes the existing contracts.
+- Incus 7.0 LTS is the only implemented Environment substrate. It remains
+  behind the Atlas lifecycle boundary; Atlas owns the product contract and
+  delegates container mechanics to the pinned local Incus daemon.
 
 ## Persistence vocabulary
 
@@ -64,9 +64,9 @@ This is an explicit path contract, not a claim that Atlas recognizes every
 configuration dotfile. Environments that omit owner-home access receive a
 private resettable home instead.
 
-Copy-on-write reconstruction and atomic root replacement are now proven by the
-Btrfs adapter. Quota enforcement remains absent. Agents should not need to
-choose special paths merely to keep ordinary files across a reboot.
+Incus instance snapshots and delete-and-recreate reset are now proven on the
+Btrfs pool. Quota enforcement remains absent. Agents should not need to choose
+special paths merely to keep ordinary files across a reboot.
 
 ### Volatile execution state
 
@@ -90,8 +90,8 @@ proof until its prerequisites have been demonstrated.
 | Order | Proof | Exit evidence | State |
 | --- | --- | --- | --- |
 | 1 | Cloud existing-client dogfood | Herdr enters both declared development environments on a persistent DigitalOcean lab host, observes their distinct non-secret configuration, operates one shared durable checkout, survives reboot, and demonstrates reset of environment-local drift without losing owner work | complete |
-| 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or cloud metadata endpoints without policy; intended public egress still works | in progress |
-| 3 | Paired operator control | A controller device is explicitly paired, receives a revocable identity, and can inspect, reset, and snapshot environments over a private transport; tailnet membership alone grants no Atlas authority | queued |
+| 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or cloud metadata endpoints without policy; intended public egress still works; adding or renaming a definition does not silently renumber existing environment addresses | in progress |
+| 3 | Paired operator control | A controller device is explicitly paired, receives a revocable identity, and can inspect, reset, and snapshot environments over a private transport; tailnet membership alone grants no Atlas authority; lifecycle calls have bounded execution and recover cleanly from an unavailable Incus daemon | queued |
 | 4 | Private route | One explicitly selected environment port is reachable from an authorized paired device without a public listener or arbitrary upstream target | queued |
 | 5 | Authenticated browser surface | An agent operates one isolated browser identity while the operator can observe, take over, return control, and revoke access | queued |
 | 6 | Narrow grant | One source credential remains outside the environment while a broker performs a bounded operation or issues a short-lived derivative | queued |
@@ -99,6 +99,24 @@ proof until its prerequisites have been demonstrated.
 | 8 | Runtime environment definitions | The control plane creates, inspects, resets, and deletes definitions and instances without weakening peer-derived identity or storage guarantees | later |
 | 9 | Portable environment declaration | A backend-independent, non-secret seed maps to the definition model; import requires explicit operator or client action and has no imperative setup hook | later |
 | 10 | Host-base comparison | The same proven behavior is ported to a bootc/OCI host and compared with the NixOS adapter on installation, update, rollback, recovery, and complexity | later |
+
+### Required Incus follow-ups
+
+- Before completing private environment networking, replace the current
+  name-order-derived IPv4 allocation with a stable environment-identity mapping,
+  define collision and address-exhaustion behavior, and prove that unrelated
+  definition changes do not renumber existing environments.
+- Before completing paired operator control, bound Incus and reset subprocess
+  execution and test timeout, daemon-restart, and interrupted lifecycle
+  recovery. Per-environment lifecycle locks now precede the global Incus
+  reconciliation lock, including system activation and reset. A stalled local
+  daemon must not wedge operator control indefinitely or leave an environment
+  falsely reported as ready.
+- Incus presence classification now shares one Python lifecycle helper across
+  reset, reconciliation, quarantine, activation inventory, volume cleanup, and
+  ACL provisioning. Only a successful, validated inventory establishes absence;
+  daemon errors and ambiguous responses fail closed. Focused regressions cover
+  those failure paths, including the generated activation service.
 
 ### Parallel storage hardening
 
@@ -123,12 +141,12 @@ ceremony, and hardware recovery remain unproven.
   explicit degraded state that must be replaced by Tailscale SSH after
   enrollment. Configuration evaluation is not live deployment evidence.
 
-- Persistent development and contract-test VMs mount a dedicated Btrfs data disk
-  at `/var/lib/atlas`. Environment roots, applied seeds, named root snapshots,
-  and durable volumes are separate subvolumes with no default per-environment
-  quota.
-- The live ISO retains the directory adapter and truthfully reports snapshots
-  and rollback as unavailable.
+- Persistent development and contract-test VMs mount a dedicated Btrfs data
+  disk at `/var/lib/atlas`. Incus owns environment-root and dependent-volume
+  subvolumes in its Btrfs pool; Atlas durable owner and declared volumes remain
+  separate host-managed subvolumes with no default per-environment quota.
+- The live ISO uses the Incus directory pool and truthfully reports snapshots
+  and rollback as unavailable until that adapter is qualified.
 - The parameterized installed-storage module places the host and Atlas data in
   one LUKS2 container, with a fixed host logical volume and an elastic Btrfs data
   logical volume. It requires installer-generated device UUIDs rather than
@@ -142,10 +160,9 @@ ceremony, and hardware recovery remain unproven.
   `/home/<owner>` with passwordless environment-local `sudo`. This deliberately
   grants every admitted process root inside that environment, not Atlas-host
   root; narrower per-process authority remains future Grant work.
-- The current systemd-nspawn adapter still shares host networking. The selected
-  Incus substrate has demonstrated separate loopback and network namespaces plus
-  fail-closed egress policy in a disposable KVM proof, but the Atlas Environment
-  Entry adapter does not own that behavior yet.
+- The Incus adapter creates separate network namespaces and applies the
+  `atlas-private` NIC ACL to every environment. The complete connection matrix
+  remains the active private-networking product proof before paired control.
 - The read-only host Nix store remains visible inside environments for declared
   tools.
 - There is no route proxy, browser service, grant broker, persistent installer,

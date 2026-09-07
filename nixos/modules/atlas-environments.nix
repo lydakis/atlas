@@ -6,7 +6,9 @@
 }:
 let
   cfg = config.atlas.host;
+  incusInventory = "${pkgs.python3}/bin/python3 -I ${../../src/atlas/lifecycle.py} --incus ${pkgs.incus-lts}/bin/incus";
   gitIni = pkgs.formats.gitIni { };
+  yaml = pkgs.formats.yaml { };
   inherit (lib)
     concatMap
     concatMapStringsSep
@@ -21,23 +23,24 @@ let
     mkIf
     mkOption
     nameValuePair
-    optionalAttrs
     types
     unique
     ;
 
   environmentNames = builtins.attrNames cfg.environments;
+  incusDeclaredInstances = pkgs.writeText "atlas-incus-declared-instances" (
+    concatMapStringsSep "\n" (name: "atlas-${name}") environmentNames
+  );
+  environmentIpv4ByName = builtins.listToAttrs (
+    lib.imap0 (index: name: nameValuePair name "10.211.0.${toString (index + 10)}") environmentNames
+  );
   layerNames = builtins.attrNames cfg.environmentLayers;
   volumeNames = builtins.attrNames cfg.volumes;
 
   loginUser = name: "atlas-${name}";
   loginHome = environment: "/run/atlas/entry-users/${environment.id}";
-  environmentStateParent = environment: "${toString cfg.dataRoot}/environments/${environment.id}";
-  environmentRuntimeRoot = environment: "${environmentStateParent environment}/rootfs";
-  environmentRuntimeReady = environment: "${environmentStateParent environment}/rootfs.ready";
-  environmentSeed = environment: "${environmentStateParent environment}/seed";
-  environmentSnapshots = environment: "${environmentStateParent environment}/snapshots";
   environmentLock = environment: "/run/atlas/locks/${environment.id}.lock";
+  guestContractRoot = "/run/atlas/guest-contract";
   volumePath = volume: "${toString cfg.dataRoot}/volumes/${volume.id}/data";
   ownerHome = "/home/${cfg.owner.name}";
   ownerHomeVolume = {
@@ -53,235 +56,82 @@ let
   dataRootPersistent = cfg.dataRootPersistence == "reboot-persistent";
   btrfsStorage = cfg.storage.adapter == "btrfs-subvolume";
   escapedSliceSegment = name: lib.replaceStrings [ "-" ] [ "\\x2d" ] name;
-  sliceName = name: "atlas-environments-${escapedSliceSegment name}";
-  sliceUnit = name: "${sliceName name}.slice";
   environmentServiceName = name: "atlas-environment-${escapedSliceSegment name}";
-  environmentServiceUnit = name: "${environmentServiceName name}.service";
-  environmentCgroupPrefix =
-    name: "/atlas.slice/atlas-environments.slice/${sliceUnit name}/${environmentServiceUnit name}";
+  environmentControlServiceName = name: "atlas-environment-control-${escapedSliceSegment name}";
+  environmentCgroupPrefix = name: "/lxc.payload.atlas-${name}";
 
   ubuntuArchitecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
-  ubuntuRootfs = pkgs.fetchurl {
-    url = "https://partner-images.canonical.com/oci/noble/20260810/ubuntu-noble-oci-${ubuntuArchitecture}-root.tar.gz";
-    hash =
-      if pkgs.stdenv.hostPlatform.isAarch64 then
-        "sha256-k6XLePgVlERrbyEzkNUqHzeCiN4TbDEfNpU476cul7U="
-      else
-        "sha256-qqeq73rxhbs1mvI151NLBYDlz3yfwn2010xIgfJ1JMw=";
+  incusImageVersion = "20260829_07:42";
+  incusImageMetadataHash =
+    if pkgs.stdenv.hostPlatform.isAarch64 then
+      "sha256-hNvdWu9fPSk807Zw7+rN8MSGxrH3IdGJ3mJMrHMhumw="
+    else
+      "sha256-ZgzuAjoW2aSydSlxN95JUs45CvjioDKlwfmUi8elo9k=";
+  incusImageRootHash =
+    if pkgs.stdenv.hostPlatform.isAarch64 then
+      "sha256-gj3087s49oN+/oI30Hsr2OYlazy0QTStvTRNtxEPfQ4="
+    else
+      "sha256-STGVZi/M3l7a9aLd0Ft6rwHMiM9KedBQRjfIDDvz9iA=";
+  incusImageContentId = builtins.hashString "sha256" (
+    builtins.toJSON {
+      metadata = incusImageMetadataHash;
+      root = incusImageRootHash;
+    }
+  );
+  incusImageAlias = "atlas-ubuntu-${builtins.substring 0 12 incusImageContentId}";
+  # Upstream daily builds expire. Retain the exact pinned bytes in Atlas's
+  # image release; never replace assets under an existing release tag.
+  incusImageMirror = "https://github.com/lydakis/atlas/releases/download/ubuntu-noble-20260829-0742";
+  incusImageMetadata = pkgs.fetchurl {
+    name = "incus.tar.xz";
+    url = "${incusImageMirror}/${ubuntuArchitecture}-incus.tar.xz";
+    hash = incusImageMetadataHash;
   };
-  ubuntuPackageSnapshot = "20260829T000000Z";
-  ubuntuSudoDeb = pkgs.fetchurl {
-    url = "https://snapshot.ubuntu.com/ubuntu/${ubuntuPackageSnapshot}/pool/main/s/sudo/sudo_1.9.15p5-3ubuntu5.24.04.2_${ubuntuArchitecture}.deb";
-    hash =
-      if pkgs.stdenv.hostPlatform.isAarch64 then
-        "sha256-AVCCudbewXymsZKKnV93obUeFJfKOmMpI2XC1V/IDV8="
-      else
-        "sha256-1TYdQCHcfLYNSblLGGupCMEOnjjzOlXLoEkXVBHrElE=";
-  };
-  ubuntuLibapparmorDeb = pkgs.fetchurl {
-    url = "https://snapshot.ubuntu.com/ubuntu/${ubuntuPackageSnapshot}/pool/main/a/apparmor/libapparmor1_4.0.1really4.0.1-0ubuntu0.24.04.7_${ubuntuArchitecture}.deb";
-    hash =
-      if pkgs.stdenv.hostPlatform.isAarch64 then
-        "sha256-nvJll1CdT6HURshKinY556bzpsRxeV1y3xaf7LuDUUc="
-      else
-        "sha256-QgU1HDf06BPxyoG21ZoABx8PcIaeZS9KueW6fl6JXTQ=";
-  };
-  ubuntuBootstrapId = builtins.hashString "sha256" "${ubuntuLibapparmorDeb}:${ubuntuSudoDeb}";
-  atlasCaBundle = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-  migrateLegacyCaBundles = pkgs.writeShellApplication {
-    name = "atlas-migrate-legacy-ca-bundles";
-    runtimeInputs = [ pkgs.coreutils ];
-    text = ''
-      migrate_bundle() {
-        target="$1"
-        if [ ! -L "$target" ]; then
-          return
-        fi
-
-        link_target="$(readlink -- "$target")"
-        case "$link_target" in
-          /nix/store/*/etc/ssl/certs/ca-bundle.crt)
-            temporary="$(mktemp --tmpdir="$(dirname -- "$target")" .atlas-ca-bundle.XXXXXX)"
-            if ! install -m 0644 ${atlasCaBundle} "$temporary" || ! mv -T -- "$temporary" "$target"; then
-              rm -f -- "$temporary"
-              return 1
-            fi
-            ;;
-        esac
-      }
-
-      migrate_bundle /etc/ssl/certs/ca-bundle.crt
-      migrate_bundle /etc/ssl/certs/ca-certificates.crt
-    '';
+  incusImageRoot = pkgs.fetchurl {
+    name = "rootfs.squashfs";
+    url = "${incusImageMirror}/${ubuntuArchitecture}-rootfs.squashfs";
+    hash = incusImageRootHash;
   };
   baseImageRecord = {
     distribution = "ubuntu";
     release = "24.04";
-    build = "20260810";
+    build = builtins.substring 0 8 incusImageVersion;
     architecture = ubuntuArchitecture;
-    source = "canonical-oci-rootfs";
+    source = "linuxcontainers-incus-image";
+    contentId = incusImageContentId;
   };
-  ownerLayout = ''
-        provision_owner() {
-          local target="$1"
-          local account numeric_id
-          local -a removed_users=()
-          local -a removed_groups=()
-
-          while IFS=: read -r account _ numeric_id _; do
-            if [ "$account" = ${lib.escapeShellArg cfg.owner.name} ] && \
-               [ "$numeric_id" != ${lib.escapeShellArg (toString cfg.owner.uid)} ]; then
-              echo "Atlas refused an owner name that collides with a base-image account" >&2
-              return 1
-            fi
-            if [ "$numeric_id" = ${lib.escapeShellArg (toString cfg.owner.uid)} ] || \
-               [ "$account" = ${lib.escapeShellArg cfg.owner.name} ]; then
-              removed_users+=("$account")
-            fi
-          done < "$target/etc/passwd"
-          while IFS=: read -r account _ numeric_id _; do
-            if [ "$account" = ${lib.escapeShellArg cfg.owner.name} ] && \
-               [ "$numeric_id" != ${lib.escapeShellArg (toString cfg.owner.uid)} ]; then
-              echo "Atlas refused an owner name that collides with a base-image group" >&2
-              return 1
-            fi
-            if [ "$numeric_id" = ${lib.escapeShellArg (toString cfg.owner.uid)} ] || \
-               [ "$account" = ${lib.escapeShellArg cfg.owner.name} ]; then
-              removed_groups+=("$account")
-            fi
-          done < "$target/etc/group"
-
-          for account in "''${removed_users[@]}"; do
-            sed -i -E "/^''${account}:/d" \
-              "$target/etc/passwd" "$target/etc/shadow"
-          done
-          for account in "''${removed_groups[@]}"; do
-            sed -i -E "/^''${account}:/d" \
-              "$target/etc/group" "$target/etc/gshadow"
-          done
-
-          install -d -m 0755 \
-            "$target/etc/atlas" \
-            "$target/etc/pam.d" \
-            "$target/etc/sudoers.d" \
-            "$target${ownerHome}" \
-            "$target/usr/local/bin"
-          install -d -m 0700 ${
-            concatMapStringsSep " " (path: ''"$target${ownerHome}/${path}"'') resettableHomePaths
-          }
-          install -d -m 0700 "$target${ownerHome}/.config/git"
-          chown -R ${toString cfg.owner.uid}:${toString cfg.owner.uid} "$target${ownerHome}"
-          printf '%s\n' \
-            ${lib.escapeShellArg "${cfg.owner.name}:x:${toString cfg.owner.uid}:${toString cfg.owner.uid}:Atlas owner:${ownerHome}:/bin/bash"} \
-            >> "$target/etc/passwd"
-          printf '%s\n' \
-            ${lib.escapeShellArg "${cfg.owner.name}:x:${toString cfg.owner.uid}:"} \
-            >> "$target/etc/group"
-          printf '%s\n' \
-            ${lib.escapeShellArg "${cfg.owner.name}:!:20000:0:99999:7:::"} \
-            >> "$target/etc/shadow"
-          printf '%s\n' \
-            ${lib.escapeShellArg "${cfg.owner.name}:!::"} \
-            >> "$target/etc/gshadow"
-          install -d -m 0750 "$target/etc/sudoers.d"
-          printf 'Defaults:%s !use_pty\n%s ALL=(ALL:ALL) NOPASSWD: ALL\n' \
-            ${lib.escapeShellArg cfg.owner.name} \
-            ${lib.escapeShellArg cfg.owner.name} \
-            > "$target/etc/sudoers.d/atlas-owner"
-          chmod 0440 "$target/etc/sudoers.d/atlas-owner"
-        }
-  '';
-  ownerBootstrapId = builtins.hashString "sha256" ownerLayout;
-  environmentOwnerLayoutId =
-    environment:
+  environmentLayoutId =
+    name: environment:
     builtins.hashString "sha256" (
       builtins.toJSON {
-        inherit ownerBootstrapId ubuntuBootstrapId;
+        version = 1;
+        baseImage = baseImageRecord // {
+          alias = incusImageAlias;
+        };
+        owner = {
+          inherit (cfg.owner) name uid;
+          homeVolumeId = if environment.ownerHome then cfg.owner.homeVolumeId else null;
+          elevation = "passwordless-environment-sudo";
+        };
         durableOwnerHome = environment.ownerHome;
-        ownerHomeVolumeId = if environment.ownerHome then cfg.owner.homeVolumeId else null;
+        resettablePaths = if environment.ownerHome then resettableHomePaths else [ ];
+        network = {
+          address = environmentIpv4ByName.${name};
+          acl = "atlas-private";
+        };
+        runtimeSurfaces = {
+          nixStore = "/nix/store";
+          contract = "/etc/atlas-host/control-contract.json";
+          control = "/mnt/atlas-control.sock";
+        };
+        startup = "atlas-systemd-service";
+        volumes = mapAttrs (volumeName: mount: {
+          inherit (mount) access target;
+          inherit (cfg.volumes.${volumeName}) id;
+          hostPath = volumePath cfg.volumes.${volumeName};
+        }) (lib.filterAttrs (volumeName: _mount: hasAttr volumeName cfg.volumes) environment.volumeMounts);
       }
     );
-  bootstrapTree =
-    environment:
-    let
-      ownerLayoutId = environmentOwnerLayoutId environment;
-    in
-    ''
-      ${ownerLayout}
-      bootstrap_tree() {
-        local target="$1"
-        tar --extract --gzip --numeric-owner --file=${ubuntuRootfs} --directory="$target"
-        install -d -m 0755 \
-          "$target/etc/atlas" \
-          "$target/etc/ssl/certs" \
-          "$target/etc/systemd/system" \
-          "$target/etc/systemd/system/multi-user.target.d" \
-          "$target/run/atlas" \
-          "$target/run/atlas-host-systemd" \
-          "$target/usr/lib/atlas/bootstrap-packages" \
-          "$target/usr/lib/systemd"
-        ${lib.optionalString (allMountTargets != [ ]) ''
-          install -d -m 0755 ${concatMapStringsSep " " (path: ''"$target${path}"'') allMountTargets}
-        ''}
-        provision_owner "$target"
-        printf '%s\n' ${lib.escapeShellArg ownerLayoutId} > "$target/etc/atlas/owner-layout-id"
-        install -m 0644 ${ubuntuLibapparmorDeb} \
-          "$target/usr/lib/atlas/bootstrap-packages/libapparmor1.deb"
-        install -m 0644 ${ubuntuSudoDeb} \
-          "$target/usr/lib/atlas/bootstrap-packages/sudo.deb"
-        printf '%s\n' ${lib.escapeShellArg ubuntuBootstrapId} \
-          > "$target/usr/lib/atlas/bootstrap-packages/bootstrap-id"
-        cat > "$target/etc/systemd/system/atlas-bootstrap-packages.service" <<'EOF'
-    [Unit]
-    Description=Install pinned Ubuntu packages required by Atlas
-    ConditionPathExists=/usr/lib/atlas/bootstrap-packages/sudo.deb
-    Before=multi-user.target
-
-    [Service]
-    Type=oneshot
-    Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    StandardOutput=journal+console
-    StandardError=journal+console
-    ExecStart=/usr/bin/dpkg --install /usr/lib/atlas/bootstrap-packages/libapparmor1.deb /usr/lib/atlas/bootstrap-packages/sudo.deb
-    ExecStartPost=/bin/mv /usr/lib/atlas/bootstrap-packages/bootstrap-id /usr/lib/atlas/bootstrap-complete
-    ExecStartPost=/bin/rm -rf /usr/lib/atlas/bootstrap-packages
-    EOF
-        cat > "$target/etc/systemd/system/multi-user.target.d/atlas-bootstrap-packages.conf" <<'EOF'
-    [Unit]
-    Requires=atlas-bootstrap-packages.service
-    After=atlas-bootstrap-packages.service
-    EOF
-        install -m 0644 ${atlasCaBundle} \
-          "$target/etc/ssl/certs/ca-bundle.crt"
-        install -m 0644 ${atlasCaBundle} \
-          "$target/etc/ssl/certs/ca-certificates.crt"
-        ln -sfn /run/atlas-host-systemd/lib/systemd/systemd "$target/sbin/init"
-        rm -rf -- "$target/usr/lib/systemd/system"
-        install -d -m 0755 "$target/usr/lib/systemd/system"
-        while IFS= read -r -d "" source_path; do
-          relative_path="''${source_path#./}"
-          install -d -m 0755 "$target/usr/lib/systemd/system/$relative_path"
-        done < <(
-          cd ${pkgs.systemd}/example/systemd/system
-          find . -mindepth 1 -type d -print0
-        )
-        while IFS= read -r -d "" source_path; do
-          relative_path="''${source_path#./}"
-          ln -sfn \
-            "/run/atlas-host-systemd/example/systemd/system/$relative_path" \
-            "$target/usr/lib/systemd/system/$relative_path"
-        done < <(
-          cd ${pkgs.systemd}/example/systemd/system
-          find . -mindepth 1 ! -type d -print0
-        )
-        ln -sfn /usr/lib/systemd/system/multi-user.target \
-          "$target/etc/systemd/system/default.target"
-      }
-    '';
-  seedBootstrapDigest = environment: builtins.hashString "sha256" (bootstrapTree environment);
-  seedId =
-    environment:
-    builtins.hashString "sha256" "${ubuntuRootfs}:${pkgs.systemd}:${seedBootstrapDigest environment}";
 
   effectiveVariables =
     environment:
@@ -347,6 +197,7 @@ let
       inherit (mount) access target;
       inherit name;
       id = cfg.volumes.${name}.id;
+      hostPath = volumePath cfg.volumes.${name};
     }) (lib.filterAttrs (name: _mount: hasAttr name cfg.volumes) environment.volumeMounts);
 
   environmentRecord = name: environment: {
@@ -374,39 +225,35 @@ let
     packages = effectivePackageNames environment;
     git.config = effectiveGitConfig environment;
     network = {
-      mode = environment.networkMode;
-      status = "degraded";
+      mode = "private-nat";
+      status = "experimental";
     };
-    resources = environment.resources;
     runtime = {
-      backend = "systemd-nspawn-service";
+      backend = "incus-container";
       lifecycle = "resettable";
-      ownerLayoutId = environmentOwnerLayoutId environment;
+      layoutId = environmentLayoutId name environment;
       persistence = if dataRootPersistent then "until-explicit-reset" else "until-reset-or-host-reboot";
       resettable = true;
-      rootHostPath = environmentRuntimeRoot environment;
-      readyHostPath = environmentRuntimeReady environment;
       storage = {
-        adapter = cfg.storage.adapter;
+        adapter = "incus-${cfg.storage.adapter}-pool";
         copyOnWrite = btrfsStorage;
         snapshots = btrfsStorage;
-      }
-      // optionalAttrs btrfsStorage {
-        seedHostPath = environmentSeed environment;
-        snapshotsHostPath = environmentSnapshots environment;
-        seed.id = seedId environment;
-        seedPrepareCommand = "${seedPreparers.${name}}/bin/atlas-prepare-seed-${name}";
       };
       baseImage = baseImageRecord;
+      instance = {
+        name = "atlas-${name}";
+        resetCommand = "${incusResetCommands.${name}}/bin/atlas-incus-reset-${name}";
+        verifyCommand = "${incusVerifyCommands.${name}}/bin/atlas-incus-verify-${name}";
+      };
     };
     process = {
       cgroupPrefix = environmentCgroupPrefix name;
-      serviceUnit = environmentServiceUnit name;
-      sliceUnit = sliceUnit name;
+      serviceUnit = "incus.service";
+      sliceUnit = "system.slice";
     };
     volumes = environmentVolumeRecords environment;
     entry = {
-      adapter = "fixed-login-to-persistent-nspawn";
+      adapter = "fixed-login-to-persistent-incus";
       loginUser = loginUser name;
       loginUid = environment.uid;
     };
@@ -422,7 +269,7 @@ let
 
   doctor = {
     status = "experimental";
-    adapter = if btrfsStorage then "nixos-nspawn-btrfs-v0" else "nixos-nspawn-directory-v0";
+    adapter = "nixos-incus-${if btrfsStorage then "btrfs" else "directory"}-v0";
     composition = {
       declarative = true;
       named = true;
@@ -441,11 +288,11 @@ let
       concurrentEntry = true;
     };
     identity = {
-      source = "unix-peer-credentials-and-anchored-cgroup";
+      source = "unix-peer-credentials-or-host-bound-environment-listener";
       callerAuthoredIdentityAccepted = false;
     };
     rootIsolation = {
-      mode = "systemd-nspawn-user-namespace";
+      mode = "incus-isolated-idmap";
       status = "experimental";
       hostRootShared = false;
       packageManager = "apt";
@@ -470,8 +317,8 @@ let
       };
     };
     networkIsolation = {
-      mode = "shared-host";
-      status = "degraded";
+      mode = "incus-bridge-nat-acl";
+      status = "experimental";
     };
     toolIsolation = {
       mode = "container-rootfs-plus-read-only-nix-store";
@@ -487,6 +334,46 @@ let
     inherit doctor environmentByCgroupPrefix environmentByUid;
     environments = environmentRecords;
   };
+  privateNetworkDestinations = [
+    "10.0.0.0/8"
+    "100.64.0.0/10"
+    "169.254.0.0/16"
+    "172.16.0.0/12"
+    "192.168.0.0/16"
+  ];
+  incusPrivateAcl = {
+    config = { };
+    description = "Atlas private environment egress policy";
+    ingress = [ ];
+    egress = [
+      {
+        action = "allow";
+        destination = "10.211.0.1";
+        protocol = "udp";
+        destination_port = "53";
+        state = "enabled";
+      }
+      {
+        action = "allow";
+        destination = "10.211.0.1";
+        protocol = "tcp";
+        destination_port = "53";
+        state = "enabled";
+      }
+    ]
+    ++ map (destination: {
+      action = "reject";
+      inherit destination;
+      state = "enabled";
+    }) privateNetworkDestinations
+    ++ [
+      {
+        action = "allow";
+        state = "enabled";
+      }
+    ];
+  };
+  incusPrivateAclFile = yaml.generate "atlas-private-acl.yaml" incusPrivateAcl;
   controlContractFile = pkgs.writeText "atlas-control-contract.json" (
     builtins.toJSON controlContract
   );
@@ -527,7 +414,7 @@ let
     in
     effectiveVariables environment
     // {
-      ATLAS_CONTROL_SOCKET = "/run/atlas/control.sock";
+      ATLAS_CONTROL_SOCKET = "/mnt/atlas-control.sock";
       ATLAS_ENVIRONMENT_ID = environment.id;
       ATLAS_ENVIRONMENT_NAME = name;
       GIT_CONFIG_GLOBAL = "${ownerHome}/.config/git/config";
@@ -539,15 +426,6 @@ let
       USER = cfg.owner.name;
     };
 
-  environmentArgumentLines =
-    name: environment:
-    let
-      variables = environmentVariables name environment;
-    in
-    concatMapStringsSep "\n" (
-      variable: "        ${lib.escapeShellArg "--setenv=${variable}=${variables.${variable}}"}"
-    ) (builtins.attrNames variables);
-
   environmentAssignmentLines =
     name: environment:
     let
@@ -557,451 +435,593 @@ let
       variable: "          ${lib.escapeShellArg "${variable}=${variables.${variable}}"}"
     ) (builtins.attrNames variables);
 
-  volumeArgumentLines =
-    environment:
-    concatMapStringsSep "\n" (
-      volumeName:
-      let
-        mount = environment.volumeMounts.${volumeName};
-        source = volumePath cfg.volumes.${volumeName};
-        flag = if mount.access == "read-only" then "--bind-ro" else "--bind";
-      in
-      "        ${lib.escapeShellArg "${flag}=${source}:${mount.target}:idmap"}"
-    ) (builtins.attrNames environment.volumeMounts);
+  incusGuestProvisioners = mapAttrs (
+    name: environment:
+    let
+      layoutId = environmentLayoutId name environment;
+      resettableHome = lib.optionalString (!environment.ownerHome) ''
+        install -d -m 0700 -o ${toString cfg.owner.uid} -g ${toString cfg.owner.uid} \
+          ${lib.escapeShellArg ownerHome}
+      '';
+    in
+    pkgs.writeShellScript "atlas-incus-provision-${name}" ''
+      set -eu
+      existing_user="$(getent passwd ${toString cfg.owner.uid} | cut -d: -f1 || true)"
+      if [ -n "$existing_user" ] && [ "$existing_user" != ${lib.escapeShellArg cfg.owner.name} ]; then
+        userdel --force "$existing_user"
+      fi
+      named_user_uid="$(id -u ${lib.escapeShellArg cfg.owner.name} 2>/dev/null || true)"
+      if [ -n "$named_user_uid" ] && [ "$named_user_uid" != ${toString cfg.owner.uid} ]; then
+        userdel --force ${lib.escapeShellArg cfg.owner.name}
+      fi
+      existing_group="$(getent group ${toString cfg.owner.uid} | cut -d: -f1 || true)"
+      if [ -n "$existing_group" ] && [ "$existing_group" != ${lib.escapeShellArg cfg.owner.name} ]; then
+        groupdel "$existing_group"
+      fi
+      named_group_gid="$(getent group ${lib.escapeShellArg cfg.owner.name} | cut -d: -f3 || true)"
+      if [ -n "$named_group_gid" ] && [ "$named_group_gid" != ${toString cfg.owner.uid} ]; then
+        groupdel ${lib.escapeShellArg cfg.owner.name}
+      fi
+      if ! getent group ${lib.escapeShellArg cfg.owner.name} >/dev/null; then
+        groupadd --gid ${toString cfg.owner.uid} ${lib.escapeShellArg cfg.owner.name}
+      fi
+      if ! getent passwd ${lib.escapeShellArg cfg.owner.name} >/dev/null; then
+        useradd --uid ${toString cfg.owner.uid} --gid ${toString cfg.owner.uid} \
+          --home-dir ${lib.escapeShellArg ownerHome} --no-create-home \
+          --shell /bin/bash ${lib.escapeShellArg cfg.owner.name}
+      fi
+      ${resettableHome}
+      install -d -m 0700 -o ${toString cfg.owner.uid} -g ${toString cfg.owner.uid} \
+        ${lib.escapeShellArg "${ownerHome}/.config/git"}
+      install -d -m 0755 /etc/atlas
+      printf '%s\n' ${lib.escapeShellArg layoutId} > /etc/atlas/layout-id
+      printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' ${lib.escapeShellArg cfg.owner.name} \
+        > /etc/sudoers.d/atlas-owner
+      chmod 0440 /etc/sudoers.d/atlas-owner
+    ''
+  ) cfg.environments;
 
-  ownerHomeArgumentLines =
-    environment:
+  incusVolumeDeviceCommands =
+    name: environment:
+    concatMapStringsSep "\n"
+      (
+        volumeName:
+        let
+          mount = environment.volumeMounts.${volumeName};
+          source = volumePath cfg.volumes.${volumeName};
+          readonly = lib.optionalString (mount.access == "read-only") " readonly=true";
+        in
+        ''
+          incus --force-local config device add ${lib.escapeShellArg "atlas-${name}"} \
+            ${lib.escapeShellArg "volume-${volumeName}"} disk \
+            source=${lib.escapeShellArg source} path=${lib.escapeShellArg mount.target} \
+            shift=true${readonly}
+        ''
+      )
+      (filter (volumeName: hasAttr volumeName cfg.volumes) (builtins.attrNames environment.volumeMounts));
+
+  incusResettableDeviceCommands =
+    name: environment:
     lib.optionalString environment.ownerHome (
-      concatMapStringsSep "\n" (argument: "        ${lib.escapeShellArg argument}") (
-        [ "--bind=${ownerHomePath}:${ownerHome}:idmap" ]
-        ++ map (
-          path: "--bind=${environmentRuntimeRoot environment}${ownerHome}/${path}:${ownerHome}/${path}:idmap"
+      concatMapStringsSep "\n" (
+        path:
+        let
+          suffix = lib.replaceStrings [ "." "/" ] [ "" "-" ] path;
+          volume = "atlas-${name}-home-${suffix}";
+          device = "resettable-${suffix}";
+        in
+        ''
+          incus --force-local storage volume create atlas ${lib.escapeShellArg volume} \
+            initial.uid=${toString cfg.owner.uid} initial.gid=${toString cfg.owner.uid} \
+            initial.mode=0700 security.shifted=true
+          incus --force-local config device add ${lib.escapeShellArg "atlas-${name}"} \
+            ${lib.escapeShellArg device} disk pool=atlas \
+            source=${lib.escapeShellArg volume} \
+            path=${lib.escapeShellArg "${ownerHome}/${path}"} dependent=true
+        ''
+      ) resettableHomePaths
+    );
+
+  incusResettableVolumeCleanupCommands =
+    name: environment:
+    lib.optionalString environment.ownerHome (
+      concatMapStringsSep "\n" (
+        path:
+        let
+          suffix = lib.replaceStrings [ "." "/" ] [ "" "-" ] path;
+          volume = "atlas-${name}-home-${suffix}";
+        in
+        ''
+          presence="$(${incusInventory} volume ${lib.escapeShellArg volume})"
+          if [ "$presence" = present ]; then
+            incus --force-local storage volume delete atlas ${lib.escapeShellArg volume}
+          fi
+        ''
+      ) resettableHomePaths
+    );
+
+  incusExpectedDevices =
+    name: environment:
+    {
+      root = {
+        type = "disk";
+        path = "/";
+        pool = "atlas";
+      };
+      eth0 = {
+        type = "nic";
+        name = "eth0";
+        network = "atlasbr0";
+        "ipv4.address" = environmentIpv4ByName.${name};
+        "security.acls" = "atlas-private";
+      };
+      nix-store = {
+        type = "disk";
+        source = "/nix/store";
+        path = "/nix/store";
+        readonly = "true";
+      };
+      atlas-contract = {
+        type = "disk";
+        source = guestContractRoot;
+        path = "/etc/atlas-host";
+        readonly = "true";
+      };
+      atlas-control = {
+        type = "proxy";
+        bind = "instance";
+        listen = "unix:/mnt/atlas-control.sock";
+        connect = "unix:/run/atlas/environment-sockets/${name}/control.sock";
+        uid = toString cfg.owner.uid;
+        gid = toString cfg.owner.uid;
+        mode = "0660";
+      };
+    }
+    // lib.optionalAttrs environment.ownerHome {
+      owner-home = {
+        type = "disk";
+        source = ownerHomePath;
+        path = ownerHome;
+        shift = "true";
+      };
+    }
+    // builtins.listToAttrs (
+      map
+        (
+          volumeName:
+          let
+            mount = environment.volumeMounts.${volumeName};
+          in
+          nameValuePair "volume-${volumeName}" (
+            {
+              type = "disk";
+              source = volumePath cfg.volumes.${volumeName};
+              path = mount.target;
+              shift = "true";
+            }
+            // lib.optionalAttrs (mount.access == "read-only") { readonly = "true"; }
+          )
+        )
+        (filter (volumeName: hasAttr volumeName cfg.volumes) (builtins.attrNames environment.volumeMounts))
+    )
+    // builtins.listToAttrs (
+      lib.optionals environment.ownerHome (
+        map (
+          path:
+          let
+            suffix = lib.replaceStrings [ "." "/" ] [ "" "-" ] path;
+          in
+          nameValuePair "resettable-${suffix}" {
+            type = "disk";
+            pool = "atlas";
+            source = "atlas-${name}-home-${suffix}";
+            path = "${ownerHome}/${path}";
+            dependent = "true";
+          }
         ) resettableHomePaths
       )
     );
 
-  environmentDaemons = mapAttrs (
+  incusReconcilers = mapAttrs (
     name: environment:
     let
-      runtimeRoot = environmentRuntimeRoot environment;
-      ownerLayoutId = environmentOwnerLayoutId environment;
-      environmentArguments = environmentArgumentLines name environment;
-      ownerHomeArguments = ownerHomeArgumentLines environment;
-      volumeArguments = volumeArgumentLines environment;
-    in
-    pkgs.writeShellApplication {
-      name = "atlas-environment-${name}";
-      runtimeInputs = [ pkgs.systemd ];
-      text = ''
-        if [ "$(cat ${lib.escapeShellArg (environmentRuntimeReady environment)} 2>/dev/null || true)" != ${lib.escapeShellArg ownerLayoutId} ]; then
-          echo "Atlas environment ${name} requires an explicit reset for the current owner layout" >&2
-          exit 1
-        fi
-        nspawn_arguments=(
-          --quiet
-          --settings=no
-          --boot
-          --notify-ready=yes
-          --keep-unit
-          --register=yes
-          --machine=${lib.escapeShellArg "atlas-${name}"}
-          --directory=${lib.escapeShellArg runtimeRoot}
-          --private-users=pick
-          --private-users-ownership=map
-          --bind-ro=${pkgs.systemd}:/run/atlas-host-systemd
-          --bind-ro=/nix/store:/nix/store
-          --bind-ro=/etc/atlas:/etc/atlas
-          --bind=/run/atlas/control.sock:/run/atlas/control.sock
-        ${environmentArguments}
-        ${ownerHomeArguments}
-        ${volumeArguments}
-        )
-        exec systemd-nspawn "''${nspawn_arguments[@]}"
+      instance = "atlas-${name}";
+      layoutId = environmentLayoutId name environment;
+      ownerHomeDevice = lib.optionalString environment.ownerHome ''
+        incus --force-local config device add ${lib.escapeShellArg instance} owner-home disk \
+          source=${lib.escapeShellArg ownerHomePath} path=${lib.escapeShellArg ownerHome} shift=true
       '';
-    }
-  ) cfg.environments;
-
-  environmentLayoutChecks = mapAttrs (
-    name: environment:
-    let
-      ownerLayoutId = environmentOwnerLayoutId environment;
-    in
-    pkgs.writeShellApplication {
-      name = "atlas-check-owner-layout-${name}";
-      runtimeInputs = [ pkgs.coreutils ];
-      text = ''
-        [ "$(cat ${lib.escapeShellArg (environmentRuntimeReady environment)} 2>/dev/null || true)" = ${lib.escapeShellArg ownerLayoutId} ]
+      ownerHomeVerification = lib.optionalString environment.ownerHome ''
+        require_device_value owner-home source ${lib.escapeShellArg ownerHomePath} || return 1
+        require_device_value owner-home path ${lib.escapeShellArg ownerHome} || return 1
+        require_device_value owner-home shift true || return 1
       '';
-    }
-  ) cfg.environments;
-
-  seedPreparers = mapAttrs (
-    name: environment:
-    let
-      stateParent = environmentStateParent environment;
-      seedRoot = environmentSeed environment;
-      bootstrapTreeForEnvironment = bootstrapTree environment;
-      environmentSeedId = seedId environment;
+      volumeDevices = incusVolumeDeviceCommands name environment;
+      resettableDevices = incusResettableDeviceCommands name environment;
+      resettableCleanup = incusResettableVolumeCleanupCommands name environment;
+      expectedDevicesJson = builtins.toJSON (incusExpectedDevices name environment);
+      provisioner = incusGuestProvisioners.${name};
+      address = environmentIpv4ByName.${name};
     in
     pkgs.writeShellApplication {
-      name = "atlas-prepare-seed-${name}";
+      name = "atlas-incus-reconcile-${name}";
       runtimeInputs = [
-        pkgs.btrfs-progs
         pkgs.coreutils
-        pkgs.findutils
-        pkgs.gnused
-        pkgs.gnutar
-        pkgs.gzip
+        pkgs.incus-lts
+        pkgs.jq
+        pkgs.util-linux
       ];
       text = ''
-        refuse_mounts_below() {
-          local managed_path="$1"
-          local mount_target
-          if [ ! -r /proc/self/mountinfo ]; then
-            echo "Atlas could not inspect mount state" >&2
+        set -eu
+        instance=${lib.escapeShellArg instance}
+
+        require_config_value() {
+          actual="$(
+            printf '%s\n' "$instance_record" \
+              | jq -r --arg key "$1" '.expanded_config[$key] // ""'
+          )"
+          if [ "$actual" != "$2" ]; then
+            echo "Atlas Incus configuration drifted at $1" >&2
             return 1
           fi
-          while IFS=' ' read -r _ _ _ _ mount_target _; do
-            case "$mount_target" in
-              "$managed_path"|"$managed_path"/*)
-                echo "Atlas refused a lifecycle path with mounts below it" >&2
-                return 1
-                ;;
-            esac
-          done < /proc/self/mountinfo
         }
 
-        delete_managed_tree() {
-          local managed_path="$1"
-          if [ ! -e "$managed_path" ]; then
+        require_device_value() {
+          actual="$(
+            printf '%s\n' "$instance_record" \
+              | jq -r --arg device "$1" --arg key "$2" \
+                '.devices[$device][$key] // ""'
+          )"
+          if [ "$actual" != "$3" ]; then
+            echo "Atlas Incus device $1 drifted at $2" >&2
+            return 1
+          fi
+        }
+
+        quarantine_instance() {
+          local failed presence state
+          failed=0
+          if ! presence="$(${incusInventory} instance "$instance")"; then
+            echo "Atlas could not inventory $instance while quarantining it" >&2
+            return 1
+          fi
+          if [ "$presence" = absent ]; then
             return 0
           fi
-          if btrfs subvolume show "$managed_path" >/dev/null 2>&1; then
-            btrfs subvolume delete --recursive --commit-after -- "$managed_path" >/dev/null
-          else
-            rm -rf -- "$managed_path"
+          if ! incus --force-local config set "$instance" boot.autostart=false; then
+            failed=1
+          fi
+          state=""
+          if ! state="$(incus --force-local list ${lib.escapeShellArg "^${instance}$"} --format csv -c s)"; then
+            failed=1
+          fi
+          if [ "$state" != STOPPED ] && ! incus --force-local stop --force "$instance"; then
+            failed=1
+          fi
+          if ! state="$(incus --force-local list ${lib.escapeShellArg "^${instance}$"} --format csv -c s)"; then
+            failed=1
+            state=""
+          fi
+          if [ "$state" != STOPPED ]; then
+            echo "Atlas could not confirm that $instance was quarantined" >&2
+            failed=1
+          fi
+          return "$failed"
+        }
+
+        require_expanded_device_value() {
+          actual="$(
+            printf '%s\n' "$instance_record" \
+              | jq -r --arg device "$1" --arg key "$2" \
+                '.expanded_devices[$device][$key] // ""'
+          )"
+          if [ "$actual" != "$3" ]; then
+            echo "Atlas Incus expanded device $1 drifted at $2" >&2
+            return 1
           fi
         }
 
-        make_private_path() {
-          local pattern="$1"
-          local temporary_path
-          temporary_path="$(mktemp -d --tmpdir=${lib.escapeShellArg stateParent} "$pattern.XXXXXX")"
-          rmdir -- "$temporary_path"
-          printf '%s\n' "$temporary_path"
+        verify_instance_configuration() {
+          expected_devices="$(printf '%s\n' ${lib.escapeShellArg expectedDevicesJson} | jq -cS '.')"
+          actual_devices="$(printf '%s\n' "$instance_record" | jq -cS '.devices')"
+          if [ "$actual_devices" != "$expected_devices" ]; then
+            echo "Atlas Incus managed device inventory drifted" >&2
+            return 1
+          fi
+
+          profiles="$(printf '%s\n' "$instance_record" | jq -c '.profiles')"
+          if [ "$profiles" != '[]' ]; then
+            echo "Atlas Incus instance profiles drifted" >&2
+            return 1
+          fi
+          actual_expanded_devices="$(printf '%s\n' "$instance_record" | jq -cS '.expanded_devices')"
+          if [ "$actual_expanded_devices" != "$expected_devices" ]; then
+            echo "Atlas Incus effective device configuration drifted" >&2
+            return 1
+          fi
+
+          unexpected_config="$(
+            printf '%s\n' "$instance_record" \
+              | jq -r '
+                  .expanded_config | keys[] |
+                  select(
+                    startswith("image.") | not
+                  ) |
+                  select(
+                    startswith("volatile.") | not
+                  ) |
+                  select(. != "boot.autostart") |
+                  select(. != "boot.host_shutdown_action") |
+                  select(. != "linux.sysctl.net.ipv6.conf.all.disable_ipv6") |
+                  select(. != "linux.sysctl.net.ipv6.conf.default.disable_ipv6") |
+                  select(. != "security.guestapi") |
+                  select(. != "security.idmap.isolated") |
+                  select(. != "user.atlas.environment-id") |
+                  select(. != "user.atlas.layout-id")
+                '
+          )"
+          if [ -n "$unexpected_config" ]; then
+            echo "Atlas Incus effective configuration has unexpected keys: $unexpected_config" >&2
+            return 1
+          fi
+
+          require_config_value security.idmap.isolated true || return 1
+          require_config_value security.guestapi false || return 1
+          require_config_value user.atlas.environment-id ${lib.escapeShellArg environment.id} || return 1
+          require_config_value linux.sysctl.net.ipv6.conf.all.disable_ipv6 1 || return 1
+          require_config_value linux.sysctl.net.ipv6.conf.default.disable_ipv6 1 || return 1
+          require_config_value boot.host_shutdown_action force-stop || return 1
+          require_config_value boot.autostart false || return 1
+          require_expanded_device_value root type disk || return 1
+          require_expanded_device_value root path / || return 1
+          require_expanded_device_value root pool atlas || return 1
+          require_device_value eth0 type nic || return 1
+          require_device_value eth0 name eth0 || return 1
+          require_device_value eth0 network atlasbr0 || return 1
+          require_device_value eth0 ipv4.address ${lib.escapeShellArg address} || return 1
+          require_device_value eth0 security.acls atlas-private || return 1
+          require_device_value nix-store source /nix/store || return 1
+          require_device_value nix-store path /nix/store || return 1
+          require_device_value nix-store readonly true || return 1
+          require_device_value atlas-contract source ${lib.escapeShellArg guestContractRoot} || return 1
+          require_device_value atlas-contract path /etc/atlas-host || return 1
+          require_device_value atlas-contract readonly true || return 1
+          require_device_value atlas-control bind instance || return 1
+          require_device_value atlas-control listen unix:/mnt/atlas-control.sock || return 1
+          require_device_value atlas-control connect ${lib.escapeShellArg "unix:/run/atlas/environment-sockets/${name}/control.sock"} || return 1
+          require_device_value atlas-control uid ${toString cfg.owner.uid} || return 1
+          require_device_value atlas-control gid ${toString cfg.owner.uid} || return 1
+          require_device_value atlas-control mode 0660 || return 1
+          ${ownerHomeVerification}
         }
 
-        ${bootstrapTreeForEnvironment}
+        verify_instance() {
+          verify_instance_configuration || return 1
+          require_config_value user.atlas.layout-id ${lib.escapeShellArg layoutId} || return 1
+        }
 
-        if [ -L ${lib.escapeShellArg stateParent} ] || [ ! -d ${lib.escapeShellArg stateParent} ]; then
-          echo "Atlas refused an invalid environment state parent" >&2
-          exit 1
-        fi
-        if [ -L ${lib.escapeShellArg seedRoot} ] || \
-           { [ -e ${lib.escapeShellArg seedRoot} ] && \
-             ! btrfs subvolume show ${lib.escapeShellArg seedRoot} >/dev/null 2>&1; }; then
-          echo "Atlas refused an invalid Btrfs seed" >&2
-          exit 1
-        fi
+        mode="''${1:-ensure}"
+        case "$mode" in
+          ensure|reset)
+            if [ "$#" -ne 0 ] && [ "$#" -ne 1 ]; then
+              echo "Atlas Incus reconciler received unexpected arguments" >&2
+              exit 2
+            fi
+            ;;
+          verify-snapshot)
+            if [ "$#" -ne 3 ] || [ "$2" != "$instance" ]; then
+              echo "Atlas Incus snapshot verifier received invalid arguments" >&2
+              exit 2
+            fi
+            case "$3" in
+              [a-z]|[a-z][a-z0-9-]*) ;;
+              *)
+                echo "Atlas Incus snapshot verifier received an invalid snapshot" >&2
+                exit 2
+                ;;
+            esac
+            if [ "''${#3}" -gt 40 ]; then
+              echo "Atlas Incus snapshot verifier received an invalid snapshot" >&2
+              exit 2
+            fi
+            ;;
+          *)
+            echo "Atlas Incus reconciler accepts ensure, reset, or verify-snapshot" >&2
+            exit 2
+            ;;
+        esac
 
-        shopt -s nullglob
-        private_seed_paths=(
-          ${stateParent}/.deleting-seed.*
-          ${stateParent}/.seed.*
-        )
-        shopt -u nullglob
-        for private_seed_path in "''${private_seed_paths[@]}"; do
-          if [ -L "$private_seed_path" ] || [ ! -d "$private_seed_path" ]; then
-            echo "Atlas refused an invalid private seed path" >&2
+        lifecycle_lock=${lib.escapeShellArg (environmentLock environment)}
+        inherited_lock_fd="''${ATLAS_LIFECYCLE_LOCK_FD:-}"
+        if [ -n "$inherited_lock_fd" ]; then
+          case "$inherited_lock_fd" in
+            *[!0-9]*)
+              echo "Atlas received an invalid inherited lifecycle lock" >&2
+              exit 1
+              ;;
+          esac
+          inherited_lock_path="$(readlink -f "/proc/self/fd/$inherited_lock_fd" 2>/dev/null || true)"
+          if [ "$inherited_lock_path" != "$lifecycle_lock" ]; then
+            echo "Atlas received the wrong inherited lifecycle lock" >&2
             exit 1
           fi
-          refuse_mounts_below "$private_seed_path"
-          delete_managed_tree "$private_seed_path"
-        done
-
-        seed_matches=false
-        if [ -d ${lib.escapeShellArg seedRoot} ] && \
-           [ "$(cat ${lib.escapeShellArg "${seedRoot}/etc/atlas/seed-id"} 2>/dev/null || true)" = ${lib.escapeShellArg environmentSeedId} ] && \
-           [ "$(btrfs property get -ts ${lib.escapeShellArg seedRoot} ro 2>/dev/null || true)" = ro=true ]; then
-          seed_matches=true
+          flock "$inherited_lock_fd"
+        else
+          exec 9>"$lifecycle_lock"
+          flock 9
         fi
 
-        if [ "$seed_matches" = true ]; then
+        # Every mutation takes the environment lock before the global Incus
+        # reconciliation lock. Snapshot operations need only the first lock.
+        exec 8>/run/atlas/locks/incus-reconcile.lock
+        flock 8
+        incus --force-local admin waitready
+
+        if [ "$mode" = verify-snapshot ]; then
+          instance_record="$(
+            incus --force-local query "/1.0/instances/$instance/snapshots/$3"
+          )"
+          if ! verify_instance; then
+            exit 20
+          fi
           exit 0
         fi
 
-        temporary_seed="$(make_private_path .seed)"
-        old_seed=""
-        cleanup_seed() {
-          if [ -n "$temporary_seed" ] && [ -e "$temporary_seed" ]; then
-            delete_managed_tree "$temporary_seed"
+        presence="$(${incusInventory} instance "$instance")"
+        if [ "$presence" = present ]; then
+          actual_layout="$(incus --force-local config get "$instance" user.atlas.layout-id)"
+          if [ "$mode" = ensure ] && [ -n "$actual_layout" ] && [ "$actual_layout" != ${lib.escapeShellArg layoutId} ]; then
+            quarantine_instance
+            echo "Atlas environment ${name} requires an explicit reset for the current instance layout" >&2
+            exit 1
           fi
-        }
-        trap cleanup_seed EXIT
-        btrfs subvolume create "$temporary_seed" >/dev/null
-        bootstrap_tree "$temporary_seed"
-        printf '%s\n' ${lib.escapeShellArg environmentSeedId} > "$temporary_seed/etc/atlas/seed-id"
-        btrfs property set -ts "$temporary_seed" ro true
+          if [ "$mode" = ensure ] && [ "$actual_layout" = ${lib.escapeShellArg layoutId} ]; then
+            instance_record="$(incus --force-local query "/1.0/instances/$instance")"
+            if ! verify_instance; then
+              quarantine_instance
+              echo "Atlas environment ${name} requires an explicit reset after instance drift" >&2
+              exit 1
+            fi
+            if [ "$(incus --force-local list ${lib.escapeShellArg "^${instance}$"} --format csv -c s)" != RUNNING ]; then
+              incus --force-local start "$instance"
+            fi
+            instance_record="$(incus --force-local query "/1.0/instances/$instance")"
+            if ! verify_instance; then
+              quarantine_instance
+              echo "Atlas environment ${name} requires an explicit reset after instance drift" >&2
+              exit 1
+            fi
+            exit 0
+          fi
+          snapshots="$(incus --force-local snapshot list "$instance" --format csv -c n)"
+          if [ -n "$snapshots" ]; then
+            if [ "$mode" = ensure ]; then
+              quarantine_instance
+            fi
+            echo "Atlas refuses to recreate ${name} while named snapshots exist; delete them explicitly before reset" >&2
+            exit 1
+          fi
+          incus --force-local delete --force "$instance"
+        fi
 
-        if [ -e ${lib.escapeShellArg seedRoot} ]; then
-          old_seed="$(make_private_path .deleting-seed)"
-          mv -T -- ${lib.escapeShellArg seedRoot} "$old_seed"
-        fi
-        if ! mv -T -- "$temporary_seed" ${lib.escapeShellArg seedRoot}; then
-          if [ -n "$old_seed" ] && [ -e "$old_seed" ]; then
-            mv -T -- "$old_seed" ${lib.escapeShellArg seedRoot}
+        # A failed create can leave an unattached resettable volume behind.
+        # Those volumes never contain durable owner data and are safe to clear
+        # before reconstructing an incomplete instance.
+        ${resettableCleanup}
+
+        creation_pending=true
+        cleanup_incomplete_creation() {
+          local status="$?"
+          trap - EXIT
+          if [ "$creation_pending" = true ] && ! quarantine_instance; then
+            status=1
           fi
-          exit 1
-        fi
-        temporary_seed=""
-        if [ -n "$old_seed" ] && [ -e "$old_seed" ]; then
-          delete_managed_tree "$old_seed"
-        fi
+          exit "$status"
+        }
+        trap cleanup_incomplete_creation EXIT
+        incus --force-local init ${lib.escapeShellArg incusImageAlias} "$instance" \
+          --no-profiles --storage atlas \
+          --config security.idmap.isolated=true \
+          --config security.guestapi=false \
+          --config user.atlas.environment-id=${lib.escapeShellArg environment.id} \
+          --config linux.sysctl.net.ipv6.conf.all.disable_ipv6=1 \
+          --config linux.sysctl.net.ipv6.conf.default.disable_ipv6=1 \
+          --config boot.autostart=false \
+          --config boot.host_shutdown_action=force-stop
+        incus --force-local config device add "$instance" eth0 nic \
+          name=eth0 network=atlasbr0 ipv4.address=${lib.escapeShellArg address} \
+          security.acls=atlas-private
+        incus --force-local config device add "$instance" nix-store disk \
+          source=/nix/store path=/nix/store readonly=true
+        incus --force-local config device add "$instance" atlas-contract disk \
+          source=${lib.escapeShellArg guestContractRoot} \
+          path=/etc/atlas-host readonly=true
+        incus --force-local config device add "$instance" atlas-control proxy \
+          bind=instance listen=unix:/mnt/atlas-control.sock \
+          connect=unix:${lib.escapeShellArg "/run/atlas/environment-sockets/${name}/control.sock"} \
+          uid=${toString cfg.owner.uid} gid=${toString cfg.owner.uid} mode=0660
+        ${ownerHomeDevice}
+        ${volumeDevices}
+        ${resettableDevices}
+        incus --force-local start "$instance"
+        timeout -k 5 60 incus --force-local exec "$instance" -T -n -- true
+        incus --force-local exec "$instance" -T -n -- \
+          /bin/bash ${provisioner}
+        instance_record="$(incus --force-local query "/1.0/instances/$instance")"
+        verify_instance_configuration
+        incus --force-local config set "$instance" user.atlas.layout-id=${lib.escapeShellArg layoutId}
+        instance_record="$(incus --force-local query "/1.0/instances/$instance")"
+        verify_instance
+        creation_pending=false
         trap - EXIT
       '';
     }
   ) cfg.environments;
 
-  entryLaunchers = mapAttrs (
+  incusResetCommands = mapAttrs (
+    name: _environment:
+    pkgs.writeShellApplication {
+      name = "atlas-incus-reset-${name}";
+      text = ''
+        exec ${incusReconcilers.${name}}/bin/atlas-incus-reconcile-${name} reset
+      '';
+    }
+  ) cfg.environments;
+
+  incusVerifyCommands = mapAttrs (
+    name: _environment:
+    pkgs.writeShellApplication {
+      name = "atlas-incus-verify-${name}";
+      text = ''
+        if [ "$#" -ne 2 ]; then
+          echo "Atlas Incus snapshot verifier requires an instance and snapshot" >&2
+          exit 2
+        fi
+        exec ${incusReconcilers.${name}}/bin/atlas-incus-reconcile-${name} \
+          verify-snapshot "$1" "$2"
+      '';
+    }
+  ) cfg.environments;
+
+  incusEntryLaunchers = mapAttrs (
     name: environment:
     let
-      stateParent = environmentStateParent environment;
-      runtimeRoot = environmentRuntimeRoot environment;
-      runtimeReady = environmentRuntimeReady environment;
-      seedRoot = environmentSeed environment;
-      snapshotsRoot = environmentSnapshots environment;
       environmentShell = environmentShells.${name};
       environmentAssignments = environmentAssignmentLines name environment;
-      ownerLayoutId = environmentOwnerLayoutId environment;
-      bootstrapTreeForEnvironment = bootstrapTree environment;
-      service = environmentServiceUnit name;
-      cgroupPrefix = environmentCgroupPrefix name;
+      instance = "atlas-${name}";
     in
     pkgs.writeShellApplication {
       name = "atlas-enter-${name}";
       runtimeInputs = [
         pkgs.coreutils
-        pkgs.findutils
-        pkgs.gnused
-        pkgs.gnutar
-        pkgs.gzip
-        pkgs.systemd
+        pkgs.incus-lts
         pkgs.util-linux
-      ]
-      ++ lib.optionals btrfsStorage [ pkgs.btrfs-progs ];
+      ];
       text = ''
-                if [ "$#" -eq 1 ] && [ "$1" = "interactive" ]; then
-                  command=(${environmentShell} -i)
-                elif [ "$#" -eq 2 ] && [ "$1" = "command" ]; then
-                  command=(${environmentShell} -c "$2")
-                else
-                  echo "Atlas entry launcher rejected unsupported arguments" >&2
-                  exit 2
-                fi
-                storage_adapter=${lib.escapeShellArg cfg.storage.adapter}
+        if [ "$#" -eq 1 ] && [ "$1" = interactive ]; then
+          incus_flags=()
+          command=(${environmentShell} -i)
+        elif [ "$#" -eq 2 ] && [ "$1" = command ]; then
+          incus_flags=(-T)
+          command=(${environmentShell} -c "$2")
+        else
+          echo "Atlas entry launcher rejected unsupported arguments" >&2
+          exit 2
+        fi
 
-                exec 9>${lib.escapeShellArg (environmentLock environment)}
-                flock 9
+        ${incusReconcilers.${name}}/bin/atlas-incus-reconcile-${name} ensure
 
-                refuse_mounts_below() {
-                  local managed_path="$1"
-                  local mount_target
-                  if [ ! -r /proc/self/mountinfo ]; then
-                    echo "Atlas could not inspect mount state" >&2
-                    return 1
-                  fi
-                  while IFS=' ' read -r _ _ _ _ mount_target _; do
-                    case "$mount_target" in
-                      "$managed_path"|"$managed_path"/*)
-                        echo "Atlas refused a lifecycle path with mounts below it" >&2
-                        return 1
-                        ;;
-                    esac
-                  done < /proc/self/mountinfo
-                }
-
-                delete_managed_tree() {
-                  local managed_path="$1"
-                  if [ ! -e "$managed_path" ]; then
-                    return 0
-                  fi
-                  if [ "$storage_adapter" = btrfs-subvolume ] && \
-                     btrfs subvolume show "$managed_path" >/dev/null 2>&1; then
-                    btrfs subvolume delete --recursive --commit-after -- "$managed_path" >/dev/null
-                  else
-                    rm -rf -- "$managed_path"
-                  fi
-                }
-
-                make_private_path() {
-                  local pattern="$1"
-                  local temporary_path
-                  temporary_path="$(mktemp -d --tmpdir=${lib.escapeShellArg stateParent} "$pattern.XXXXXX")"
-                  rmdir -- "$temporary_path"
-                  printf '%s\n' "$temporary_path"
-                }
-
-                ${bootstrapTreeForEnvironment}
-
-                if [ -L ${lib.escapeShellArg stateParent} ] || [ ! -d ${lib.escapeShellArg stateParent} ]; then
-                  echo "Atlas refused an invalid environment state parent" >&2
-                  exit 1
-                fi
-                if [ -L ${lib.escapeShellArg runtimeRoot} ] || \
-                   { [ -e ${lib.escapeShellArg runtimeRoot} ] && [ ! -d ${lib.escapeShellArg runtimeRoot} ]; }; then
-                  echo "Atlas refused an invalid environment runtime root" >&2
-                  exit 1
-                fi
-                if [ -L ${lib.escapeShellArg runtimeReady} ] || \
-                   { [ -e ${lib.escapeShellArg runtimeReady} ] && [ ! -f ${lib.escapeShellArg runtimeReady} ]; }; then
-                  echo "Atlas refused an invalid environment readiness marker" >&2
-                  exit 1
-                fi
-                if [ -f ${lib.escapeShellArg runtimeReady} ] && \
-                   [ "$(cat ${lib.escapeShellArg runtimeReady})" != ${lib.escapeShellArg ownerLayoutId} ]; then
-                  echo "Atlas environment ${name} requires an explicit reset for the current owner layout" >&2
-                  exit 1
-                fi
-                if [ "$storage_adapter" = btrfs-subvolume ]; then
-                  if [ -e ${lib.escapeShellArg runtimeRoot} ] && \
-                     ! btrfs subvolume show ${lib.escapeShellArg runtimeRoot} >/dev/null 2>&1; then
-                    echo "Atlas refused an environment root that is not a Btrfs subvolume" >&2
-                    exit 1
-                  fi
-                  if [ -L ${lib.escapeShellArg seedRoot} ] || \
-                     { [ -e ${lib.escapeShellArg seedRoot} ] && \
-                       ! btrfs subvolume show ${lib.escapeShellArg seedRoot} >/dev/null 2>&1; }; then
-                    echo "Atlas refused an invalid Btrfs seed" >&2
-                    exit 1
-                  fi
-                  if [ -L ${lib.escapeShellArg snapshotsRoot} ] || \
-                     { [ -e ${lib.escapeShellArg snapshotsRoot} ] && [ ! -d ${lib.escapeShellArg snapshotsRoot} ]; }; then
-                    echo "Atlas refused an invalid snapshots directory" >&2
-                    exit 1
-                  fi
-                  ${seedPreparers.${name}}/bin/atlas-prepare-seed-${name}
-                fi
-
-                if systemctl is-active --quiet ${lib.escapeShellArg service}; then
-                  if [ ! -d ${lib.escapeShellArg runtimeRoot} ] || [ ! -f ${lib.escapeShellArg runtimeReady} ]; then
-                    echo "Atlas refused an active environment with inconsistent runtime state" >&2
-                    exit 1
-                  fi
-                else
-                  refuse_mounts_below ${lib.escapeShellArg runtimeRoot}
-
-                  shopt -s nullglob
-                  ready_markers=(
-                    ${stateParent}/.rootfs-ready.*
-                  )
-                  private_paths=(
-                    ${stateParent}/.deleting-*
-                    ${stateParent}/.rootfs.*
-                    ${stateParent}/.seed.*
-                  )
-                  shopt -u nullglob
-                  for ready_marker in "''${ready_markers[@]}"; do
-                    if [ -L "$ready_marker" ] || [ ! -f "$ready_marker" ]; then
-                      echo "Atlas refused an invalid private lifecycle path" >&2
-                      exit 1
-                    fi
-                    rm -f -- "$ready_marker"
-                  done
-                  for private_path in "''${private_paths[@]}"; do
-                    if [ -L "$private_path" ] || [ ! -d "$private_path" ]; then
-                      echo "Atlas refused an invalid private lifecycle path" >&2
-                      exit 1
-                    fi
-                    refuse_mounts_below "$private_path"
-                    delete_managed_tree "$private_path"
-                  done
-
-                  if { [ -e ${lib.escapeShellArg runtimeRoot} ] && [ ! -f ${lib.escapeShellArg runtimeReady} ]; } || \
-                     { [ ! -e ${lib.escapeShellArg runtimeRoot} ] && [ -e ${lib.escapeShellArg runtimeReady} ]; }; then
-                    delete_managed_tree ${lib.escapeShellArg runtimeRoot}
-                    rm -f -- ${lib.escapeShellArg runtimeReady}
-                  fi
-
-                  if [ ! -f ${lib.escapeShellArg runtimeReady} ]; then
-                    if [ "$storage_adapter" = btrfs-subvolume ]; then
-                      temporary_root="$(make_private_path .rootfs)"
-                      btrfs subvolume snapshot -- ${lib.escapeShellArg seedRoot} "$temporary_root" >/dev/null
-                    else
-                      temporary_root="$(mktemp -d --tmpdir=${lib.escapeShellArg stateParent} .rootfs.XXXXXX)"
-                      bootstrap_tree "$temporary_root"
-                    fi
-                    cleanup() {
-                      delete_managed_tree "$temporary_root"
-                    }
-                    trap cleanup EXIT
-                    mv -T -- "$temporary_root" ${lib.escapeShellArg runtimeRoot}
-                    printf '%s\n' ${lib.escapeShellArg ownerLayoutId} > ${lib.escapeShellArg runtimeReady}
-                    chmod 0600 ${lib.escapeShellArg runtimeReady}
-                    trap - EXIT
-                  fi
-
-                  systemctl start ${lib.escapeShellArg service}
-                fi
-                if [ "$(cat ${lib.escapeShellArg "${runtimeRoot}/usr/lib/atlas/bootstrap-complete"} 2>/dev/null || true)" != ${lib.escapeShellArg ubuntuBootstrapId} ]; then
-                  systemctl stop ${lib.escapeShellArg service} || true
-                  echo "Atlas environment ${name} failed its pinned Ubuntu package bootstrap" >&2
-                  exit 1
-                fi
-
-                leader="$(machinectl show ${lib.escapeShellArg "atlas-${name}"} --property=Leader --value)"
-                if ! [[ "$leader" =~ ^[1-9][0-9]*$ ]]; then
-                  echo "Atlas could not resolve the environment leader" >&2
-                  exit 1
-                fi
-
-                nsenter \
-                  --target "$leader" \
-                  --user \
-                  --mount \
-                  --uts \
-                  --ipc \
-                  --net \
-                  --pid \
-                  --cgroup \
-                  --wdns=/ \
-                  -- \
-                  ${migrateLegacyCaBundles}/bin/atlas-migrate-legacy-ca-bundles
-
-                flock -u 9
-
-                control_group="$(systemctl show ${lib.escapeShellArg service} --property=ControlGroup --value)"
-                case "$control_group" in
-                  ${lib.escapeShellArg cgroupPrefix}|${lib.escapeShellArg "${cgroupPrefix}/"}*) ;;
-                  *)
-                    echo "Atlas refused an environment with an unexpected cgroup" >&2
-                    exit 1
-                    ;;
-                esac
-                session_cgroup="/sys/fs/cgroup''${control_group}/atlas-sessions"
-                mkdir -p -- "$session_cgroup"
-                printf '%s\n' "$$" > "$session_cgroup/cgroup.procs"
-
-                exec nsenter \
-                  --target "$leader" \
-                  --user \
-                  --mount \
-                  --uts \
-                  --ipc \
-                  --net \
-                  --pid \
-                  --cgroup \
-                  --wdns=${lib.escapeShellArg ownerHome} \
-                  -- \
-                  ${pkgs.util-linux}/bin/setpriv \
-                  --reuid=${toString cfg.owner.uid} \
-                  --regid=${toString cfg.owner.uid} \
-                  --clear-groups \
-                  ${pkgs.coreutils}/bin/env -i \
+        exec incus --force-local exec ${lib.escapeShellArg instance} "''${incus_flags[@]}" \
+          --user=${toString cfg.owner.uid} --group=${toString cfg.owner.uid} \
+          --cwd=${lib.escapeShellArg ownerHome} -- \
+          ${pkgs.coreutils}/bin/env -i \
         ${environmentAssignments} \
-                  "''${command[@]}"
+          "''${command[@]}"
       '';
     }
   ) cfg.environments;
+
+  entryLaunchers = incusEntryLaunchers;
 
   entryShells = mapAttrs (
     name: _environment:
@@ -1191,6 +1211,8 @@ let
   reservedMountTrees = [
     "/dev"
     "/etc/atlas"
+    "/etc/atlas-host"
+    "/mnt/atlas-control.sock"
     "/nix/store"
     "/proc"
     "/run/atlas"
@@ -1367,32 +1389,10 @@ in
                 from the environment root.
               '';
             };
-            networkMode = mkOption {
-              default = "shared-host";
-              type = types.enum [ "shared-host" ];
-            };
-            resources = {
-              cpuWeight = mkOption {
-                default = 100;
-                type = types.ints.between 1 10000;
-              };
-              ioWeight = mkOption {
-                default = 100;
-                type = types.ints.between 1 10000;
-              };
-              tasksMax = mkOption {
-                default = 4096;
-                type = types.ints.positive;
-              };
-              memoryMax = mkOption {
-                default = null;
-                type = types.nullOr types.str;
-              };
-            };
           };
         }
       );
-      description = "Named persistent, resettable Atlas environment instances for the nspawn adapter.";
+      description = "Named persistent, resettable Atlas environment instances.";
     };
 
     environmentContract = mkOption {
@@ -1477,8 +1477,8 @@ in
     ];
 
     atlas.host.environmentContract = {
-      version = 6;
-      adapter = if btrfsStorage then "nixos-nspawn-btrfs-v0" else "nixos-nspawn-directory-v0";
+      version = 7;
+      adapter = doctor.adapter;
       baseImage = baseImageRecord;
       composition = doctor.composition;
       identity = doctor.identity;
@@ -1490,7 +1490,76 @@ in
     environment = {
       etc."atlas/control-contract.json".source = controlContractFile;
       shells = builtins.attrValues entryShells;
-      systemPackages = [ atlasControl ] ++ lib.optionals btrfsStorage [ pkgs.btrfs-progs ];
+      systemPackages = [
+        atlasControl
+      ]
+      ++ lib.optionals btrfsStorage [ pkgs.btrfs-progs ]
+      ++ [ pkgs.incus-lts ];
+    };
+
+    security.apparmor.enable = true;
+
+    networking = {
+      nftables.enable = true;
+      firewall.trustedInterfaces = [ "atlasbr0" ];
+      nftables.tables.atlas-host-input = {
+        family = "inet";
+        content = ''
+          chain input {
+            type filter hook input priority 10; policy accept;
+            iifname "atlasbr0" tcp dport 53 accept
+            iifname "atlasbr0" udp dport { 53, 67 } accept
+            iifname "atlasbr0" fib daddr type { local, broadcast, multicast } drop
+          }
+        '';
+      };
+      dhcpcd.denyInterfaces = [
+        "atlasbr0"
+        "veth*"
+      ];
+    };
+
+    virtualisation.incus = {
+      enable = true;
+      package = pkgs.incus-lts;
+      preseed = {
+        storage_pools = [
+          {
+            name = "atlas";
+            driver = if btrfsStorage then "btrfs" else "dir";
+            config.source = "${toString cfg.dataRoot}/incus-pool";
+          }
+        ];
+        networks = [
+          {
+            name = "atlasbr0";
+            type = "bridge";
+            config = {
+              "ipv4.address" = "10.211.0.1/24";
+              "ipv4.nat" = "true";
+              "ipv6.address" = "none";
+            };
+          }
+        ];
+        profiles = [
+          {
+            name = "default";
+            description = "Atlas environment profile";
+            devices = {
+              root = {
+                type = "disk";
+                path = "/";
+                pool = "atlas";
+              };
+              eth0 = {
+                type = "nic";
+                name = "eth0";
+                network = "atlasbr0";
+              };
+            };
+          }
+        ];
+      };
     };
 
     security.sudo = {
@@ -1513,6 +1582,10 @@ in
 
     systemd = {
       services = {
+        # Incus and its preseed must never initialize the pool on the host
+        # filesystem beneath a late (for example nofail provider) data mount.
+        incus.unitConfig.RequiresMountsFor = [ (toString cfg.dataRoot) ];
+
         atlas-storage-prepare = mkIf btrfsStorage {
           description = "Prepare Atlas Btrfs storage";
           requiredBy = [ "atlas-host.target" ];
@@ -1606,6 +1679,189 @@ in
           '';
         };
 
+        atlas-guest-contract = {
+          description = "Publish the guest-visible Atlas control contract";
+          requiredBy = [ "atlas-host.target" ];
+          before = [ "atlas-host.target" ];
+          after = [ "systemd-tmpfiles-setup.service" ];
+          restartTriggers = [ controlContractFile ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          path = [ pkgs.coreutils ];
+          script = ''
+            set -eu
+            next="$(mktemp ${guestContractRoot}/.control-contract.json.XXXXXX)"
+            trap 'rm -f "$next"' EXIT
+            install -m 0644 ${controlContractFile} "$next"
+            mv -f "$next" ${guestContractRoot}/control-contract.json
+            trap - EXIT
+          '';
+        };
+
+        atlas-incus-image = {
+          description = "Import the pinned Atlas Ubuntu image into Incus";
+          requiredBy = [ "atlas-host.target" ];
+          before = [
+            "atlas-incus-network-policy.service"
+            "atlas-host.target"
+          ];
+          requires = [ "incus-preseed.service" ];
+          after = [ "incus-preseed.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          path = [
+            pkgs.coreutils
+            pkgs.incus-lts
+            pkgs.jq
+          ];
+          script = ''
+            set -euo pipefail
+            incus --force-local admin waitready
+            expected_fingerprint="$(
+              cat ${incusImageMetadata} ${incusImageRoot} | sha256sum
+            )"
+            expected_fingerprint="''${expected_fingerprint%% *}"
+            images="$(incus --force-local image list --format json)"
+            matching_images="$(
+              printf '%s\n' "$images" | jq -c \
+                --arg alias ${lib.escapeShellArg incusImageAlias} \
+                '[.[] | select(any(.aliases[]?; .name == $alias))]'
+            )"
+            image_count="$(printf '%s\n' "$matching_images" | jq -r 'length')"
+            if [ "$image_count" = 0 ]; then
+              incus --force-local image import ${incusImageMetadata} ${incusImageRoot} \
+                --alias ${lib.escapeShellArg incusImageAlias}
+              images="$(incus --force-local image list --format json)"
+              matching_images="$(
+                printf '%s\n' "$images" | jq -c \
+                  --arg alias ${lib.escapeShellArg incusImageAlias} \
+                  '[.[] | select(any(.aliases[]?; .name == $alias))]'
+              )"
+              image_count="$(printf '%s\n' "$matching_images" | jq -r 'length')"
+            fi
+            if [ "$image_count" != 1 ]; then
+              echo "Atlas image alias did not resolve to exactly one image" >&2
+              exit 1
+            fi
+            fingerprint="$(printf '%s\n' "$matching_images" | jq -r '.[0].fingerprint')"
+            if [ "$fingerprint" != "$expected_fingerprint" ]; then
+              echo "Atlas image alias does not resolve to the declared image bytes" >&2
+              exit 1
+            fi
+            incus --force-local image set-property ${lib.escapeShellArg incusImageAlias} \
+              user.atlas.content-id=${lib.escapeShellArg incusImageContentId}
+            images="$(incus --force-local image list --format json)"
+            matching_images="$(
+              printf '%s\n' "$images" | jq -c \
+                --arg alias ${lib.escapeShellArg incusImageAlias} \
+                '[.[] | select(any(.aliases[]?; .name == $alias))]'
+            )"
+            content_id="$(
+              printf '%s\n' "$matching_images" \
+                | jq -r '.[0].properties["user.atlas.content-id"] // ""'
+            )"
+            if [ "$content_id" != ${lib.escapeShellArg incusImageContentId} ]; then
+              echo "Atlas image alias does not match the declared image content" >&2
+              exit 1
+            fi
+          '';
+        };
+
+        atlas-incus-inventory = {
+          description = "Quarantine undeclared Atlas Incus environments";
+          requiredBy = [ "atlas-host.target" ];
+          before = [
+            "atlas-host.target"
+          ]
+          ++ builtins.map (name: "${environmentServiceName name}.service") environmentNames;
+          requires = [ "incus-preseed.service" ];
+          after = [ "incus-preseed.service" ];
+          restartTriggers = [ incusDeclaredInstances ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          path = [
+            pkgs.coreutils
+            pkgs.gnugrep
+            pkgs.incus-lts
+            pkgs.util-linux
+          ];
+          script = ''
+            set -eu
+            incus --force-local admin waitready
+            instances="$(${incusInventory} instance)"
+            while IFS= read -r instance; do
+              [ -n "$instance" ] || continue
+              if grep -Fqx -- "$instance" ${incusDeclaredInstances}; then
+                continue
+              fi
+
+              environment_id="$(incus --force-local config get "$instance" user.atlas.environment-id)"
+              if ! printf '%s\n' "$environment_id" | grep -Eq \
+                '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+                echo "Atlas-marked instance $instance has no valid environment identity" >&2
+                exit 1
+              fi
+              exec 9>"/run/atlas/locks/$environment_id.lock"
+              flock 9
+
+              exec 8>/run/atlas/locks/incus-reconcile.lock
+              flock 8
+              presence="$(${incusInventory} instance "$instance")"
+              if [ "$presence" != present ]; then
+                echo "Atlas-marked instance $instance disappeared during inventory" >&2
+                exit 1
+              fi
+              current_environment_id="$(
+                incus --force-local config get "$instance" user.atlas.environment-id
+              )"
+              if [ "$current_environment_id" != "$environment_id" ]; then
+                echo "Atlas-marked instance $instance changed identity during inventory" >&2
+                exit 1
+              fi
+              incus --force-local config set "$instance" boot.autostart=false
+              state="$(incus --force-local list "^$instance$" --format csv -c s)"
+              if [ "$state" != STOPPED ]; then
+                incus --force-local stop --force "$instance"
+                state="$(incus --force-local list "^$instance$" --format csv -c s)"
+              fi
+              if [ "$state" != STOPPED ]; then
+                echo "Atlas-marked instance $instance did not stop during inventory" >&2
+                exit 1
+              fi
+              flock -u 8
+              flock -u 9
+            done <<< "$instances"
+          '';
+        };
+
+        atlas-incus-network-policy = {
+          description = "Apply the Atlas private environment network policy";
+          requiredBy = [ "atlas-host.target" ];
+          before = [ "atlas-host.target" ];
+          requires = [ "atlas-incus-image.service" ];
+          after = [ "atlas-incus-image.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          path = [ pkgs.incus-lts ];
+          script = ''
+            set -eu
+            presence="$(${incusInventory} acl atlas-private)"
+            if [ "$presence" = present ]; then
+              incus --force-local network acl edit atlas-private < ${incusPrivateAclFile}
+            else
+              incus --force-local network acl create atlas-private < ${incusPrivateAclFile}
+            fi
+          '';
+        };
+
         atlas-host-contract = mkIf btrfsStorage {
           requires = [
             "atlas-storage-prepare.service"
@@ -1641,24 +1897,13 @@ in
           description = "Atlas root-only lifecycle management service";
           after = [ "atlas-host-contract.service" ];
           serviceConfig = {
-            ExecStart = "${atlasControl}/bin/atlas serve --management --systemctl ${pkgs.systemd}/bin/systemctl --btrfs ${pkgs.btrfs-progs}/bin/btrfs";
+            ExecStart = "${atlasControl}/bin/atlas serve --management --incus ${pkgs.incus-lts}/bin/incus${lib.optionalString btrfsStorage " --btrfs ${pkgs.btrfs-progs}/bin/btrfs"}";
             User = "root";
             Group = "root";
             Slice = "atlas-control.slice";
-            AmbientCapabilities = [
-              "CAP_CHOWN"
-              "CAP_DAC_OVERRIDE"
-              "CAP_FSETID"
-              "CAP_FOWNER"
-            ]
-            ++ lib.optional btrfsStorage "CAP_SYS_ADMIN";
-            CapabilityBoundingSet = [
-              "CAP_CHOWN"
-              "CAP_DAC_OVERRIDE"
-              "CAP_FSETID"
-              "CAP_FOWNER"
-            ]
-            ++ lib.optional btrfsStorage "CAP_SYS_ADMIN";
+            AmbientCapabilities = [ ];
+            # Traverse owner-only data paths and query Btrfs subvolume UUIDs.
+            CapabilityBoundingSet = [ "CAP_DAC_READ_SEARCH" ] ++ lib.optional btrfsStorage "CAP_SYS_ADMIN";
             LockPersonality = true;
             NoNewPrivileges = true;
             PrivateDevices = true;
@@ -1668,41 +1913,64 @@ in
             ProtectKernelModules = true;
             ProtectKernelTunables = true;
             ProtectSystem = "strict";
-            ReadWritePaths = [
-              "${toString cfg.dataRoot}/environments"
-              "/run/atlas/locks"
-            ];
+            ReadWritePaths = [ "/run/atlas/locks" ];
             Restart = "on-failure";
             RestrictAddressFamilies = [ "AF_UNIX" ];
+            RestrictSUIDSGID = true;
           };
         };
       }
       // mapAttrs' (
-        name: environment:
+        name: _environment:
         nameValuePair (environmentServiceName name) {
-          description = "Persistent Atlas environment ${name}";
+          description = "Persistent Atlas Incus environment ${name}";
+          requiredBy = [ "atlas-host.target" ];
+          before = [ "atlas-host.target" ];
           requires = [
             "atlas-control.socket"
+            "atlas-guest-contract.service"
+            "atlas-incus-network-policy.service"
+            "atlas-incus-inventory.service"
             "atlas-owner-home-prepare.service"
+            "${environmentControlServiceName name}.socket"
           ];
           after = [
             "atlas-control.socket"
+            "atlas-guest-contract.service"
+            "atlas-incus-network-policy.service"
+            "atlas-incus-inventory.service"
             "atlas-owner-home-prepare.service"
+            "${environmentControlServiceName name}.socket"
           ];
           restartTriggers = [ environmentConfigFiles.${name} ];
-          unitConfig.RequiresMountsFor = [ (environmentStateParent environment) ];
           serviceConfig = {
-            Type = "notify";
-            NotifyAccess = "all";
-            ExecCondition = "${environmentLayoutChecks.${name}}/bin/atlas-check-owner-layout-${name}";
-            ExecStart = "${environmentDaemons.${name}}/bin/atlas-environment-${name}";
-            Slice = sliceUnit name;
-            Delegate = true;
-            KillMode = "mixed";
-            Restart = "on-failure";
-            RestartSec = "1s";
-            TimeoutStartSec = "2min";
-            TimeoutStopSec = "30s";
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = "${incusReconcilers.${name}}/bin/atlas-incus-reconcile-${name} ensure";
+            TimeoutStartSec = "10min";
+          };
+        }
+      ) cfg.environments
+      // mapAttrs' (
+        name: _environment:
+        nameValuePair (environmentControlServiceName name) {
+          description = "Atlas environment-bound control listener for ${name}";
+          serviceConfig = {
+            ExecStart = "${atlasControl}/bin/atlas serve --environment ${name}";
+            User = "root";
+            Group = "root";
+            Slice = "atlas-control.slice";
+            LockPersonality = true;
+            NoNewPrivileges = true;
+            PrivateDevices = true;
+            PrivateTmp = true;
+            ProtectControlGroups = true;
+            ProtectHome = true;
+            ProtectKernelModules = true;
+            ProtectKernelTunables = true;
+            ProtectSystem = "strict";
+            RestrictAddressFamilies = [ "AF_UNIX" ];
+            RestrictSUIDSGID = true;
           };
         }
       ) cfg.environments;
@@ -1713,7 +1981,7 @@ in
           wantedBy = [ "atlas-host.target" ];
           before = [ "atlas-host.target" ];
           socketConfig = {
-            ListenStream = "/run/atlas/control.sock";
+            ListenStream = "/run/atlas/public/control.sock";
             SocketMode = "0666";
             DirectoryMode = "0755";
             RemoveOnStop = true;
@@ -1731,26 +1999,28 @@ in
             RemoveOnStop = true;
           };
         };
-      };
-
-      slices = mapAttrs' (
-        name: environment:
-        nameValuePair (sliceName name) {
-          sliceConfig = {
-            CPUWeight = environment.resources.cpuWeight;
-            IOWeight = environment.resources.ioWeight;
-            TasksMax = environment.resources.tasksMax;
-          }
-          // optionalAttrs (environment.resources.memoryMax != null) {
-            MemoryMax = environment.resources.memoryMax;
+      }
+      // mapAttrs' (
+        name: _environment:
+        nameValuePair (environmentControlServiceName name) {
+          description = "Atlas environment-bound control socket for ${name}";
+          socketConfig = {
+            ListenStream = "/run/atlas/environment-sockets/${name}/control.sock";
+            SocketMode = "0600";
+            DirectoryMode = "0700";
+            RemoveOnStop = true;
           };
         }
       ) cfg.environments;
 
       tmpfiles.rules = [
         "d /run/atlas 0755 root root - -"
+        "d /run/atlas/public 0755 root root - -"
+        "d /run/atlas/environment-sockets 0700 root root - -"
+        "d ${guestContractRoot} 0755 root root - -"
         "d /run/atlas/entry-users 0711 root root - -"
         "d /run/atlas/locks 0700 root root - -"
+        "d /var/lib/incus/security/apparmor/profiles 0700 root root - -"
       ]
       ++ concatMap (
         name:
@@ -1760,8 +2030,7 @@ in
         in
         [
           "d ${loginHome environment} 0700 ${user} ${user} - -"
-          "d ${environmentStateParent environment} 0700 root root - -"
-          "d ${environmentSnapshots environment} 0700 root root - -"
+          "d /run/atlas/environment-sockets/${name} 0700 root root - -"
         ]
       ) environmentNames
       ++ [ "d ${builtins.dirOf ownerHomePath} 0711 root root - -" ]

@@ -1,17 +1,17 @@
 # Incus substrate evaluation
 
-Status: selected Environment substrate; adapter integration and physical-image
-qualification remain incomplete
+Status: selected and integrated Environment substrate; physical-image
+qualification remains incomplete
 
 Date: August 31, 2026
 
 ## Decision
 
-Select Incus 7.0 LTS, as patched by the pinned NixOS package set, as the default
-Atlas Environment substrate. Implement it behind the existing Atlas lifecycle
-boundary. Keep the current systemd-nspawn and Btrfs implementation only as a
-temporary reference until the Incus-backed adapter passes the existing control,
-reset, snapshot, update, and installed-host contracts.
+Select Incus 7.0 LTS, as patched by the pinned NixOS package set, as the Atlas
+Environment substrate behind the existing lifecycle boundary. The integrated
+adapter now passes the control, entry, persistence, reset, snapshot, private
+network configuration, and daemon-recovery host contract. The former nspawn
+substrate has been removed rather than retained as a fallback.
 
 This decision completes the substrate spike. The remaining work is adapter
 implementation and product qualification, not another substrate selection
@@ -32,11 +32,20 @@ repository's own runtime proof.
 
 ## Ubuntu image decision
 
-The existing Atlas image and the Incus proof image are both Ubuntu Noble 24.04
-LTS. The existing adapter pins Canonical's `20260810` Noble OCI root filesystem;
-the Incus proof pins the Linux Containers `20260829_07:42` Noble `default`
-system image. The 19-day difference is incidental and did not cause the
-compatibility problem.
+The retired prototype image and the Incus image were both Ubuntu Noble 24.04
+LTS. The prototype pinned Canonical's `20260810` Noble OCI root filesystem; the
+Incus adapter pins the Linux Containers `20260829_07:42` Noble `default` system
+image. The 19-day difference was incidental and did not cause the compatibility
+problem.
+
+The upstream daily-build URLs have expired. Atlas retains the unchanged amd64
+and arm64 metadata and rootfs in the dedicated
+[Ubuntu Noble image release](https://github.com/lydakis/atlas/releases/tag/ubuntu-noble-20260829-0742).
+The original SHA-256 pins, Incus image identities, and Nix output names remain
+unchanged. Image assets must never be overwritten or deleted from an existing
+release; future image updates require a new release tag and hash pins. The
+release records the upstream URLs and checksums. This retention mirror does
+not replace the later image provenance and update qualification work.
 
 Ubuntu 26.04 is now the newest LTS. Atlas is not switching guest releases inside
 the backend migration because 24.04 is the release proven by both adapters and
@@ -56,10 +65,11 @@ Atlas will therefore:
 
 - keep Ubuntu 24.04 LTS for the first Incus adapter rather than couple the
   backend migration to an OS-major upgrade
-- consume an exact fingerprint of the Incus team's Noble system image and
-  materialize its metadata and rootfs with pinned hashes
-- disable floating alias updates and advance the image deliberately through the
-  Atlas contract suite and security review
+- materialize the Incus team's Noble image metadata and rootfs with pinned
+  hashes, then derive the Atlas image identity and local alias from that hash
+  tuple
+- rebind the local alias to the pinned content on import and advance the image
+  deliberately through the Atlas contract suite and security review
 - treat the Incus daemon LTS and the guest Ubuntu LTS as independent version
   tracks
 - decide before physical alpha whether the Linux Containers community image is
@@ -126,13 +136,16 @@ authority model.
 
 ## Runtime evidence
 
-`nixos/tests/incus-substrate.nix` boots a nested x86_64 NixOS host under KVM and
-uses a pinned Ubuntu Noble system image without runtime image-network access.
-The hardened proof passed with the NixOS default Incus LTS 7.0.1 package. An
-earlier run of the core matrix and reboot contract also passed with Incus 7.3.
-Atlas should start on the NixOS LTS track and consume its backported security
-patches rather than selecting the feature track for version number alone. The
-proof currently validates:
+`nixos/tests/incus-substrate.nix` boots a nested x86_64 NixOS substrate under
+KVM, `nixos/tests/host-contract.nix` exercises the integrated Atlas adapter,
+and `nixos/tests/installed-host.nix` exercises that adapter across a real host
+reboot on the installed-disk layout. All use a pinned Ubuntu Noble system image
+without runtime image-network access. The hardened proofs passed with the
+NixOS default Incus LTS 7.0.1 package. An earlier run of the substrate core
+matrix and reboot contract also passed with Incus 7.3. Atlas should start on
+the NixOS LTS track and consume its backported security patches rather than
+selecting the feature track for version number alone. Together, the proofs
+currently validate:
 
 - an Incus Btrfs pool on the elastic Atlas data filesystem
 - AppArmor enabled on the host and unprivileged containers with distinct,
@@ -146,18 +159,32 @@ proof currently validates:
   instance restart
 - snapshot restore removing later root and dependent-volume changes while
   preserving later writes to the independent durable volume
+- reset refusing to destroy an instance while named snapshots remain
 - delete and recreation removing resettable drift while preserving the durable
   owner volume; observed recreation took 14.6 to 20.3 seconds across KVM runs
 - Incus daemon restart leaving both running instances and their process IDs
   intact
+- fail-closed live-device verification, automatic reconstruction after an
+  interrupted readiness marker, and exact reconciliation of the shared NIC ACL
+- Btrfs subvolume-UUID verification for durable storage plus a
+  generation-stable guest contract directory that follows atomic contract
+  replacement without remounting the instance
+- activation-time quarantine of an undeclared Atlas instance without deleting
+  its recoverable state, plus shared lifecycle locking between system
+  reconciliation, reset, and snapshots
+- a writable resettable global Git configuration and a single public control
+  endpoint at `/run/atlas/public/control.sock`
 - default bridge reachability between environments before policy
 - an Incus NIC ACL blocking the other environment, host bridge, RFC 1918 LAN,
-  tailnet, and link-local metadata destinations while allowing the intended
-  external test destination
+  tailnet, and link-local metadata destinations; the host firewall also blocks
+  a public-class address assigned locally, while a separate routed namespace
+  proves that forwarded public-class traffic remains allowed
 - explicit guest IPv6 disablement so link-local IPv6 does not bypass the IPv4
   policy proof
-- host reboot autostart, persistent root and volume state, and loss of volatile
-  listeners
+- host reboot startup in the integrated installed-host proof through
+  Atlas-owned systemd reconciliation, with Incus autostart disabled and
+  persistent root and volume state; the substrate proof separately verifies
+  that instance restart drops volatile listeners
 
 The test deliberately disables the instance guest API and verifies that neither
 the Incus administrative socket nor the guest API socket is present inside an
@@ -173,8 +200,9 @@ The working configuration also needs:
 - AppArmor enabled and the Incus AppArmor profile directory created before the
   daemon starts
 - host DHCP excluded from the Incus bridge and its `veth` devices
-- the Incus bridge trusted by the NixOS host firewall so DHCP and host-bound
-  bridge traffic reach Incus's own nftables policy
+- early Incus bridge trust so DHCP is not rejected as stale conntrack state,
+  followed by a later Atlas nftables input chain that allows only bridge DNS
+  and DHCP while dropping other host-local, broadcast, and multicast traffic
 - nftables rather than legacy iptables
 - automation commands with explicit timeouts, hard kill-after bounds, and
   `incus exec -T -n`
@@ -193,14 +221,14 @@ Incus projects and its remote API are not needed for the first adapter. Atlas
 should preserve its peer-derived local control protocol and use the local Incus
 API as an internal mechanism. Pairing and private routes remain Atlas concerns.
 
-## Qualification gates after selection
+## Remaining qualification gates
 
 1. Define the reproducible, provenance-checked system-image pipeline described
    above. The current proof's pinned image is sufficient for adapter work, not
    yet the physical release provenance decision.
-2. Implement an Incus-backed environment through the existing lifecycle seam
-   and pass the current Atlas control and installed-host contracts without
-   weakening kernel-derived identity or root-only lifecycle authority.
+2. Extend the adapter's KVM network assertions from namespace and applied-policy
+   evidence to the complete allowed-and-denied connection matrix required by
+   the private-networking roadmap proof.
 3. Prove update, rollback, backup, restore, power-loss, storage exhaustion, and
    recovery behavior. The current proof covers snapshots and reboot, not those
    failure modes.
@@ -209,6 +237,6 @@ API as an internal mechanism. Pairing and private routes remain Atlas concerns.
 5. Re-run the security review against the exact pinned Incus and NixOS patch set
    used by the physical image.
 
-Incus is selected now. These gates determine when it replaces the current
-adapter and when the managed physical image can ship; they do not reopen the
-substrate decision unless the implementation fails a product contract.
+Incus is selected and integrated now. These gates determine when the managed
+physical image can ship; they do not reopen the substrate decision unless the
+implementation fails a product contract.

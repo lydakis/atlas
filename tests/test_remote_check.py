@@ -60,7 +60,7 @@ class RemoteCheckTests(unittest.TestCase):
         output = self.run_remote_check()
 
         self.assertIn(f"ERRAND_CWD={self.workspace.resolve()}", output)
-        self.assertIn("'--on', 'cabal', '--', '/usr/bin/nix'", output)
+        self.assertIn("'--on', 'cabal', '--no-apply', '--', '/usr/bin/nix'", output)
         self.assertIn("'flake', 'check', 'path:.'", output)
 
     def test_build_rewrites_local_flake_and_allows_destination_override(self):
