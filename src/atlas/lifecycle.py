@@ -15,6 +15,7 @@ from typing import Any
 
 DEFAULT_LOCK_ROOT = "/run/atlas/locks"
 INCUS_QUERY_TIMEOUT_SECONDS = 60
+STORAGE_QUERY_TIMEOUT_SECONDS = 60
 MAX_INCUS_DIAGNOSTIC_BYTES = 4096
 SNAPSHOT_CONFIGURATION_MISMATCH = 20
 VolumeFingerprint = (
@@ -175,13 +176,21 @@ def _run_verify_command(
 def _btrfs_subvolume_uuid(path: Path, btrfs: str | None) -> str | None:
     if btrfs is None:
         return None
-    result = subprocess.run(
-        [btrfs, "subvolume", "show", str(path)],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [btrfs, "subvolume", "show", str(path)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=STORAGE_QUERY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        # This can occur after mutation too: do not claim preservation or infer
+        # a directory identity from incomplete Btrfs output.
+        raise ControlOperationError(
+            "storage_timeout", "storage identity query timed out; preservation is unverified"
+        ) from error
     if result.returncode != 0:
         raise RuntimeError("Atlas could not verify a Btrfs subvolume identity")
     match = re.search(

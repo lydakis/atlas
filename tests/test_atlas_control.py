@@ -660,6 +660,46 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             ):
                 lifecycle.reset(environment)
 
+    def test_btrfs_timeout_never_reports_preservation_or_starts_later_mutation(self):
+        for method in ("reset", "restore_snapshot"):
+            for fingerprint_index in range(4):
+                with self.subTest(method=method, fingerprint=fingerprint_index), tempfile.TemporaryDirectory() as directory:
+                    lifecycle, environment, durable_home = self.fixture(directory)
+                    lifecycle.btrfs = "/bin/btrfs"
+                    fingerprints = 0
+                    mutations = 0
+
+                    def run(command, **kwargs):
+                        nonlocal fingerprints, mutations
+                        if command[0] == "/bin/btrfs":
+                            self.assertEqual(kwargs.get("timeout"), 60)
+                            current = fingerprints
+                            fingerprints += 1
+                            if current == fingerprint_index:
+                                raise subprocess.TimeoutExpired(
+                                    command, 60,
+                                    output=b"UUID: 11111111-1111-4111-8111-111111111111\n",
+                                )
+                            return subprocess.CompletedProcess(
+                                command, 0,
+                                stdout="UUID: 11111111-1111-4111-8111-111111111111\n",
+                                stderr="",
+                            )
+                        if command[0] == "/nix/store/atlas-reconcile-shared-dev" or "restore" in command:
+                            mutations += 1
+                        return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
+
+                    with mock.patch("atlas.lifecycle.subprocess.run", side_effect=run):
+                        with self.assertRaises(ControlOperationError) as raised:
+                            arguments = ("checkpoint",) if method == "restore_snapshot" else ()
+                            getattr(lifecycle, method)(environment, *arguments)
+                    self.assertEqual(raised.exception.code, "storage_timeout")
+                    self.assertEqual(mutations, int(fingerprint_index >= 2))
+                    self.assertEqual(fingerprints, fingerprint_index + 1)
+                    self.assertEqual((durable_home / "repository").read_text(), "durable")
+                    with (Path(lifecycle.lock_root) / f"{environment['id']}.lock").open() as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def test_reset_fails_closed_if_btrfs_identity_is_unreadable(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             lifecycle, environment, _durable_home = self.fixture(temporary_directory)

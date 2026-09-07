@@ -119,8 +119,13 @@ proof until its prerequisites have been demonstrated.
   without waiting: contention returns `lifecycle_busy` before any command runs,
   leaving the active operation's lock intact. Tests cover contention for reset
   and all snapshot entry points, then a successful snapshot query after release.
-  This does not bound shell-level `admin waitready` or lock waits, Btrfs
-  fingerprint commands, reset/verification scripts, or
+  Btrfs identity subprocesses also have a 60-second timeout and discard partial
+  output. Tests cover owner-home and volume query timeouts before and after reset
+  and restore: pre-mutation failure prevents mutation; post-mutation failure
+  returns `storage_timeout` without claiming preservation or retrying mutation.
+  This is a subprocess timeout, not a guarantee against uninterruptible kernel
+  I/O or a deadline on filesystem path checks. This does not bound shell-level
+  `admin waitready` or lock waits, reset/verification scripts, or
   mutations yet. Mutation deadlines must account for server-side work continuing
   after the CLI exits before releasing authority to another lifecycle operation.
   Per-environment lifecycle locks now precede the global Incus
