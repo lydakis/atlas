@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -16,6 +17,7 @@ from typing import Any
 DEFAULT_LOCK_ROOT = "/run/atlas/locks"
 INCUS_QUERY_TIMEOUT_SECONDS = 60
 STORAGE_QUERY_TIMEOUT_SECONDS = 60
+SNAPSHOT_VERIFY_TIMEOUT_SECONDS = 60
 MAX_INCUS_DIAGNOSTIC_BYTES = 4096
 SNAPSHOT_CONFIGURATION_MISMATCH = 20
 VolumeFingerprint = (
@@ -142,20 +144,38 @@ def _run_reset_command(command: str, lock_fd: int) -> None:
         )
 
 
-def _run_verify_command(
-    command: str, lock_fd: int, instance: str, snapshot: str
-) -> None:
+def _run_verifier(arguments: list[str], lock_fd: int) -> subprocess.CompletedProcess:
     environment = os.environ.copy()
     environment["ATLAS_LIFECYCLE_LOCK_FD"] = str(lock_fd)
-    result = subprocess.run(
-        [command, instance, snapshot],
-        check=False,
+    # The trusted verifier runs shell children which inherit the lifecycle lock.
+    # Give it a private process group so timeout kills those children as well.
+    with subprocess.Popen(
+        arguments,
         env=environment,
         pass_fds=(lock_fd,),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
-    )
+        start_new_session=True,
+    ) as process:
+        try:
+            _, diagnostic = process.communicate(timeout=SNAPSHOT_VERIFY_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise ControlOperationError(
+                "incus_timeout", "snapshot verification timed out; restore was not started"
+            ) from error
+        return subprocess.CompletedProcess(arguments, process.returncode, stderr=diagnostic)
+
+
+def _run_verify_command(
+    command: str, lock_fd: int, instance: str, snapshot: str
+) -> None:
+    result = _run_verifier([command, instance, snapshot], lock_fd)
     if result.returncode != 0:
         diagnostic = _bounded_diagnostic(result.stderr)
         if diagnostic:

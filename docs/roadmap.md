@@ -124,8 +124,14 @@ proof until its prerequisites have been demonstrated.
   and restore: pre-mutation failure prevents mutation; post-mutation failure
   returns `storage_timeout` without claiming preservation or retrying mutation.
   This is a subprocess timeout, not a guarantee against uninterruptible kernel
-  I/O or a deadline on filesystem path checks. This does not bound shell-level
-  `admin waitready` or lock waits, reset/verification scripts, or
+  I/O or a deadline on filesystem path checks. Snapshot verification invoked by
+  Python now has a 60-second subprocess timeout covering its shell lock waits
+  and queries. Timeout kills the verifier's private process group, discards its
+  output, and returns `incus_timeout` without starting restore. Local process
+  tests cover an exited leader whose child retains the lock and stderr pipe,
+  and preservation of normal verifier exit status and diagnostics. This does
+  not bound standalone reconciliation's `admin waitready` or lock waits, reset
+  scripts, or
   mutations yet. Mutation deadlines must account for server-side work continuing
   after the CLI exits before releasing authority to another lifecycle operation.
   Per-environment lifecycle locks now precede the global Incus

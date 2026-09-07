@@ -4,6 +4,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +22,7 @@ from atlas.lifecycle import (  # noqa: E402
     MAX_INCUS_DIAGNOSTIC_BYTES,
     ControlOperationError,
     EnvironmentLifecycle,
+    _run_verifier,
 )
 
 
@@ -689,7 +691,10 @@ class EnvironmentLifecycleTests(unittest.TestCase):
                             mutations += 1
                         return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
 
-                    with mock.patch("atlas.lifecycle.subprocess.run", side_effect=run):
+                    with (
+                        mock.patch("atlas.lifecycle.subprocess.run", side_effect=run),
+                        mock.patch("atlas.lifecycle._run_verifier", return_value=subprocess.CompletedProcess([], 0, stderr="")),
+                    ):
                         with self.assertRaises(ControlOperationError) as raised:
                             arguments = ("checkpoint",) if method == "restore_snapshot" else ()
                             getattr(lifecycle, method)(environment, *arguments)
@@ -734,9 +739,11 @@ class EnvironmentLifecycleTests(unittest.TestCase):
                     list_result,
                     subprocess.CompletedProcess([], 0, stderr=""),
                     subprocess.CompletedProcess([], 0, stderr=""),
-                    subprocess.CompletedProcess([], 0, stderr=""),
                 ],
-            ) as run:
+            ) as run, mock.patch(
+                "atlas.lifecycle._run_verifier",
+                return_value=subprocess.CompletedProcess([], 0, stderr=""),
+            ):
                 lifecycle.create_snapshot(environment, "baseline")
                 self.assertEqual(
                     lifecycle.list_snapshots(environment), ["baseline", "later"]
@@ -762,11 +769,6 @@ class EnvironmentLifecycleTests(unittest.TestCase):
                         "list",
                         "atlas-shared-dev",
                         "--format=json",
-                    ],
-                    [
-                        "/nix/store/atlas-verify-shared-dev",
-                        "atlas-shared-dev",
-                        "baseline",
                     ],
                     [
                         "/bin/incus",
@@ -796,7 +798,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "atlas.lifecycle.subprocess.run", return_value=stale_layout
+                    "atlas.lifecycle._run_verifier", return_value=stale_layout
                 ) as run,
                 self.assertRaises(ControlOperationError) as raised,
             ):
@@ -810,12 +812,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
                     "atlas-shared-dev",
                     "baseline",
                 ],
-                check=False,
-                env=mock.ANY,
-                pass_fds=mock.ANY,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
+                mock.ANY,
             )
 
     def test_snapshot_restore_reports_verifier_infrastructure_failure(self):
@@ -826,13 +823,67 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             )
 
             with (
-                mock.patch("atlas.lifecycle.subprocess.run", return_value=failed),
+                mock.patch("atlas.lifecycle._run_verifier", return_value=failed),
                 self.assertRaises(ControlOperationError) as raised,
             ):
                 lifecycle.restore_snapshot(environment, "baseline")
 
             self.assertEqual(raised.exception.code, "incus_failed")
             self.assertEqual(raised.exception.message, "Incus could not verify the snapshot")
+
+    def test_verifier_receives_lock_and_preserves_exit_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (Path(directory) / "lock").open("w") as lock:
+                result = _run_verifier([
+                    sys.executable, "-c",
+                    "import os, sys; os.fstat(int(os.environ['ATLAS_LIFECYCLE_LOCK_FD'])); "
+                    "print('verification diagnostic', file=sys.stderr); sys.exit(20)",
+                ], lock.fileno())
+            self.assertEqual(result.returncode, 20)
+            self.assertEqual(result.stderr, "verification diagnostic\n")
+
+    def test_verifier_timeout_kills_lock_holding_child_and_prevents_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lifecycle, environment, _home = self.fixture(directory)
+            ready = Path(directory) / "child-ready"
+            child = (
+                "import pathlib, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"pathlib.Path({str(ready)!r}).touch(); time.sleep(10)"
+            )
+            # The leader exits immediately; its child retains stderr and the
+            # inherited lock. Killing only the leader cannot clean this up.
+            leader = (
+                "import os, subprocess, sys; "
+                "fd = int(os.environ['ATLAS_LIFECYCLE_LOCK_FD']); "
+                f"subprocess.Popen([sys.executable, '-c', {child!r}], pass_fds=(fd,))"
+            )
+
+            def verify(_arguments, lock_fd):
+                return _run_verifier([sys.executable, "-c", leader], lock_fd)
+
+            with (
+                mock.patch("atlas.lifecycle.SNAPSHOT_VERIFY_TIMEOUT_SECONDS", 2),
+                mock.patch("atlas.lifecycle._run_verifier", side_effect=verify),
+                mock.patch("atlas.lifecycle.subprocess.run") as run,
+            ):
+                with self.assertRaises(ControlOperationError) as raised:
+                    lifecycle.restore_snapshot(environment, "baseline")
+                self.assertEqual(raised.exception.code, "incus_timeout")
+                run.assert_not_called()
+            self.assertTrue(ready.exists(), "verifier child did not start")
+            # Allow the killed child to be scheduled out. Its inherited open
+            # file description must no longer hold authority after cleanup.
+            with (Path(lifecycle.lock_root) / f"{environment['id']}.lock").open() as lock:
+                deadline = time.monotonic() + 1
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            self.fail("verifier child retained the lifecycle lock")
+                        time.sleep(0.01)
 
     def test_runtime_rejects_non_incus_and_untrusted_reconcile_commands(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
