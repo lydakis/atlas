@@ -20,6 +20,7 @@ from .lifecycle import (
     EnvironmentLifecycle,
 )
 from .operations import OperationStore, assert_admitted
+from .controllers import ControllerStore
 
 
 PROTOCOL_VERSION = 1
@@ -86,6 +87,7 @@ def handle_request(
     lifecycle: EnvironmentLifecycle | None = None,
     trusted_environment: str | None = None,
     operations: OperationStore | None = None,
+    controllers: ControllerStore | None = None,
 ) -> dict[str, Any]:
     """Handle one request using identity supplied by the kernel."""
     if not isinstance(request, dict):
@@ -98,6 +100,23 @@ def handle_request(
 
     environments = contract["environments"]
     operation = request.get("operation")
+
+    if operation in ("controller.list", "controller.pair", "controller.revoke"):
+        if peer_uid != 0 or controllers is None:
+            return _error("forbidden", "controller approval requires host root on the management surface")
+        fields = {"controller.list": set(), "controller.pair": {"name", "publicKey"}, "controller.revoke": {"id"}}[operation]
+        if not _has_exact_keys(request, {"version", "operation"} | fields):
+            return _error("invalid_request", "unexpected controller request fields")
+        try:
+            if operation == "controller.list":
+                return _success(controllers.list())
+            if operation == "controller.pair":
+                return _success(controllers.pair(request["name"], request["publicKey"]))
+            return _success(controllers.revoke(request["id"]))
+        except ControlOperationError as error:
+            return _error(error.code, error.message)
+        except ValueError as error:
+            return _error("invalid_request", str(error))
 
     if operation == "operation.inspect":
         if peer_uid != 0 or operations is None:
@@ -382,6 +401,7 @@ def _serve_connection(connection: socket.socket, args: argparse.Namespace) -> No
                 lifecycle=lifecycle,
                 trusted_environment=args.environment,
                 operations=OperationStore(lock_root=args.lock_root) if args.management else None,
+                controllers=ControllerStore() if args.management else None,
             )
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
             response = _error("invalid_request", str(error))
@@ -446,6 +466,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = subparsers.add_parser("doctor")
     doctor_parser.add_argument("--json", action="store_true")
+
+    controller_parser = subparsers.add_parser("controller")
+    controller_commands = controller_parser.add_subparsers(dest="controller_command", required=True)
+    for command in ("list", "pair", "revoke"):
+        controller_command = controller_commands.add_parser(command)
+        controller_command.add_argument("--json", action="store_true")
+        if command == "pair":
+            controller_command.add_argument("name")
+            controller_command.add_argument("--public-key-file", required=True)
+        elif command == "revoke":
+            controller_command.add_argument("id")
 
     operation_parser = subparsers.add_parser("operation")
     operation_subparsers = operation_parser.add_subparsers(dest="operation_command", required=True)
@@ -515,6 +546,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         payload = {"version": PROTOCOL_VERSION, "operation": "doctor"}
+    elif args.command == "controller":
+        payload = {"version": PROTOCOL_VERSION, "operation": "controller." + args.controller_command}
+        if args.controller_command == "pair":
+            try:
+                with Path(args.public_key_file).open(encoding="utf-8") as public_key:
+                    payload.update(name=args.name, publicKey=public_key.read(4097))
+            except (OSError, UnicodeError):
+                return _print_response(_error("invalid_request", "could not read the public key file"), args.json)
+        elif args.controller_command == "revoke":
+            payload["id"] = args.id
     elif args.command == "operation":
         payload = {"version": PROTOCOL_VERSION, "operation": "operation.inspect", "id": args.id}
     elif args.environment_command == "list":
@@ -549,6 +590,7 @@ def main(argv: list[str] | None = None) -> int:
             if payload["operation"] == "environment.reset"
             or payload["operation"].startswith("environment.snapshot.")
             or payload["operation"] == "operation.inspect"
+            or payload["operation"].startswith("controller.")
             else os.environ.get("ATLAS_CONTROL_SOCKET", DEFAULT_SOCKET)
         )
     try:

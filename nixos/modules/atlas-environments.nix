@@ -1923,7 +1923,10 @@ in
           after = [ "atlas-host-contract.service" ];
           unitConfig.RequiresMountsFor = [ "/var/lib/atlas" ];
           serviceConfig = {
-            StateDirectory = "atlas/operations";
+            StateDirectory = [
+              "atlas/operations"
+              "atlas/controllers"
+            ];
             StateDirectoryMode = "0700";
             ExecStart = "${atlasControl}/bin/atlas serve --management --incus ${pkgs.incus-lts}/bin/incus${lib.optionalString btrfsStorage " --btrfs ${pkgs.btrfs-progs}/bin/btrfs"}";
             User = "root";

@@ -462,6 +462,9 @@ assert
   defaultHost.config.systemd.sockets.atlas-control.socketConfig.ListenStream
   == "/run/atlas/public/control.sock";
 assert defaultHost.config.systemd.sockets.atlas-manage.socketConfig.SocketMode == "0600";
+assert builtins.elem "atlas/controllers"
+  defaultHost.config.systemd.services.atlas-manage.serviceConfig.StateDirectory;
+assert defaultHost.config.systemd.services.atlas-manage.serviceConfig.StateDirectoryMode == "0700";
 assert
   defaultHost.config.systemd.services."atlas-environment-shared\\x2ddev".serviceConfig.Type
   == "oneshot";

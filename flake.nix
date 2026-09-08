@@ -184,6 +184,7 @@
                 cp ${./tests/test_remote_check.py} work/tests/test_remote_check.py
                 cp ${./tests/test_incus_inventory.py} work/tests/test_incus_inventory.py
                 cp ${./tests/test_operations.py} work/tests/test_operations.py
+                cp ${./tests/test_controllers.py} work/tests/test_controllers.py
                 cp ${./nixos/modules/atlas-environments.nix} work/nixos/modules/atlas-environments.nix
                 install -m 0755 ${./scripts/remote-check} work/scripts/remote-check
                 cd work

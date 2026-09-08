@@ -91,7 +91,7 @@ proof until its prerequisites have been demonstrated.
 | --- | --- | --- | --- |
 | 1 | Cloud existing-client dogfood | Herdr enters both declared development environments on a persistent DigitalOcean lab host, observes their distinct non-secret configuration, operates one shared durable checkout, survives reboot, and demonstrates reset of environment-local drift without losing owner work | complete |
 | 2 | Private environment networking | Two environments bind the same loopback port; neither reaches the other environment, host loopback, tailnet, LAN, or cloud metadata endpoints without policy; intended public egress still works; adding or renaming a definition does not silently renumber existing environment addresses | complete (controlled IPv4 VM proof) |
-| 3 | Paired operator control | A controller device is explicitly paired, receives a revocable identity, and can inspect, reset, and snapshot environments over a private transport; tailnet membership alone grants no Atlas authority; lifecycle calls have bounded execution and recover cleanly from an unavailable Incus daemon | in progress (query-deadline prerequisite; pairing not implemented) |
+| 3 | Paired operator control | A controller device is explicitly paired, receives a revocable identity, and can inspect, reset, and snapshot environments over a private transport; tailnet membership alone grants no Atlas authority; lifecycle calls have bounded execution and recover cleanly from an unavailable Incus daemon | in progress (local approval registry; remote authentication and pairing proof pending) |
 | 4 | Private route | One explicitly selected environment port is reachable from an authorized paired device without a public listener or arbitrary upstream target | queued |
 | 5 | Authenticated browser surface | An agent operates one isolated browser identity while the operator can observe, take over, return control, and revoke access | queued |
 | 6 | Narrow grant | One source credential remains outside the environment while a broker performs a bounded operation or issues a short-lived derivative | queued |
@@ -99,6 +99,18 @@ proof until its prerequisites have been demonstrated.
 | 8 | Runtime environment definitions | The control plane creates, inspects, resets, and deletes definitions and instances without weakening peer-derived identity or storage guarantees | later |
 | 9 | Portable environment declaration | A backend-independent, non-secret seed maps to the definition model; import requires explicit operator or client action and has no imperative setup hook | later |
 | 10 | Host-base comparison | The same proven behavior is ported to a bootc/OCI host and compared with the NixOS adapter on installation, update, rollback, recovery, and complexity | later |
+
+### Paired control slices
+
+- Local approval registry: root management can explicitly approve, list, and
+  revoke Ed25519 controller public keys. Unit tests cover durable approvals,
+  replacement conflicts, revocation generations, malformed records, contention,
+  and management-surface authorization. All 73 Linux tests and the Nix module
+  evaluation pass; runtime provisioning in a VM is not yet demonstrated.
+  See [the local ceremony and boundary](paired-operator-control.md).
+- Next: private transport with proof of key possession, host-bound approval
+  checks, and revocation fencing. No remote authority is enabled by the registry
+  alone. Browser takeover and fresh operator verification remain later proofs.
 
 ### Required Incus follow-ups
 
