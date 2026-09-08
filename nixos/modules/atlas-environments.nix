@@ -395,7 +395,10 @@ let
 
   atlasControl = pkgs.writeShellApplication {
     name = "atlas";
-    runtimeInputs = [ pkgs.python3 ];
+    runtimeInputs = [
+      pkgs.python3
+      pkgs.systemd
+    ];
     text = ''
       export PYTHONPATH=${../../src}
       exec python3 -P -m atlas "$@"
@@ -864,8 +867,10 @@ let
 
         # Every mutation takes the environment lock before the global Incus
         # reconciliation lock. Snapshot operations need only the first lock.
+        ${atlasControl}/bin/atlas operation-guard ${lib.escapeShellArg environment.id}
         exec 8>/run/atlas/locks/incus-reconcile.lock
-        flock --wait 60 8
+        # This queue spans provisioning of other environments, not one query.
+        flock --wait 600 8
         incus --force-local admin waitready --timeout 60
 
         if [ "$mode" = verify-snapshot ]; then
@@ -1828,9 +1833,10 @@ in
               fi
               exec 9>"/run/atlas/locks/$environment_id.lock"
               flock --wait 60 9
+              ${atlasControl}/bin/atlas operation-guard "$environment_id"
 
               exec 8>/run/atlas/locks/incus-reconcile.lock
-              flock --wait 60 8
+              flock --wait 600 8
               presence="$(${incusInventory} instance "$instance")"
               if [ "$presence" != present ]; then
                 echo "Atlas-marked instance $instance disappeared during inventory" >&2
@@ -1915,7 +1921,10 @@ in
         atlas-manage = {
           description = "Atlas root-only lifecycle management service";
           after = [ "atlas-host-contract.service" ];
+          unitConfig.RequiresMountsFor = [ "/var/lib/atlas" ];
           serviceConfig = {
+            StateDirectory = "atlas/operations";
+            StateDirectoryMode = "0700";
             ExecStart = "${atlasControl}/bin/atlas serve --management --incus ${pkgs.incus-lts}/bin/incus${lib.optionalString btrfsStorage " --btrfs ${pkgs.btrfs-progs}/bin/btrfs"}";
             User = "root";
             Group = "root";
@@ -1934,6 +1943,33 @@ in
             ProtectSystem = "strict";
             ReadWritePaths = [ "/run/atlas/locks" ];
             Restart = "on-failure";
+            RestrictAddressFamilies = [ "AF_UNIX" ];
+            RestrictSUIDSGID = true;
+          };
+        };
+
+        "atlas-operation@" = {
+          description = "Atlas lifecycle operation %i";
+          unitConfig.RequiresMountsFor = [ "/var/lib/atlas" ];
+          # Independent of the API service: restarting atlas-manage must not
+          # kill an in-flight reset or release its inherited lifecycle lock.
+          serviceConfig = {
+            Type = "exec";
+            ExecStart = "${atlasControl}/bin/atlas operation-worker %i";
+            User = "root";
+            Group = "root";
+            StateDirectory = "atlas/operations";
+            StateDirectoryMode = "0700";
+            CapabilityBoundingSet = [ "CAP_DAC_READ_SEARCH" ] ++ lib.optional btrfsStorage "CAP_SYS_ADMIN";
+            NoNewPrivileges = true;
+            PrivateDevices = true;
+            PrivateTmp = true;
+            ProtectControlGroups = true;
+            ProtectHome = true;
+            ProtectKernelModules = true;
+            ProtectKernelTunables = true;
+            ProtectSystem = "strict";
+            ReadWritePaths = [ "/run/atlas/locks" ];
             RestrictAddressFamilies = [ "AF_UNIX" ];
             RestrictSUIDSGID = true;
           };

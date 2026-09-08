@@ -248,7 +248,21 @@ pkgs.testers.runNixOSTest {
         entry("atlas-shared-dev", "echo later > .config/atlas/after-snapshot")
         entry("atlas-shared-dev", "echo durable-later > Documents/after-snapshot")
         entry("atlas-shared-dev", "echo volume-later > Projects/repo-a/after-snapshot")
-        machine.succeed("atlas environment snapshot restore shared-dev baseline --json")
+        # Keep verification in flight while the API service is restarted. The
+        # independent worker must retain authority and finish exactly once.
+        global_lock = "/run/atlas/locks/incus-reconcile.lock"
+        machine.succeed(f"nohup flock {global_lock} -c 'sleep 15' >/dev/null 2>&1 &")
+        machine.wait_until_succeeds(f"! flock -n {global_lock} -c true", timeout=5)
+        receipt = json.loads(machine.succeed(
+            "atlas environment snapshot restore shared-dev baseline --json --no-wait"
+        ))["result"]
+        operation_id = receipt["id"]
+        machine.fail("atlas environment snapshot delete shared-dev baseline --json --no-wait")
+        machine.succeed("systemctl restart atlas-manage.service")
+        machine.wait_until_succeeds(
+            f"atlas operation inspect {operation_id} --json | grep -F '\"status\": \"succeeded\"'",
+            timeout=60,
+        )
         wait_for_instance("atlas-shared-dev")
         project_inode_after = machine.succeed(
             f"stat -c '%d:%i' {shlex.quote(project_path)}"
@@ -268,7 +282,7 @@ pkgs.testers.runNixOSTest {
     with subtest("explicit reset recreates root and dependent volumes"):
         owner_home_path = environment_entry["owner"]["homeStorage"]["hostPath"]
         inode_before = machine.succeed(f"stat -c '%d:%i' {shlex.quote(owner_home_path)}").strip()
-        machine.succeed("atlas environment reset shared-dev --json")
+        machine.succeed("atlas environment reset shared-dev --json --wait")
         wait_for_instance("atlas-shared-dev")
         inode_after = machine.succeed(f"stat -c '%d:%i' {shlex.quote(owner_home_path)}").strip()
         assert inode_after == inode_before
@@ -418,7 +432,7 @@ pkgs.testers.runNixOSTest {
         service = "atlas-environment-shared\\x2ddev.service"
         machine.succeed("incus config device remove atlas-shared-dev nix-store")
         machine.fail(f"systemctl restart '{service}'")
-        machine.succeed("atlas environment reset shared-dev --json")
+        machine.succeed("atlas environment reset shared-dev --json --wait")
         machine.succeed(f"systemctl reset-failed '{service}'")
         machine.succeed(f"systemctl restart '{service}'")
         entry("atlas-shared-dev", "sudo -n touch /etc/incomplete-atlas-instance")

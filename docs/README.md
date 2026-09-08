@@ -21,6 +21,7 @@ its role rather than treating every design note as an implementation promise.
 - [Persistent Storage v0](persistent-storage-v0.md)
 - [Authenticated Surface v0](authenticated-surface-v0.md)
 - [Physical Host v0](physical-host-v0.md)
+- [Management operation receipts](management-operations.md)
 
 These documents define intended behavior. A contract is not evidence that the
 behavior has been implemented or validated.

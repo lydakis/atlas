@@ -3,6 +3,10 @@
 import json
 import os
 import re
+import fcntl
+import shutil
+import threading
+import time
 from pathlib import Path
 import shlex
 import subprocess
@@ -17,6 +21,29 @@ from atlas.lifecycle import ControlOperationError, _object_inventory, _snapshot_
 
 
 class InventoryTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("flock"), "requires Linux util-linux flock")
+    def test_global_queue_outlasts_one_readiness_budget(self):
+        source = (ROOT / "nixos/modules/atlas-environments.nix").read_text()
+        waits = re.findall(r"flock --wait (\d+) 8", source)
+        self.assertTrue(waits)
+        # Scale seconds by 60: the old one-second queue budget expires behind
+        # three seconds of provisioning. Use real independent file descriptions.
+        for wait in waits:
+            with self.subTest(wait=wait), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "lock"
+                with path.open("w") as owner, path.open() as contender:
+                    fcntl.flock(owner, fcntl.LOCK_EX)
+                    release = threading.Timer(3, lambda: fcntl.flock(owner, fcntl.LOCK_UN))
+                    release.start()
+                    try:
+                        result = subprocess.run(
+                            ["flock", "--wait", str(int(wait) / 60), str(contender.fileno())],
+                            pass_fds=(contender.fileno(),), timeout=15,
+                        )
+                        self.assertEqual(result.returncode, 0, "queued environment timed out behind legitimate provisioning")
+                    finally:
+                        release.join()
+
     def test_all_shell_readiness_and_lock_waits_are_bounded(self):
         source = (ROOT / "nixos/modules/atlas-environments.nix").read_text()
         readiness = re.findall(r"^\s*(incus --force-local admin waitready[^\n]*)$", source, re.M)
@@ -26,7 +53,8 @@ class InventoryTests(unittest.TestCase):
         for command in readiness:
             self.assertEqual(shlex.split(command)[-2:], ["--timeout", "60"])
         for command in locks:
-            self.assertEqual(shlex.split(command)[1:3], ["--wait", "60"])
+            arguments = shlex.split(command)
+            self.assertEqual(arguments[1:3], ["--wait", "600" if arguments[-1] == "8" else "60"])
 
     def test_readiness_failure_stops_activation_before_inventory_or_import(self):
         source = (ROOT / "nixos/modules/atlas-environments.nix").read_text()
@@ -72,10 +100,24 @@ class InventoryTests(unittest.TestCase):
                 "import os, time\n"
                 f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
                 "print('[]', flush=True)\n"
-                "time.sleep(2)\n"
+                "time.sleep(30)\n"
             )
             incus.chmod(0o755)
-            with mock.patch("atlas.lifecycle.INCUS_QUERY_TIMEOUT_SECONDS", 0.5):
+            popen = subprocess.Popen
+            def started(*args, **kwargs):
+                process = popen(*args, **kwargs)
+                deadline = time.monotonic() + 30
+                while not pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not pid_file.exists():
+                    process.kill()
+                    process.communicate()
+                    self.fail("query child did not start")
+                return process
+            with (
+                mock.patch("atlas.lifecycle.INCUS_QUERY_TIMEOUT_SECONDS", 0.5),
+                mock.patch("atlas.lifecycle.subprocess.Popen", side_effect=started),
+            ):
                 with self.assertRaises(ControlOperationError) as raised:
                     _object_inventory(str(incus), "instance", "atlas-demo")
             self.assertEqual(raised.exception.code, "incus_timeout")

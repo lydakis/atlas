@@ -204,7 +204,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("Reset preserves the declared durable work volume"):
         reset = json.loads(
-            target.succeed("atlas environment reset shared-dev --json")
+            target.succeed("atlas environment reset shared-dev --json --wait")
         )
         assert reset["ok"] is True
         assert reset["result"]["preservedOwnerHome"] is True

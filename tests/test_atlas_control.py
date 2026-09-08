@@ -1,5 +1,7 @@
 import fcntl
 import io
+import os
+import signal
 import socket
 import subprocess
 import sys
@@ -573,7 +575,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             ):
                 lifecycle.reset(environment)
 
-            self.assertEqual(raised.exception.code, "incus_failed")
+            self.assertEqual(raised.exception.code, "incus_query_failed")
             self.assertEqual(len(run.call_args_list), 1)
 
     def test_reset_query_timeout_prevents_mutation_and_releases_lock(self):
@@ -828,7 +830,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             ):
                 lifecycle.restore_snapshot(environment, "baseline")
 
-            self.assertEqual(raised.exception.code, "incus_failed")
+            self.assertEqual(raised.exception.code, "verification_failed")
             self.assertEqual(raised.exception.message, "Incus could not verify the snapshot")
 
     def test_verifier_receives_lock_and_preserves_exit_diagnostic(self):
@@ -849,7 +851,7 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             child = (
                 "import pathlib, signal, time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                f"pathlib.Path({str(ready)!r}).touch(); time.sleep(10)"
+                f"pathlib.Path({str(ready)!r}).touch(); time.sleep(30)"
             )
             # The leader exits immediately; its child retains stderr and the
             # inherited lock. Killing only the leader cannot clean this up.
@@ -862,9 +864,25 @@ class EnvironmentLifecycleTests(unittest.TestCase):
             def verify(_arguments, lock_fd):
                 return _run_verifier([sys.executable, "-c", leader], lock_fd)
 
+            popen = subprocess.Popen
+            def started(*args, **kwargs):
+                process = popen(*args, **kwargs)
+                deadline = time.monotonic() + 30
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not ready.exists():
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.communicate()
+                    self.fail("verifier child did not start")
+                return process
+
             with (
-                mock.patch("atlas.lifecycle.SNAPSHOT_VERIFY_TIMEOUT_SECONDS", 2),
+                mock.patch("atlas.lifecycle.SNAPSHOT_VERIFY_TIMEOUT_SECONDS", 0.2),
                 mock.patch("atlas.lifecycle._run_verifier", side_effect=verify),
+                mock.patch("atlas.lifecycle.subprocess.Popen", side_effect=started),
                 mock.patch("atlas.lifecycle.subprocess.run") as run,
             ):
                 with self.assertRaises(ControlOperationError) as raised:

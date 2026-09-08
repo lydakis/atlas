@@ -102,6 +102,21 @@ proof until its prerequisites have been demonstrated.
 
 ### Required Incus follow-ups
 
+- Management mutations now use durable receipts and independent systemd workers.
+  A bounded client wait returns an operation identity without cancelling work;
+  restarting the control service can inspect the same worker's saved outcome.
+  Admission records and lifecycle locks block conflicting operations, including
+  generated reconciliation. Started operations are never automatically replayed.
+  All 66 Linux unit regressions pass, covering admission, saved results, and
+  interrupted cleanup. The VM proof has demonstrated a restore completing
+  across control-service restart while rejecting a conflicting mutation.
+  The full host-contract run also passed reset, networking, generation switch,
+  and reboot. Subsequent query-error classification and completed-admission
+  cleanup refinements are covered by the 66-test Linux suite, not a repeat of
+  that full VM run. Automatic reconciliation
+  of unknown outcomes after worker loss or ambiguous Incus errors remains open.
+  See [management operation receipts](management-operations.md).
+
 - Private IPv4 allocation now derives from environment UUIDs in a fixed /16,
   with explicit collision and capacity rejection rather than reassignment.
   Module assertions cover addition, rename, fixed address vectors, and a real
@@ -130,8 +145,11 @@ proof until its prerequisites have been demonstrated.
   output, and returns `incus_timeout` without starting restore. Local process
   tests cover an exited leader whose child retains the lock and stderr pipe,
   and preservation of normal verifier exit status and diagnostics. Generated
-  reconciliation and activation scripts now use 60-second waits for individual
-  shell lock acquisitions and daemon readiness. A failed wait exits the script
+  reconciliation and activation scripts use 60-second waits for environment
+  locks and daemon readiness, and a 600-second global provisioning queue budget.
+  The previous 60-second global queue failed cold VM startup when provisioning
+  another environment took longer than a minute. A real-lock regression now
+  covers that contention. A failed wait exits the script
   before the following operation; it never unlocks another operation's lock.
   Tests enforce bounded wait arguments and activation failure propagation.
   These are per-wait limits, not a total reconciliation deadline. They do not

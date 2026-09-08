@@ -19,6 +19,7 @@ from .lifecycle import (
     ControlOperationError,
     EnvironmentLifecycle,
 )
+from .operations import OperationStore, assert_admitted
 
 
 PROTOCOL_VERSION = 1
@@ -84,6 +85,7 @@ def handle_request(
     contract: dict[str, Any],
     lifecycle: EnvironmentLifecycle | None = None,
     trusted_environment: str | None = None,
+    operations: OperationStore | None = None,
 ) -> dict[str, Any]:
     """Handle one request using identity supplied by the kernel."""
     if not isinstance(request, dict):
@@ -96,6 +98,16 @@ def handle_request(
 
     environments = contract["environments"]
     operation = request.get("operation")
+
+    if operation == "operation.inspect":
+        if peer_uid != 0 or operations is None:
+            return _error("forbidden", "operation inspection requires host root on the management surface")
+        if not _has_exact_keys(request, {"version", "operation", "id"}):
+            return _error("invalid_request", "operation.inspect requires exactly one id")
+        try:
+            return _success(operations.recover_status(request["id"]))
+        except FileNotFoundError:
+            return _error("not_found", "management operation does not exist")
 
     if operation == "doctor":
         if not _has_exact_keys(request, {"version", "operation"}):
@@ -156,6 +168,8 @@ def handle_request(
             return _error("not_found", "environment does not exist")
         environment = environments[name]
         try:
+            if operations is not None:
+                return _success(_submit_operation(operations, lifecycle, environment, request, contract))
             preserved_owner_home = lifecycle.reset(environment)
         except ControlOperationError as error:
             return _error(error.code, error.message)
@@ -212,6 +226,8 @@ def handle_request(
                 "snapshot must be a lowercase slug of at most 40 characters",
             )
         try:
+            if operations is not None:
+                return _success(_submit_operation(operations, lifecycle, environment, request, contract))
             method = getattr(lifecycle, snapshot_methods[operation])
             lifecycle_result = method(environment, snapshot)
         except ControlOperationError as error:
@@ -233,6 +249,50 @@ def handle_request(
         return _success(result)
 
     return _error("unknown_operation", "operation is not supported")
+
+
+def _submit_operation(operations, lifecycle, environment, request, contract):
+    return operations.submit(environment["id"], {
+        "request": request,
+        "contract": contract,
+        "lifecycle": {
+            "lock_root": lifecycle.lock_root,
+            "incus": lifecycle.incus,
+            "btrfs": lifecycle.btrfs,
+            "snapshots_enabled": lifecycle.snapshots_enabled,
+        },
+    })
+
+
+def _operation_worker(identifier):
+    os.environ["ATLAS_OPERATION_ID"] = identifier
+    store = OperationStore()
+    store.execute(identifier, _execute_operation_payload)
+    return 0
+
+
+def _execute_operation_payload(payload):
+    lifecycle = EnvironmentLifecycle(**payload["lifecycle"])
+    request = payload["request"]
+    # Ordinary mistakes (missing/existing snapshots) must not be confused with
+    # a lost mutation outcome. Admission already excludes competing Atlas work.
+    if request["operation"].startswith("environment.snapshot."):
+        try:
+            environment = payload["contract"]["environments"][request["name"]]
+            names = lifecycle.list_snapshots(environment)
+        except Exception:
+            return _error("preflight_failed", "snapshot inventory could not be verified; no mutation was submitted")
+        exists = request["snapshot"] in names
+        if request["operation"] == "environment.snapshot.create" and exists:
+            return _error("conflict", "snapshot already exists")
+        if request["operation"] != "environment.snapshot.create" and not exists:
+            return _error("not_found", "snapshot does not exist")
+    return handle_request(
+        peer_uid=0,
+        request=request,
+        contract=payload["contract"],
+        lifecycle=lifecycle,
+    )
 
 
 def _load_json(path: str) -> Any:
@@ -321,6 +381,7 @@ def _serve_connection(connection: socket.socket, args: argparse.Namespace) -> No
                 contract=contract,
                 lifecycle=lifecycle,
                 trusted_environment=args.environment,
+                operations=OperationStore(lock_root=args.lock_root) if args.management else None,
             )
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
             response = _error("invalid_request", str(error))
@@ -386,6 +447,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser("doctor")
     doctor_parser.add_argument("--json", action="store_true")
 
+    operation_parser = subparsers.add_parser("operation")
+    operation_subparsers = operation_parser.add_subparsers(dest="operation_command", required=True)
+    operation_inspect = operation_subparsers.add_parser("inspect")
+    operation_inspect.add_argument("id")
+    operation_inspect.add_argument("--json", action="store_true")
+    worker_parser = subparsers.add_parser("operation-worker", help=argparse.SUPPRESS)
+    worker_parser.add_argument("id")
+    guard_parser = subparsers.add_parser("operation-guard", help=argparse.SUPPRESS)
+    guard_parser.add_argument("id")
+
     environment_parser = subparsers.add_parser("environment")
     environment_subparsers = environment_parser.add_subparsers(
         dest="environment_command", required=True
@@ -398,6 +469,9 @@ def build_parser() -> argparse.ArgumentParser:
     reset_parser = environment_subparsers.add_parser("reset")
     reset_parser.add_argument("name")
     reset_parser.add_argument("--json", action="store_true")
+    reset_wait = reset_parser.add_mutually_exclusive_group()
+    reset_wait.add_argument("--wait", action="store_true", help="wait for the saved operation result")
+    reset_wait.add_argument("--no-wait", action="store_true", help="return the management operation receipt immediately")
     snapshot_parser = environment_subparsers.add_parser("snapshot")
     snapshot_subparsers = snapshot_parser.add_subparsers(
         dest="snapshot_command", required=True
@@ -407,6 +481,9 @@ def build_parser() -> argparse.ArgumentParser:
         operation_parser.add_argument("name")
         operation_parser.add_argument("snapshot")
         operation_parser.add_argument("--json", action="store_true")
+        operation_wait = operation_parser.add_mutually_exclusive_group()
+        operation_wait.add_argument("--wait", action="store_true", help="wait for the saved operation result")
+        operation_wait.add_argument("--no-wait", action="store_true", help="return the management operation receipt immediately")
     snapshot_list_parser = snapshot_subparsers.add_parser("list")
     snapshot_list_parser.add_argument("name")
     snapshot_list_parser.add_argument("--json", action="store_true")
@@ -426,9 +503,20 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "serve":
         return serve(args)
+    if args.command == "operation-worker":
+        return _operation_worker(args.id)
+    if args.command == "operation-guard":
+        try:
+            assert_admitted(args.id)
+        except ControlOperationError as error:
+            print(error.message, file=sys.stderr)
+            return 1
+        return 0
 
     if args.command == "doctor":
         payload = {"version": PROTOCOL_VERSION, "operation": "doctor"}
+    elif args.command == "operation":
+        payload = {"version": PROTOCOL_VERSION, "operation": "operation.inspect", "id": args.id}
     elif args.environment_command == "list":
         payload = {"version": PROTOCOL_VERSION, "operation": "environment.list"}
     elif args.environment_command == "inspect" and args.subject == "self":
@@ -460,10 +548,40 @@ def main(argv: list[str] | None = None) -> int:
             DEFAULT_MANAGEMENT_SOCKET
             if payload["operation"] == "environment.reset"
             or payload["operation"].startswith("environment.snapshot.")
+            or payload["operation"] == "operation.inspect"
             else os.environ.get("ATLAS_CONTROL_SOCKET", DEFAULT_SOCKET)
         )
     try:
-        return _print_response(_request(socket_path, payload), args.json)
+        response = _request(socket_path, payload)
+        # Preserve the ordinary synchronous CLI experience for quick work.
+        # A slow operation returns a receipt after a bounded client wait; it is
+        # not cancelled and can be inspected after reconnecting.
+        deadline = time.monotonic() if getattr(args, "no_wait", False) else float("inf") if getattr(args, "wait", False) else time.monotonic() + 30
+        if payload["operation"] != "operation.inspect" and not getattr(args, "no_wait", False):
+            while response.get("ok") and isinstance(response.get("result"), dict) and response["result"].get("status") in ("pending", "running"):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.2)
+                receipt = response["result"]
+                try:
+                    response = _request(socket_path, {
+                        "version": PROTOCOL_VERSION, "operation": "operation.inspect", "id": receipt["id"],
+                    })
+                except (OSError, json.JSONDecodeError):
+                    response = {"ok": False}
+                if not response.get("ok"):
+                    failure = _error(
+                        "operation_poll_failed",
+                        f"could not inspect accepted management operation {receipt['id']}; "
+                        f"work was not cancelled; run atlas operation inspect {receipt['id']}",
+                    )
+                    failure["receipt"] = receipt  # Last observed state, not a new outcome.
+                    return _print_response(failure, args.json)
+            if response.get("ok") and isinstance(response.get("result"), dict) and response["result"].get("status") == "unknown":
+                response = _error("operation_unknown", f"inspect management operation {response['result']['id']}; it will not be retried automatically")
+            elif response.get("ok") and isinstance(response.get("result"), dict) and "response" in response["result"]:
+                response = response["result"]["response"]
+        return _print_response(response, args.json)
     except (ConnectionError, FileNotFoundError, json.JSONDecodeError) as error:
         print(f"atlas: control socket unavailable: {error}", file=sys.stderr)
         return 1

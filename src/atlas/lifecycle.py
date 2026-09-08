@@ -118,7 +118,8 @@ def _run_incus(
         if diagnostic:
             print(f"atlas-lifecycle: Incus failed: {diagnostic}", file=sys.stderr)
         raise ControlOperationError(
-            "incus_failed", "Incus could not complete the lifecycle operation"
+            "incus_query_failed" if query else "incus_failed",
+            "Incus could not complete the lifecycle operation",
         )
     return result.stdout if capture else ""
 
@@ -189,7 +190,7 @@ def _run_verify_command(
                 "snapshot does not match the current environment layout",
             )
         raise ControlOperationError(
-            "incus_failed", "Incus could not verify the snapshot"
+            "verification_failed", "Incus could not verify the snapshot"
         )
 
 
@@ -373,6 +374,8 @@ def _instance_exists(incus: str, instance: str) -> bool:
 
 @contextmanager
 def _lifecycle_lock(environment_id: str, lock_root: str):
+    from .operations import assert_admitted
+
     locks = Path(lock_root)
     locks.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock_path = locks / f"{environment_id}.lock"
@@ -387,6 +390,7 @@ def _lifecycle_lock(environment_id: str, lock_root: str):
             raise ControlOperationError(
                 "lifecycle_busy", "another lifecycle operation holds the environment lock; retry later"
             ) from error
+        assert_admitted(environment_id)
         yield lock_fd
     finally:
         os.close(lock_fd)
