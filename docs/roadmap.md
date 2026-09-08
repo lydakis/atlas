@@ -106,7 +106,11 @@ proof until its prerequisites have been demonstrated.
   revoke Ed25519 controller public keys. Unit tests cover durable approvals,
   replacement conflicts, revocation generations, malformed records, contention,
   and management-surface authorization. All 73 Linux tests and the Nix module
-  evaluation pass; runtime provisioning in a VM is not yet demonstrated.
+  evaluation pass. The full host-contract VM now also proves approval and
+  revocation through the management socket, denial from public and environment
+  clients (including environment root), root-only registry permissions, approval
+  persistence across service restart, and an unchanged revocation record after
+  host reboot. This is a local approval proof, not remote authentication.
   See [the local ceremony and boundary](paired-operator-control.md).
 - Next: private transport with proof of key possession, host-bound approval
   checks, and revocation fencing. No remote authority is enabled by the registry

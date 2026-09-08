@@ -122,6 +122,35 @@ pkgs.testers.runNixOSTest {
     for instance in ("atlas-shared-dev", "atlas-personal-dev", "atlas-restricted"):
         wait_for_instance(instance)
 
+    with subtest("controller approvals are restricted to host management"):
+        # Disposable VM-only keys. No private key enters the Atlas registry.
+        machine.succeed("ssh-keygen -q -t ed25519 -N \"\" -f /tmp/controller-proof")
+        pair_command = "atlas controller pair proof-device --public-key-file /tmp/controller-proof.pub --json"
+        paired_controller = json.loads(machine.succeed(pair_command))["result"]
+        controller_id = paired_controller["id"]
+        assert paired_controller["status"] == "active"
+        assert json.loads(machine.succeed(pair_command))["result"] == paired_controller
+        machine.fail("atlas --socket /run/atlas/public/control.sock controller list --json")
+        machine.fail("sudo -u atlas-shared-dev atlas controller list --json")
+        entry("atlas-shared-dev", "sudo -n atlas controller list --json", succeeds=False)
+        # A caller cannot choose the public socket to bypass management auth.
+        entry("atlas-shared-dev", "sudo -n atlas --socket /mnt/atlas-control.sock controller list --json", succeeds=False)
+        for path, expected_mode in (
+            ("/var/lib/atlas/controllers", "700"),
+            ("/var/lib/atlas/controllers/controllers.json", "600"),
+        ):
+            assert machine.succeed(f"stat -c '%u:%g:%a' {path}").strip() == f"0:0:{expected_mode}"
+        machine.succeed("systemctl restart atlas-manage.service")
+        assert json.loads(machine.succeed("atlas controller list --json"))["result"] == [paired_controller]
+        revoked_controller = json.loads(machine.succeed(
+            f"atlas controller revoke {controller_id} --json"
+        ))["result"]
+        assert revoked_controller["status"] == "revoked"
+        assert revoked_controller["generation"] > paired_controller["generation"]
+        assert json.loads(machine.succeed(
+            f"atlas controller revoke {controller_id} --json"
+        ))["result"] == revoked_controller
+
     with subtest("host contract selects Incus without a substrate fallback"):
         contract = json.loads(machine.succeed("cat /etc/atlas/host-contract.json"))
         environment_entry = contract["configuration"]["environmentEntry"]
@@ -479,5 +508,8 @@ pkgs.testers.runNixOSTest {
         # and removal of the added definition without renumbering the survivors.
         assert network_matrix() == original_addresses
         assert machine.succeed("incus list '^atlas-alpha$' --format csv -c s").strip() == "STOPPED"
+
+    with subtest("controller revocation survives host reboot"):
+        assert json.loads(machine.succeed("atlas controller list --json"))["result"] == [revoked_controller]
   '';
 }
